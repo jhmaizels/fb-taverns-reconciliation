@@ -16,7 +16,6 @@ import os
 import secrets
 import tempfile
 import traceback
-from collections import Counter
 from pathlib import Path
 from typing import Annotated
 
@@ -35,6 +34,7 @@ from airtable_io import (  # noqa: E402
     write_mismatches,
     BASE_ID,
 )
+from summary import build_summary, render_summary_html  # noqa: E402
 
 app = FastAPI(title="FB Taverns Reconciliation")
 security = HTTPBasic()
@@ -64,19 +64,29 @@ PAGE_HEAD = """<!doctype html>
 <meta charset="utf-8">
 <title>FB Taverns Reconciliation</title>
 <style>
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 3em auto; padding: 0 1em; color: #222; }
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 1080px; margin: 2em auto; padding: 0 1em; color: #222; }
   h1 { margin-bottom: 0.2em; }
+  h2 { margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid #2c5aa0; color: #2c5aa0; }
   .sub { color: #666; margin-bottom: 2em; }
-  form { background: #f6f6f6; border: 1px solid #ddd; padding: 1.5em; border-radius: 6px; }
+  form { background: #f6f6f6; border: 1px solid #ddd; padding: 1.5em; border-radius: 6px; max-width: 540px; }
   label { display: block; margin-bottom: 0.4em; font-weight: 600; }
   select, input[type=file] { display: block; width: 100%; padding: 0.5em; margin-bottom: 1em; box-sizing: border-box; }
   button { background: #2c5aa0; color: white; border: 0; padding: 0.7em 1.5em; border-radius: 4px; font-size: 1em; cursor: pointer; }
   button:hover { background: #1d3f74; }
-  .result { background: #efe; border: 1px solid #aca; padding: 1.2em; border-radius: 6px; margin-top: 1.5em; }
-  .err { background: #fee; border-color: #caa; }
+  .result { background: #f6f9ff; border: 1px solid #c7d8f0; padding: 1.2em; border-radius: 6px; margin-top: 1em; max-width: 540px; }
+  .err { background: #fee; border: 1px solid #caa; padding: 1.2em; border-radius: 6px; }
   .summary-row { display: flex; justify-content: space-between; padding: 0.3em 0; border-bottom: 1px dotted #ccc; }
-  a.button { display: inline-block; padding: 0.5em 1em; background: #2c5aa0; color: white; text-decoration: none; border-radius: 4px; margin-top: 1em; }
+  a.button { display: inline-block; padding: 0.5em 1em; background: #2c5aa0; color: white; text-decoration: none; border-radius: 4px; margin-top: 1em; margin-right: 0.5em; }
   pre { background: #fafafa; border: 1px solid #ddd; padding: 1em; overflow-x: auto; font-size: 0.85em; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6em 0 1em; font-size: 0.9em; }
+  th, td { padding: 0.4em 0.6em; text-align: left; border-bottom: 1px solid #eee; }
+  th { background: #f4f4f4; font-weight: 600; }
+  td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.neg td:last-child strong { color: #b00020; }
+  tr.pos td:last-child strong { color: #1f7a1f; }
+  details.block { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 0.6em 1em; margin-bottom: 0.8em; }
+  details.block > summary { cursor: pointer; padding: 0.4em 0; font-size: 1em; }
+  .pill { display: inline-block; background: #eef; color: #335; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.8em; margin-left: 0.6em; font-weight: 400; }
 </style>
 </head><body>
 """
@@ -148,26 +158,17 @@ async def upload(
             except OSError:
                 pass
 
-    by_type = Counter(m.type for m in mismatches)
-    by_type_html = "".join(
-        f"<div class='summary-row'><span>{t}</span><strong>{c}</strong></div>"
-        for t, c in by_type.most_common()
-    )
+    summary = build_summary(original_name, lines, mismatches, sites)
+    summary_html = render_summary_html(summary)
+
     return f"""{PAGE_HEAD}
 <h1>Reconciliation complete</h1>
-<p class="sub">{original_name}</p>
-<div class="result">
-  <div class="summary-row"><span>Lines processed</span><strong>{len(lines)}</strong></div>
-  <div class="summary-row"><span>Mismatches found</span><strong>{len(mismatches)}</strong></div>
-  <div class="summary-row"><span>Airtable Files row</span><code>{file_rec_id}</code></div>
-  <div class="summary-row"><span>Mismatches inserted</span><strong>{mismatch_count}</strong></div>
-</div>
-<h3>By type</h3>
-<div class="result">{by_type_html or '<em>None</em>'}</div>
+<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Upload another</a>
 </p>
+{summary_html}
 {PAGE_FOOT}"""
 
 
