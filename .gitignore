@@ -1,0 +1,25 @@
+# secrets
+.env
+.env.local
+.env.production
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# generated outputs
+outputs/
+
+# local pricing data (lives in Airtable; regenerate via build-master if needed)
+master_pricing.csv
+sites.csv
+
+# os/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

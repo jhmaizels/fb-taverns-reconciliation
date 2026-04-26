@@ -1,0 +1,10 @@
+{
+  "base_id": "appyDA69D2YhdpsA4",
+  "tables": {
+    "Sites": "tblVBCkWzNj1R0Zdz",
+    "Products": "tblwpqsGjeOi6Tl1y",
+    "Files": "tblQ5oUQfQgAI2k8s",
+    "PricingRules": "tblBonamwCgnfmX5G",
+    "Mismatches": "tbl6zLeJSip11hXYa"
+  }
+}
