@@ -1,3 +1,9 @@
+> **Note (Apr 2026):** for the current update volume (~10 single-site edits/year)
+> the simpler **`AIRTABLE_FORM.md`** approach is recommended. Build this full
+> three-page Interface only if usage grows beyond ~weekly edits or you bring on
+> 2-3+ area managers. The Form approach gets ~80% of the value for ~20% of the
+> setup time.
+
 # Airtable Interface for managers: editing prices
 
 The raw `PricingRules` table is fine for power users but it has 13 fields and
