@@ -28,8 +28,17 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 load_dotenv()
 
-from reconcile import parse_lwc_sales, reconcile_lines, parse_fb_cost_file, build_master, load_master, _parse_date  # noqa: E402
+from reconcile import (  # noqa: E402
+    parse_lwc_sales,
+    reconcile_lines,
+    parse_fb_cost_file,
+    build_master,
+    load_master,
+    _parse_date,
+    Rule,
+)
 from master_export import build_master_xlsx_bytes  # noqa: E402
+from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
     load_rules_from_airtable,
     load_sites_from_airtable,
@@ -98,6 +107,10 @@ PAGE_HEAD = """<!doctype html>
   .pill { display: inline-block; background: #eef; color: #335; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.8em; margin-left: 0.6em; font-weight: 400; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; max-width: 1080px; }
   .grid2 form h3 { margin-top: 0; color: #2c5aa0; }
+  .grid2 form > h3 + h3, .grid2 form .second-h3 { margin-top: 1.5em; padding-top: 1em; border-top: 1px solid #ddd; }
+  textarea { width: 100%; padding: 0.5em; box-sizing: border-box; font-family: inherit; font-size: 0.95em; min-height: 80px; }
+  .support-tag { display: inline-block; background: #fff4cf; color: #8a6500; padding: 0.05em 0.5em; border-radius: 8px; font-size: 0.7em; font-weight: 700; margin-left: 0.5em; vertical-align: middle; }
+  tr.support-note td { background: #fffbe7; color: #4a3f10; border-bottom: 1px solid #eee; padding-top: 0.2em; padding-bottom: 0.4em; font-size: 0.85em; }
   .master-banner { background: #fffbe7; border: 1px solid #e6d480; border-radius: 6px; padding: 0.7em 1em; margin: 0 0 1.5em; font-size: 0.92em; color: #4a3f10; }
   .master-banner .sep { color: #b09d50; margin: 0 0.4em; }
   .help { font-size: 0.85em; color: #555; margin: -0.4em 0 1em; line-height: 1.4; }
@@ -184,17 +197,14 @@ def home(_user: str = Depends(check_auth)):
 
 <h2>Pricing master</h2>
 <div class="result" style="max-width: none">
-  <p style="margin-top:0">The <strong>FB Taverns Cost Price File</strong> Excel is the master. Whenever it changes — a new tenant, an RPI uplift, a single-product correction — upload the new version below. Anyone with the link can download the current master at any time.</p>
+  <p style="margin-top:0">The <strong>FB Taverns Cost Price File</strong> Excel is the master. Update it on the left for everyday changes (RPI, new tenants, corrections). Use the right-hand form for <em>temporary</em> tenant support that overrides the master price for a window — when reconciliations land in that window, mismatches get tagged with the support context.</p>
 </div>
 
 <div class="grid2" style="margin-top:1em">
-  <form action="/export-master" method="get">
-    <h3>Download current master</h3>
-    <p class="sub">The version currently in force, in the original cost-file layout. Anyone can use this link to get the latest copy.</p>
-    <button type="submit">Download master.xlsx</button>
-  </form>
   <form action="/upload-master" method="post" enctype="multipart/form-data">
-    <h3>Upload new master version</h3>
+    <h3>Download current master</h3>
+    <p class="sub">The version currently in force. <a href="/export-master">Download master.xlsx</a> — anyone with the link can use it.</p>
+    <h3 class="second-h3">Upload new master version</h3>
     <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
     <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
@@ -205,6 +215,18 @@ def home(_user: str = Depends(check_auth)):
     <label for="m-file">Master file (.xlsx)</label>
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
     <button type="submit">Upload new version</button>
+  </form>
+  <form action="/add-support" method="post">
+    <h3>Tenant support</h3>
+    <p class="sub">A temporary support price for one site &amp; product. Reconciliations during the support window flag the mismatch but tag it with the support context, so you can see why LWC is charging the standard price.</p>
+    <label for="support-text">Describe the support in plain English</label>
+    <textarea name="text" id="support-text" required
+      placeholder="e.g. Bell 804, reducing price of Moretti 22g to £200 for six weeks starting from today"></textarea>
+    <p class="help">Include site, product, new price, when it starts, and how long it runs.<br>
+    &bull; <em>"Castle Gate 820, Coors 11G to £150 from 1 May for 8 weeks"</em><br>
+    &bull; <em>"Bay Horse 816, Madri 50L at £180 from today until end of June"</em><br>
+    &bull; <em>"Lady Jane 805, Carling 22G dropped to £155 from 15 May for one month"</em></p>
+    <button type="submit">Add support</button>
   </form>
 </div>
 
@@ -395,6 +417,119 @@ async def upload_master(
   <div class="summary-row"><span>Products updated</span><strong>{products_updated}</strong></div>
   <div class="summary-row"><span>Products with retros</span><strong>{retros_with_value}</strong></div>
   {f'<div class="summary-row"><span>Reason</span><span>{escape(reason)}</span></div>' if reason else ""}
+</div>
+<p style="margin-top:1.5em">
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="/" style="background:#666">Back to home</a>
+</p>
+{PAGE_FOOT}"""
+
+
+@app.post("/add-support", response_class=HTMLResponse)
+async def add_support(
+    text: str = Form(...),
+    _user: str = Depends(check_auth),
+):
+    """Parse a natural-language support request and create the rule in Airtable."""
+    text = (text or "").strip()
+    if not text:
+        return _error_page("Support description is empty.")
+
+    try:
+        # Build the lookup tables Claude needs to resolve site + product references
+        site_records = load_sites_from_airtable()
+        # Products: pull from Airtable directly so the LLM sees every code we know about
+        from airtable_io import _list_all, T  # noqa: E402
+        product_records = _list_all(T["Products"], fields=["product_code", "description"])
+        products = {
+            (rec["fields"].get("product_code") or ""): {
+                "description": rec["fields"].get("description") or "",
+            }
+            for rec in product_records
+            if rec["fields"].get("product_code")
+        }
+        # Filter sites to those with active rules so the LLM doesn't pick a retired one
+        rules = load_rules_from_airtable()
+        active_sites = {r.site_id for r in rules if r.valid_to is None}
+        sites = {sid: info for sid, info in site_records.items() if sid in active_sites}
+
+        parsed = parse_support_request(text, sites, products)
+        errors = validate_support_fields(parsed, sites, products)
+        if errors:
+            err_html = "".join(f"<li>{escape(e)}</li>" for e in errors)
+            parsed_html = "".join(
+                f"<div class='summary-row'><span>{escape(k)}</span><span>{escape(str(v))}</span></div>"
+                for k, v in parsed.items()
+            )
+            return _error_page(
+                f"<p>The description couldn't be parsed cleanly. Reword and try again, or fix in Airtable directly.</p>"
+                f"<ul>{err_html}</ul>"
+                f"<h3>What Claude returned:</h3><div class='result'>{parsed_html}</div>"
+            )
+
+        # Build a single Rule and push to Airtable. close_keys_at_date=None
+        # because a support rule LAYERS ON TOP of the standard rule — the
+        # standard rule must remain active so it resumes after valid_to.
+        sid = parsed["site_id"]
+        code = parsed["product_code"]
+        vf = _parse_date(parsed["valid_from"])
+        vt = _parse_date(parsed["valid_to"])
+        new_price = float(parsed["new_tenant_price"])
+        reason = (parsed.get("reason") or "").strip()
+
+        # FB price comes from the existing standard rule for the same product,
+        # so reconciliation can still flag wrong_fb_price mismatches inside the
+        # support window.
+        existing_fb = next(
+            (r.fb_price for r in rules
+             if r.product_code == code and r.valid_to is None and r.fb_price is not None),
+            None,
+        )
+        existing_desc = next(
+            (r.product_desc for r in rules if r.product_code == code and r.product_desc),
+            "",
+        )
+
+        rule = Rule(
+            site_id=sid,
+            product_code=code,
+            product_desc=existing_desc,
+            tenant_price=new_price,
+            fb_price=existing_fb,
+            retro_pct=0.0,
+            valid_from=vf,
+            valid_to=vt,
+            status="supported",
+            reason=reason,
+            source=f"support_form ({text[:80]})",
+        )
+
+        from airtable_io import upsert_pricing_rules  # noqa: E402
+        created, updated, _closed = upsert_pricing_rules([rule], close_keys_at_date=None)
+    except KeyError as e:
+        return _error_page(
+            f"<p>Server is missing a required setting: <code>{escape(str(e))}</code>.</p>"
+            f"<p>Set <code>ANTHROPIC_API_KEY</code> in the Render environment to enable natural-language parsing.</p>"
+        )
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+
+    site_name = (sites.get(sid) or {}).get("name", "")
+    product_desc = products.get(code, {}).get("description", existing_desc)
+
+    return f"""{PAGE_HEAD}
+<h1>Support added</h1>
+<p class="sub">Standard rule remains active — this support layers on top until it ends.</p>
+{_master_banner_html()}
+<div class="result">
+  <div class="summary-row"><span>Site</span><strong>{escape(sid)} {escape(site_name)}</strong></div>
+  <div class="summary-row"><span>Product</span><strong>{escape(code)} {escape(product_desc)}</strong></div>
+  <div class="summary-row"><span>Support tenant price</span><strong>£{new_price:,.2f}</strong></div>
+  <div class="summary-row"><span>Valid from</span><strong>{vf.isoformat() if vf else '?'}</strong></div>
+  <div class="summary-row"><span>Valid to</span><strong>{vt.isoformat() if vt else '?'}</strong></div>
+  <div class="summary-row"><span>Reason</span><span>{escape(reason)}</span></div>
+  <div class="summary-row"><span>Original description</span><span><em>{escape(text)}</em></span></div>
+  <div class="summary-row"><span>Airtable</span><span>created={created} updated={updated}</span></div>
 </div>
 <p style="margin-top:1.5em">
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>

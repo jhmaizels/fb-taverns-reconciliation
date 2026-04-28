@@ -27,6 +27,7 @@ class TenantRow:
     qty: float
     delta_per_unit: float
     delta_total: float
+    support_note: str = ""  # populated when matched rule is status='supported'
 
 
 @dataclass
@@ -113,6 +114,7 @@ def build_summary(
                 site_name=m.line.site_name or sites_master.get(m.line.site_id, {}).get("name", ""),
             )
             by_site[m.line.site_id] = block
+        is_support = bool(m.rule and m.rule.status == "supported")
         block.rows.append(
             TenantRow(
                 product_code=m.line.product_code,
@@ -122,6 +124,7 @@ def build_summary(
                 qty=m.line.qty,
                 delta_per_unit=m.delta_per_unit,
                 delta_total=m.delta_total,
+                support_note=m.notes if is_support else "",
             )
         )
         block.total_delta += m.delta_total
@@ -280,10 +283,13 @@ def render_summary_html(s: Summary) -> str:
             )
             for r in b.rows:
                 cls = "neg" if r.delta_total < 0 else "pos"
+                desc_cell = escape(r.product_desc)
+                if r.support_note:
+                    desc_cell += " <span class='support-tag'>SUPPORT</span>"
                 parts.append(
                     f"<tr class='{cls}'>"
                     f"<td>{escape(r.product_code)}</td>"
-                    f"<td>{escape(r.product_desc)}</td>"
+                    f"<td>{desc_cell}</td>"
                     f"<td class='r'>{_money_neutral(r.expected)}</td>"
                     f"<td class='r'>{_money_neutral(r.actual)}</td>"
                     f"<td class='r'>{r.qty:g}</td>"
@@ -291,6 +297,12 @@ def render_summary_html(s: Summary) -> str:
                     f"<td class='r'><strong>{_money(r.delta_total)}</strong></td>"
                     f"</tr>"
                 )
+                if r.support_note:
+                    parts.append(
+                        f"<tr class='support-note'>"
+                        f"<td colspan='7'><em>{escape(r.support_note)}</em></td>"
+                        f"</tr>"
+                    )
             parts.append("</tbody></table></details>")
 
     parts.append("<h2>2. FB Taverns pricing mismatches — by product</h2>")

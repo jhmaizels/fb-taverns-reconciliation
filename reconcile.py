@@ -738,6 +738,15 @@ def reconcile_lines(
         if rule.tenant_price is not None:
             delta_unit = line.unit_price - rule.tenant_price
             if abs(delta_unit) > tolerance:
+                support_note = ""
+                if rule.status == "supported":
+                    end = rule.valid_to.isoformat() if rule.valid_to else "ongoing"
+                    support_note = (
+                        f"Support period in effect (ends {end}). "
+                        f"Reason: {rule.reason or '(no reason recorded)'}. "
+                        f"Expected price reflects the support discount; "
+                        f"if LWC charged the standard price, they need to apply the support."
+                    )
                 mismatches.append(
                     Mismatch(
                         type="wrong_tenant_price",
@@ -748,6 +757,7 @@ def reconcile_lines(
                         actual_tenant_price=line.unit_price,
                         delta_per_unit=delta_unit,
                         delta_total=delta_unit * line.qty,
+                        notes=support_note,
                     )
                 )
 
