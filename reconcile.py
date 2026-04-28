@@ -268,11 +268,17 @@ def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
         h = site_header.iloc[c]
         if pd.isna(h):
             continue
-        m = re.search(r"(\d{3,})\s*$", str(h).strip())
-        if not m:
+        text = str(h).strip()
+        # Site_id is a standalone 3-digit number anywhere in the header
+        # (handles "Bell 804", "825 Eden Arms (FW1615)", etc.).
+        # Excludes things like "FW1615" because there's no word boundary before "1".
+        matches = re.findall(r"\b(\d{3})\b", text)
+        if not matches:
             continue
-        sid = m.group(1)
-        name = str(h).replace(sid, "").strip()
+        sid = matches[0]
+        name = re.sub(rf"\b{sid}\b", "", text).strip()
+        # Strip any leftover supplier account in parens like "(FW1615)"
+        name = re.sub(r"\s*\([A-Z]{1,3}\d{3,}\)\s*", "", name).strip()
         site_cols[c] = (sid, name)
 
     seen_sites = {sid: name for sid, name in site_cols.values()}
