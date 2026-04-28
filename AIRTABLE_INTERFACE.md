@@ -1,8 +1,8 @@
-> **Note (Apr 2026):** for the current update volume (~10 single-site edits/year)
-> the simpler **`AIRTABLE_FORM.md`** approach is recommended. Build this full
-> three-page Interface only if usage grows beyond ~weekly edits or you bring on
-> 2-3+ area managers. The Form approach gets ~80% of the value for ~20% of the
-> setup time.
+> **⚠️ Superseded — not the active workflow.**
+> The decision is to keep the Excel cost file as the single source of truth.
+> Updates happen by uploading a new version of the Excel via the web app's
+> **Upload new master version** button; downloads via **Download current master**.
+> This Interface design is preserved as reference only.
 
 # Airtable Interface for managers: editing prices
 

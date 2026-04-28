@@ -1,3 +1,9 @@
+> **⚠️ Superseded — not needed for the active workflow.**
+> The Excel cost file is the single source of truth; direct Airtable edits
+> aren't part of the workflow. The /upload-master endpoint already handles
+> close-and-replace correctly server-side. This Automation is preserved here
+> as reference if direct edits ever become a workflow.
+
 # Airtable Automation: auto-close prior pricing rules
 
 When a manager adds a new row to `PricingRules` with a fresh `valid_from`, this

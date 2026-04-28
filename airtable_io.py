@@ -202,6 +202,14 @@ def upsert_pricing_rules(rules: list[Rule], close_keys_at_date: date | None) -> 
 
     keys_in_new = {(r.site_id, r.product_code) for r in rules}
 
+    # Pre-compute the set of rule_keys for rules in the new batch; any existing
+    # record with a matching rule_key IS being updated, not replaced, and must
+    # never be closed by this pass (otherwise a same-date re-upload accidentally
+    # closes everything before re-opening it).
+    new_rule_keys = {
+        _rule_key(r.site_id, r.product_code, r.valid_from) for r in rules
+    }
+
     closed = 0
     if close_keys_at_date:
         existing_open: list[dict] = []
@@ -209,9 +217,11 @@ def upsert_pricing_rules(rules: list[Rule], close_keys_at_date: date | None) -> 
             f = rec["fields"]
             if f.get("valid_to"):
                 continue
-            # Don't close a rule whose valid_from is on or after the close date —
-            # those are the same date as (or future of) the new rules and should
-            # remain active.
+            # Belt: don't close rules being updated in place.
+            if f.get("rule_key") in new_rule_keys:
+                continue
+            # Braces: don't close rules whose valid_from is on/after the close
+            # date (same-date or future rules should stay active).
             vf_str = f.get("valid_from")
             if vf_str:
                 vf_date = _parse_date(vf_str)
@@ -299,15 +309,18 @@ def upsert_products_with_retros(products: dict[str, dict]) -> tuple[int, int]:
 def get_active_master_info() -> dict:
     """
     Summary of the currently-active pricing master so the reconciliation page
-    can show 'using master <X> loaded on <date>' to the operator.
+    can show 'using master <X> uploaded <date>' to the operator.
 
-    Returns: {sources: list[str], latest_valid_from: str|None,
-              active_rule_count: int, products_with_retro: int}
+    Returns: {sources, latest_valid_from, latest_uploaded_at,
+              active_rule_count, products_with_retro}
     """
     from collections import Counter
     sources: Counter[str] = Counter()
     latest_vf: str | None = None
+    latest_uploaded: str | None = None
     active_count = 0
+    # Need created time for upload-date banner: list_all doesn't include
+    # createdTime by default, so request it explicitly.
     for rec in _list_all(T["PricingRules"], fields=["source", "valid_from", "valid_to"]):
         f = rec["fields"]
         if f.get("valid_to"):
@@ -317,6 +330,9 @@ def get_active_master_info() -> dict:
             sources[f["source"]] += 1
         if f.get("valid_from") and (latest_vf is None or f["valid_from"] > latest_vf):
             latest_vf = f["valid_from"]
+        ct = rec.get("createdTime")
+        if ct and (latest_uploaded is None or ct > latest_uploaded):
+            latest_uploaded = ct
     products_with_retro = sum(
         1
         for rec in _list_all(T["Products"], fields=["retro_per_keg"])
@@ -325,6 +341,7 @@ def get_active_master_info() -> dict:
     return {
         "sources": [name for name, _ in sources.most_common()],
         "latest_valid_from": latest_vf,
+        "latest_uploaded_at": latest_uploaded,
         "active_rule_count": active_count,
         "products_with_retro": products_with_retro,
     }

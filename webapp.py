@@ -127,15 +127,24 @@ def _master_banner_html() -> str:
     except Exception:
         return ""
     sources = info.get("sources") or []
-    src_text = sources[0] if sources else "<em>none</em>"
+    src_text = sources[0] if sources else "<em>none uploaded yet</em>"
     if len(sources) > 1:
         src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
     vf = info.get("latest_valid_from") or "—"
+    uploaded_at = info.get("latest_uploaded_at") or ""
+    # Render upload date as just YYYY-MM-DD HH:MM
+    if uploaded_at:
+        uploaded_at = uploaded_at.replace("T", " ")[:16]
     rules = info.get("active_rule_count", 0)
     retros = info.get("products_with_retro", 0)
+    upload_chip = (
+        f' <span class="sep">·</span> uploaded <strong>{uploaded_at}</strong>'
+        if uploaded_at else ""
+    )
     return (
         '<div class="master-banner">'
-        f'<strong>Master:</strong> {src_text}'
+        f'<strong>Current master:</strong> {src_text}'
+        f'{upload_chip}'
         f' <span class="sep">·</span> effective from <strong>{vf}</strong>'
         f' <span class="sep">·</span> {rules} active rules'
         f' <span class="sep">·</span> {retros} products with retros'
@@ -173,23 +182,18 @@ def home(_user: str = Depends(check_auth)):
 
 <h2>Pricing master</h2>
 <div class="result" style="max-width: none">
-  <p style="margin-top:0"><strong>Airtable is the master.</strong> The wide cost-file Excel is now a generated <em>view</em> of Airtable, not something you edit by hand. There are three update paths:</p>
-  <ol>
-    <li><strong>Single price change</strong> (new tenant at one site, 6-week support, single correction) — <a href="{AIRTABLE_BASE_URL}" target="_blank">edit in Airtable directly</a>. Adding a new <code>PricingRules</code> row auto-closes the prior open one.</li>
-    <li><strong>Bulk update</strong> (annual RPI, full master refresh) — download the current master, edit it in Excel, upload below.</li>
-    <li><strong>Just want a copy of the current master</strong> for review or to send to a supplier — download below.</li>
-  </ol>
+  <p style="margin-top:0">The <strong>FB Taverns Cost Price File</strong> Excel is the master. Whenever it changes — a new tenant, an RPI uplift, a single-product correction — upload the new version below. Anyone with the link can download the current master at any time.</p>
 </div>
 
 <div class="grid2" style="margin-top:1em">
   <form action="/export-master" method="get">
     <h3>Download current master</h3>
-    <p class="sub">Wide-form Excel snapshot of every active rule, in the same layout as the FB cost file.</p>
+    <p class="sub">The version currently in force, in the original cost-file layout. Anyone can use this link to get the latest copy.</p>
     <button type="submit">Download master.xlsx</button>
   </form>
   <form action="/upload-master" method="post" enctype="multipart/form-data">
     <h3>Upload new master version</h3>
-    <p class="sub">Use for bulk updates. Existing prices on the same site/product will be closed at the effective date and replaced.</p>
+    <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
     <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
     <label for="reason">What changed?</label>
@@ -197,7 +201,7 @@ def home(_user: str = Depends(check_auth)):
        placeholder="e.g. April 2026 RPI uplift v8 — fixes Fosters retro">
     <label for="m-file">Master file (.xlsx)</label>
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
-    <button type="submit">Upload master</button>
+    <button type="submit">Upload new version</button>
   </form>
 </div>
 

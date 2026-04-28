@@ -1,3 +1,11 @@
+> **⚠️ Superseded — not the active workflow.**
+> The decision is to keep the Excel cost file as the single source of truth.
+> Updates happen by uploading a new version of the Excel via the web app's
+> **Upload new master version** button; downloads via **Download current master**.
+> Direct edits in Airtable are intentionally not promoted to managers.
+> This Form-based approach is preserved here only as a fallback design if the
+> Excel-master workflow ever needs replacing.
+
 # Manager UX: a single Airtable Form for price changes
 
 For the realistic volume (~10 single-site edits/year + ~2 bulk uploads/year), a
