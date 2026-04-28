@@ -16,17 +16,20 @@ import os
 import secrets
 import tempfile
 import traceback
+from html import escape
 from pathlib import Path
 from typing import Annotated
 
+from datetime import date
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 load_dotenv()
 
-from reconcile import parse_lwc_sales, reconcile_lines  # noqa: E402
+from reconcile import parse_lwc_sales, reconcile_lines, parse_fb_cost_file, build_master, load_master, _parse_date  # noqa: E402
+from master_export import build_master_xlsx_bytes  # noqa: E402
 from airtable_io import (  # noqa: E402
     load_rules_from_airtable,
     load_sites_from_airtable,
@@ -35,6 +38,8 @@ from airtable_io import (  # noqa: E402
     write_retro_findings,
     load_agreed_retros,
     get_active_master_info,
+    upsert_pricing_rules,
+    upsert_products_with_retros,
     BASE_ID,
 )
 from summary import build_summary, render_summary_html  # noqa: E402
@@ -140,10 +145,13 @@ def _master_banner_html() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home(_user: str = Depends(check_auth)):
+    today_iso = date.today().isoformat()
     return f"""{PAGE_HEAD}
 <h1>FB Taverns Reconciliation</h1>
-<p class="sub">Upload a supplier file. Results post to Airtable.</p>
+<p class="sub">Upload a supplier file to reconcile. Or update the pricing master.</p>
 {_master_banner_html()}
+
+<h2>Reconcile a supplier file</h2>
 <div class="grid2">
   <form action="/upload" method="post" enctype="multipart/form-data">
     <h3>Weekly sales</h3>
@@ -162,6 +170,37 @@ def home(_user: str = Depends(check_auth)):
     <button type="submit">Upload &amp; reconcile</button>
   </form>
 </div>
+
+<h2>Pricing master</h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0"><strong>Airtable is the master.</strong> The wide cost-file Excel is now a generated <em>view</em> of Airtable, not something you edit by hand. There are three update paths:</p>
+  <ol>
+    <li><strong>Single price change</strong> (new tenant at one site, 6-week support, single correction) — <a href="{AIRTABLE_BASE_URL}" target="_blank">edit in Airtable directly</a>. Adding a new <code>PricingRules</code> row auto-closes the prior open one.</li>
+    <li><strong>Bulk update</strong> (annual RPI, full master refresh) — download the current master, edit it in Excel, upload below.</li>
+    <li><strong>Just want a copy of the current master</strong> for review or to send to a supplier — download below.</li>
+  </ol>
+</div>
+
+<div class="grid2" style="margin-top:1em">
+  <form action="/export-master" method="get">
+    <h3>Download current master</h3>
+    <p class="sub">Wide-form Excel snapshot of every active rule, in the same layout as the FB cost file.</p>
+    <button type="submit">Download master.xlsx</button>
+  </form>
+  <form action="/upload-master" method="post" enctype="multipart/form-data">
+    <h3>Upload new master version</h3>
+    <p class="sub">Use for bulk updates. Existing prices on the same site/product will be closed at the effective date and replaced.</p>
+    <label for="vf">Effective from</label>
+    <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
+    <label for="reason">What changed?</label>
+    <input type="text" name="reason" id="reason" maxlength="200"
+       placeholder="e.g. April 2026 RPI uplift v8 — fixes Fosters retro">
+    <label for="m-file">Master file (.xlsx)</label>
+    <input type="file" name="file" id="m-file" accept=".xlsx" required>
+    <button type="submit">Upload master</button>
+  </form>
+</div>
+
 <p style="margin-top:2em"><a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable base</a></p>
 {PAGE_FOOT}"""
 
@@ -273,6 +312,87 @@ async def upload_retro(
   <a class="button" href="/" style="background:#666">Upload another</a>
 </p>
 {summary_html}
+{PAGE_FOOT}"""
+
+
+@app.get("/export-master")
+def export_master(_user: str = Depends(check_auth)):
+    """Download the current Airtable master as a wide-form Excel."""
+    try:
+        data = build_master_xlsx_bytes()
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+    filename = f"FB_Taverns_Cost_Price_File_{date.today().isoformat()}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/upload-master", response_class=HTMLResponse)
+async def upload_master(
+    file: UploadFile = File(...),
+    valid_from: str = Form(...),
+    reason: str = Form(""),
+    _user: str = Depends(check_auth),
+):
+    original_name = file.filename or "uploaded.xlsx"
+    if not original_name.lower().endswith(".xlsx"):
+        return _error_page(f"File must be .xlsx (got {original_name!r})")
+
+    vf = _parse_date(valid_from)
+    if vf is None:
+        return _error_page(f"Could not parse 'Effective from' date: {valid_from!r}")
+
+    suffix = Path(original_name).suffix or ".xlsx"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        # Push directly to Airtable WITHOUT writing to local CSV — the deployed
+        # service has no persistent disk, and Airtable is the source of truth.
+        rules, sites, products = parse_fb_cost_file(tmp_path)
+        for r in rules:
+            r.valid_from = vf
+            if reason:
+                r.reason = reason
+            r.source = original_name
+        rule_count = len(rules)
+        product_count = len(products)
+        retros_with_value = sum(1 for p in products.values() if (p.get("retro_per_keg") or 0) > 0)
+
+        rules_created, rules_updated, rules_closed = upsert_pricing_rules(rules, close_keys_at_date=vf)
+        products_created, products_updated = upsert_products_with_retros(products)
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return f"""{PAGE_HEAD}
+<h1>Master uploaded</h1>
+<p class="sub">{escape(original_name)} &middot; effective from {vf.isoformat()}</p>
+{_master_banner_html()}
+<div class="result">
+  <div class="summary-row"><span>Rules in file</span><strong>{rule_count}</strong></div>
+  <div class="summary-row"><span>Rules created</span><strong>{rules_created}</strong></div>
+  <div class="summary-row"><span>Rules updated</span><strong>{rules_updated}</strong></div>
+  <div class="summary-row"><span>Prior rules closed at {vf.isoformat()}</span><strong>{rules_closed}</strong></div>
+  <div class="summary-row"><span>Products created</span><strong>{products_created}</strong></div>
+  <div class="summary-row"><span>Products updated</span><strong>{products_updated}</strong></div>
+  <div class="summary-row"><span>Products with retros</span><strong>{retros_with_value}</strong></div>
+  {f'<div class="summary-row"><span>Reason</span><span>{escape(reason)}</span></div>' if reason else ""}
+</div>
+<p style="margin-top:1.5em">
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="/" style="background:#666">Back to home</a>
+</p>
 {PAGE_FOOT}"""
 
 

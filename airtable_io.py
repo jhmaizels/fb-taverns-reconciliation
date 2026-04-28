@@ -209,6 +209,14 @@ def upsert_pricing_rules(rules: list[Rule], close_keys_at_date: date | None) -> 
             f = rec["fields"]
             if f.get("valid_to"):
                 continue
+            # Don't close a rule whose valid_from is on or after the close date —
+            # those are the same date as (or future of) the new rules and should
+            # remain active.
+            vf_str = f.get("valid_from")
+            if vf_str:
+                vf_date = _parse_date(vf_str)
+                if vf_date and vf_date >= close_keys_at_date:
+                    continue
             site_link = (f.get("site") or [None])[0]
             product_link = (f.get("product") or [None])[0]
             sid = next((k for k, v in site_ids.items() if v == site_link), None)
