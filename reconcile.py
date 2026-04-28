@@ -286,23 +286,20 @@ def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
 
         price_raw = df.iat[r, 2]
         retro_raw = df.iat[r, 3]
-        net_raw = df.iat[r, 4]
+        # NB: fb_price is the LIST price (col 2), not Net price (col 4 = post-retro).
+        # LWC's weekly MASTER column is the list price; retro is a separate monthly rebate.
         try:
-            fb_price = float(net_raw) if not pd.isna(net_raw) else None
+            fb_price = float(price_raw) if not pd.isna(price_raw) else None
         except (TypeError, ValueError):
             fb_price = None
         try:
             retro_per_unit = float(retro_raw) if not pd.isna(retro_raw) else 0.0
         except (TypeError, ValueError):
             retro_per_unit = 0.0
-        try:
-            list_price = float(price_raw) if not pd.isna(price_raw) else None
-        except (TypeError, ValueError):
-            list_price = None
 
         retro_pct = 0.0
-        if list_price and retro_per_unit:
-            retro_pct = retro_per_unit / list_price
+        if fb_price and retro_per_unit:
+            retro_pct = retro_per_unit / fb_price
 
         for col, (sid, _) in site_cols.items():
             cell = df.iat[r, col]
@@ -562,8 +559,9 @@ def _index_rules(rules: list[Rule]) -> dict[tuple[str, str], list[Rule]]:
     idx: dict[tuple[str, str], list[Rule]] = {}
     for r in rules:
         idx.setdefault((r.site_id, r.product_code), []).append(r)
+    # Sort newest valid_from first; if rules accidentally overlap, the most recent wins.
     for k in idx:
-        idx[k].sort(key=lambda x: x.valid_from or date.min)
+        idx[k].sort(key=lambda x: x.valid_from or date.min, reverse=True)
     return idx
 
 
@@ -577,7 +575,7 @@ def _lookup_rule(
     if not candidates:
         return None
     if on_date is None:
-        return candidates[-1]
+        return candidates[0]
     for r in candidates:
         vf = r.valid_from or date.min
         vt = r.valid_to or date.max
