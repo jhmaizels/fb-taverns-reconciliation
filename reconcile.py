@@ -126,7 +126,9 @@ class Rule:
             "product_desc": self.product_desc,
             "tenant_price": "" if self.tenant_price is None else f"{self.tenant_price:.4f}",
             "fb_price": "" if self.fb_price is None else f"{self.fb_price:.4f}",
-            "retro_pct": f"{self.retro_pct:.4f}",
+            # retro_pct kept at high precision so retro_per_keg = retro_pct * fb_price
+            # round-trips exactly to the source-of-truth pennies in the cost file
+            "retro_pct": f"{self.retro_pct:.10f}",
             "valid_from": self.valid_from.isoformat() if self.valid_from else "",
             "valid_to": self.valid_to.isoformat() if self.valid_to else "",
             "status": self.status,
@@ -259,8 +261,16 @@ def parse_tenant_pricing_folder(folder: str) -> tuple[list[Rule], dict[str, str]
     return rules, seen_sites, skipped
 
 
-def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
-    """Wide-form file: rows are products; cols 0-4 = code,name,price,retro,net_price; cols 5+ = per-site tenant prices."""
+def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str], dict[str, dict]]:
+    """
+    Wide-form FB cost file. Returns:
+      - rules: list[Rule] for every (site, product) cell that has a tenant price
+      - sites: {site_id: name}
+      - products: {product_code: {"name", "fb_price", "retro_per_keg"}} — every
+        product row, even if no per-site tenant prices exist (so retro-only
+        products are still captured for retro reconciliation)
+    Cols 0-4 = code, name, list_price, retro_per_keg, net_price; cols 5+ = per-site tenant prices.
+    """
     df = pd.read_excel(path, sheet_name=0, header=None)
     site_header = df.iloc[1]
     site_cols: dict[int, tuple[str, str]] = {}
@@ -283,6 +293,7 @@ def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
 
     seen_sites = {sid: name for sid, name in site_cols.values()}
     rules: list[Rule] = []
+    products: dict[str, dict] = {}
 
     for r in range(2, df.shape[0]):
         product_code = _to_str_code(df.iat[r, 0])
@@ -307,6 +318,12 @@ def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
         if fb_price and retro_per_unit:
             retro_pct = retro_per_unit / fb_price
 
+        products[product_code] = {
+            "name": product_name,
+            "fb_price": fb_price,
+            "retro_per_keg": retro_per_unit,
+        }
+
         for col, (sid, _) in site_cols.items():
             cell = df.iat[r, col]
             if pd.isna(cell):
@@ -326,7 +343,7 @@ def parse_fb_cost_file(path: str) -> tuple[list[Rule], dict[str, str]]:
                     source=os.path.basename(path),
                 )
             )
-    return rules, seen_sites
+    return rules, seen_sites, products
 
 
 def build_master(
@@ -344,10 +361,11 @@ def build_master(
     skipped: list[tuple[str, str]] = []
     fb_count = tenant_count = 0
 
+    fb_products: dict[str, dict] = {}
     if fb_cost_file:
         if not Path(fb_cost_file).exists():
             sys.exit(f"FB cost file not found: {fb_cost_file}")
-        fb_rules, fb_sites = parse_fb_cost_file(fb_cost_file)
+        fb_rules, fb_sites, fb_products = parse_fb_cost_file(fb_cost_file)
         fb_count = len(fb_rules)
         for sid, name in fb_sites.items():
             seen_sites.setdefault(sid, name)
@@ -852,11 +870,17 @@ def main(argv: list[str] | None = None) -> int:
             sites_csv=args.sites_out,
         )
         if args.to_airtable:
-            from airtable_io import upsert_pricing_rules
+            from airtable_io import upsert_pricing_rules, upsert_products_with_retros
             new_rules = [r for r in load_master(args.out) if r.valid_from == vf]
             print(f"\nPushing {len(new_rules)} new rules to Airtable…")
             created, updated, closed = upsert_pricing_rules(new_rules, close_keys_at_date=vf)
             print(f"  Airtable: created={created} updated={updated} closed_prior={closed}")
+            if args.fb_cost:
+                # Push every product (including retro-only ones) with its retro_per_keg
+                # so the retro reconciliation can find them all.
+                _, _, fb_products = parse_fb_cost_file(args.fb_cost)
+                pcreated, pupdated = upsert_products_with_retros(fb_products)
+                print(f"  Products with retros: created={pcreated} updated={pupdated}")
         return 0
 
     if args.cmd == "reconcile":

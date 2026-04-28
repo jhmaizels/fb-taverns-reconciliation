@@ -259,6 +259,50 @@ def _file_hash(path: str) -> str:
     return h.hexdigest()
 
 
+def upsert_products_with_retros(products: dict[str, dict]) -> tuple[int, int]:
+    """
+    Upsert into Products table by product_code. Sets description and retro_per_keg.
+    Used after parse_fb_cost_file so retro-only products (with no per-site tenant
+    prices) still land in Products and the retro reconciler can find them.
+    """
+    table_id = T["Products"]
+    existing = _list_all(table_id, fields=["product_code"])
+    by_code = {rec["fields"].get("product_code"): rec["id"] for rec in existing}
+
+    to_create, to_update = [], []
+    for code, info in products.items():
+        fields = {
+            "product_code": code,
+            "description": info.get("name") or "",
+            "supplier": "LWC",
+            "retro_eligible": float(info.get("retro_per_keg") or 0) > 0,
+            "retro_per_keg": float(info.get("retro_per_keg") or 0.0),
+        }
+        if code in by_code:
+            to_update.append({"id": by_code[code], "fields": fields})
+        else:
+            to_create.append({"fields": fields})
+
+    created = len(_batch(to_create, "create", table_id)) if to_create else 0
+    updated = len(_batch(to_update, "update", table_id)) if to_update else 0
+    return created, updated
+
+
+def load_agreed_retros() -> dict[str, dict]:
+    """Returns {product_code: {description, agreed_retro}} from Products.retro_per_keg."""
+    out: dict[str, dict] = {}
+    for rec in _list_all(T["Products"], fields=["product_code", "description", "retro_per_keg"]):
+        f = rec["fields"]
+        code = f.get("product_code")
+        if not code:
+            continue
+        out[code] = {
+            "description": f.get("description", "") or "",
+            "agreed_retro": float(f.get("retro_per_keg") or 0.0),
+        }
+    return out
+
+
 def upsert_file_record(
     file_path: str,
     supplier: str,
@@ -296,6 +340,77 @@ def _rule_lookup() -> dict[str, str]:
         for rec in _list_all(T["PricingRules"], fields=["rule_key"])
         if rec["fields"].get("rule_key")
     }
+
+
+def write_retro_findings(retro_summary, file_record_id: str) -> int:
+    """
+    Persist retro findings (under-paid, over-paid, paid-not-on-master) to the
+    Mismatches table for audit. typecast=True auto-creates the new singleSelect
+    options. Section 4 (multi-rate) and Section 5 (agreed-not-delivered) are
+    diagnostic / informational and are not persisted.
+    """
+    product_ids = _product_lookup()
+    table_id = T["Mismatches"]
+    payload: list[dict] = []
+
+    def _key(prefix: str, code: str) -> str:
+        return f"{file_record_id}|retro|{prefix}|{code}"
+
+    for r in retro_summary.under_payments:
+        fields: dict = {
+            "mismatch_key": _key("under", r.product_code),
+            "type": "retro_under_paid",
+            "severity": "high" if abs(r.total_delta) >= 50 else ("medium" if abs(r.total_delta) >= 5 else "low"),
+            "file": [file_record_id],
+            "expected_fb_price": float(r.agreed),
+            "actual_fb_price": float(r.rates_paid[0]) if r.rates_paid else 0.0,
+            "delta_per_unit": float(r.rates_paid[0]) - float(r.agreed) if r.rates_paid else -float(r.agreed),
+            "delta_total": float(r.total_delta),
+            "qty": float(r.kegs),
+            "status": "open",
+            "notes": f"Rates paid: {r.rates_paid}",
+        }
+        if r.product_code in product_ids:
+            fields["product"] = [product_ids[r.product_code]]
+        payload.append({"fields": fields})
+
+    for r in retro_summary.over_payments:
+        fields = {
+            "mismatch_key": _key("over", r.product_code),
+            "type": "retro_over_paid",
+            "severity": "medium",
+            "file": [file_record_id],
+            "expected_fb_price": float(r.agreed),
+            "actual_fb_price": float(r.rates_paid[0]) if r.rates_paid else 0.0,
+            "delta_per_unit": float(r.rates_paid[0]) - float(r.agreed) if r.rates_paid else 0.0,
+            "delta_total": float(r.total_delta),
+            "qty": float(r.kegs),
+            "status": "open",
+            "notes": f"Rates paid: {r.rates_paid}",
+        }
+        if r.product_code in product_ids:
+            fields["product"] = [product_ids[r.product_code]]
+        payload.append({"fields": fields})
+
+    for r in retro_summary.paid_not_on_master:
+        fields = {
+            "mismatch_key": _key("nomaster", r.product_code),
+            "type": "retro_paid_not_on_master",
+            "severity": "medium",
+            "file": [file_record_id],
+            "actual_fb_price": float(r.rates_paid[0]) if r.rates_paid else 0.0,
+            "delta_total": float(r.total_received),
+            "qty": float(r.kegs),
+            "status": "open",
+            "notes": f"Paid £{r.total_received:.2f} on a product with no agreed retro on master.",
+        }
+        if r.product_code in product_ids:
+            fields["product"] = [product_ids[r.product_code]]
+        payload.append({"fields": fields})
+
+    if not payload:
+        return 0
+    return len(_batch(payload, "create", table_id))
 
 
 def write_mismatches(mismatches: list[Mismatch], file_record_id: str) -> int:

@@ -32,9 +32,12 @@ from airtable_io import (  # noqa: E402
     load_sites_from_airtable,
     upsert_file_record,
     write_mismatches,
+    write_retro_findings,
+    load_agreed_retros,
     BASE_ID,
 )
 from summary import build_summary, render_summary_html  # noqa: E402
+from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 
 app = FastAPI(title="FB Taverns Reconciliation")
 security = HTTPBasic()
@@ -87,6 +90,8 @@ PAGE_HEAD = """<!doctype html>
   details.block { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 0.6em 1em; margin-bottom: 0.8em; }
   details.block > summary { cursor: pointer; padding: 0.4em 0; font-size: 1em; }
   .pill { display: inline-block; background: #eef; color: #335; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.8em; margin-left: 0.6em; font-weight: 400; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; max-width: 1080px; }
+  .grid2 form h3 { margin-top: 0; color: #2c5aa0; }
 </style>
 </head><body>
 """
@@ -112,16 +117,25 @@ def version():
 def home(_user: str = Depends(check_auth)):
     return f"""{PAGE_HEAD}
 <h1>FB Taverns Reconciliation</h1>
-<p class="sub">Upload an LWC weekly sales spreadsheet. Results post to Airtable.</p>
-<form action="/upload" method="post" enctype="multipart/form-data">
-  <label for="supplier">Supplier</label>
-  <select name="supplier" id="supplier">
-    <option value="LWC" selected>LWC (England)</option>
-  </select>
-  <label for="file">Weekly sales file (.xlsx)</label>
-  <input type="file" name="file" id="file" accept=".xlsx" required>
-  <button type="submit">Upload &amp; reconcile</button>
-</form>
+<p class="sub">Upload a supplier file. Results post to Airtable.</p>
+<div class="grid2">
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <h3>Weekly sales</h3>
+    <p class="sub">LWC weekly sales report — checks tenant and FB pricing line by line.</p>
+    <label for="ws-file">Weekly sales (.xlsx)</label>
+    <input type="file" name="file" id="ws-file" accept=".xlsx" required>
+    <input type="hidden" name="supplier" value="LWC">
+    <button type="submit">Upload &amp; reconcile</button>
+  </form>
+  <form action="/upload-retro" method="post" enctype="multipart/form-data">
+    <h3>Monthly retro</h3>
+    <p class="sub">LWC Rate Per Keg — checks the per-keg retro paid against the agreed rate.</p>
+    <label for="retro-file">Monthly retro (.xlsx)</label>
+    <input type="file" name="file" id="retro-file" accept=".xlsx" required>
+    <input type="hidden" name="supplier" value="LWC">
+    <button type="submit">Upload &amp; reconcile</button>
+  </form>
+</div>
 <p style="margin-top:2em"><a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable base</a></p>
 {PAGE_FOOT}"""
 
@@ -174,6 +188,58 @@ async def upload(
     return f"""{PAGE_HEAD}
 <h1>Reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
+<p>
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="/" style="background:#666">Upload another</a>
+</p>
+{summary_html}
+{PAGE_FOOT}"""
+
+
+@app.post("/upload-retro", response_class=HTMLResponse)
+async def upload_retro(
+    file: UploadFile = File(...),
+    supplier: str = Form("LWC"),
+    _user: str = Depends(check_auth),
+):
+    original_name = file.filename or "uploaded.xlsx"
+    if not original_name.lower().endswith(".xlsx"):
+        return _error_page(f"File must be .xlsx (got {original_name!r})")
+
+    suffix = Path(original_name).suffix or ".xlsx"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        master = load_agreed_retros()
+        if not any(v.get("agreed_retro", 0) > 0 for v in master.values()):
+            return _error_page("No agreed retros found in Products. Run build-master with a cost file first.")
+
+        lines = parse_lwc_retro(tmp_path)
+        summary = build_retro_summary(original_name, lines, master)
+
+        file_rec_id = upsert_file_record(
+            tmp_path,
+            supplier=supplier,
+            line_count=len(lines),
+            file_name_override=original_name,
+        )
+        n_findings = write_retro_findings(summary, file_rec_id)
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    summary_html = render_retro_summary_html(summary)
+    return f"""{PAGE_HEAD}
+<h1>Retro reconciliation complete</h1>
+<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Upload another</a>
