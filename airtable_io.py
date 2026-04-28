@@ -288,6 +288,40 @@ def upsert_products_with_retros(products: dict[str, dict]) -> tuple[int, int]:
     return created, updated
 
 
+def get_active_master_info() -> dict:
+    """
+    Summary of the currently-active pricing master so the reconciliation page
+    can show 'using master <X> loaded on <date>' to the operator.
+
+    Returns: {sources: list[str], latest_valid_from: str|None,
+              active_rule_count: int, products_with_retro: int}
+    """
+    from collections import Counter
+    sources: Counter[str] = Counter()
+    latest_vf: str | None = None
+    active_count = 0
+    for rec in _list_all(T["PricingRules"], fields=["source", "valid_from", "valid_to"]):
+        f = rec["fields"]
+        if f.get("valid_to"):
+            continue
+        active_count += 1
+        if f.get("source"):
+            sources[f["source"]] += 1
+        if f.get("valid_from") and (latest_vf is None or f["valid_from"] > latest_vf):
+            latest_vf = f["valid_from"]
+    products_with_retro = sum(
+        1
+        for rec in _list_all(T["Products"], fields=["retro_per_keg"])
+        if (rec["fields"].get("retro_per_keg") or 0) > 0
+    )
+    return {
+        "sources": [name for name, _ in sources.most_common()],
+        "latest_valid_from": latest_vf,
+        "active_rule_count": active_count,
+        "products_with_retro": products_with_retro,
+    }
+
+
 def load_agreed_retros() -> dict[str, dict]:
     """Returns {product_code: {description, agreed_retro}} from Products.retro_per_keg."""
     out: dict[str, dict] = {}

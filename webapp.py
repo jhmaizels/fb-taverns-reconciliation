@@ -34,6 +34,7 @@ from airtable_io import (  # noqa: E402
     write_mismatches,
     write_retro_findings,
     load_agreed_retros,
+    get_active_master_info,
     BASE_ID,
 )
 from summary import build_summary, render_summary_html  # noqa: E402
@@ -92,6 +93,8 @@ PAGE_HEAD = """<!doctype html>
   .pill { display: inline-block; background: #eef; color: #335; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.8em; margin-left: 0.6em; font-weight: 400; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; max-width: 1080px; }
   .grid2 form h3 { margin-top: 0; color: #2c5aa0; }
+  .master-banner { background: #fffbe7; border: 1px solid #e6d480; border-radius: 6px; padding: 0.7em 1em; margin: 0 0 1.5em; font-size: 0.92em; color: #4a3f10; }
+  .master-banner .sep { color: #b09d50; margin: 0 0.4em; }
 </style>
 </head><body>
 """
@@ -113,11 +116,34 @@ def version():
     }
 
 
+def _master_banner_html() -> str:
+    try:
+        info = get_active_master_info()
+    except Exception:
+        return ""
+    sources = info.get("sources") or []
+    src_text = sources[0] if sources else "<em>none</em>"
+    if len(sources) > 1:
+        src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
+    vf = info.get("latest_valid_from") or "—"
+    rules = info.get("active_rule_count", 0)
+    retros = info.get("products_with_retro", 0)
+    return (
+        '<div class="master-banner">'
+        f'<strong>Master:</strong> {src_text}'
+        f' <span class="sep">·</span> effective from <strong>{vf}</strong>'
+        f' <span class="sep">·</span> {rules} active rules'
+        f' <span class="sep">·</span> {retros} products with retros'
+        '</div>'
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(_user: str = Depends(check_auth)):
     return f"""{PAGE_HEAD}
 <h1>FB Taverns Reconciliation</h1>
 <p class="sub">Upload a supplier file. Results post to Airtable.</p>
+{_master_banner_html()}
 <div class="grid2">
   <form action="/upload" method="post" enctype="multipart/form-data">
     <h3>Weekly sales</h3>
@@ -188,6 +214,7 @@ async def upload(
     return f"""{PAGE_HEAD}
 <h1>Reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
+{_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Upload another</a>
@@ -240,6 +267,7 @@ async def upload_retro(
     return f"""{PAGE_HEAD}
 <h1>Retro reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
+{_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Upload another</a>
