@@ -100,6 +100,8 @@ PAGE_HEAD = """<!doctype html>
   .grid2 form h3 { margin-top: 0; color: #2c5aa0; }
   .master-banner { background: #fffbe7; border: 1px solid #e6d480; border-radius: 6px; padding: 0.7em 1em; margin: 0 0 1.5em; font-size: 0.92em; color: #4a3f10; }
   .master-banner .sep { color: #b09d50; margin: 0 0.4em; }
+  .help { font-size: 0.85em; color: #555; margin: -0.4em 0 1em; line-height: 1.4; }
+  .help strong { color: #2c5aa0; }
 </style>
 </head><body>
 """
@@ -196,9 +198,14 @@ def home(_user: str = Depends(check_auth)):
     <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
     <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
+    <p class="help">The date the new prices apply from. Sales <em>before</em> this date will still reconcile against the previous master.<br>
+    &bull; Annual RPI: the agreed uplift date (e.g. 1 April).<br>
+    &bull; New tenant: the handover date.<br>
+    &bull; <strong>Fixing a typo in the current master:</strong> use the same date the current master started, so historical reconciliations get re-run against the corrected prices.</p>
     <label for="reason">What changed?</label>
     <input type="text" name="reason" id="reason" maxlength="200"
        placeholder="e.g. April 2026 RPI uplift v8 — fixes Fosters retro">
+    <p class="help">A short note for the audit trail. One sentence is enough.</p>
     <label for="m-file">Master file (.xlsx)</label>
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
     <button type="submit">Upload new version</button>
