@@ -44,9 +44,14 @@ class FBProductBlock:
     expected: float
     actual: float
     delta_per_unit: float
-    sites: list[tuple[str, str, float]] = field(default_factory=list)  # (site_id, site_name, qty)
+    # site_id -> (site_name, total_qty_at_site, total_delta_at_site)
+    site_totals: dict[str, tuple[str, float, float]] = field(default_factory=dict)
     total_qty: float = 0.0
     total_delta: float = 0.0
+
+    @property
+    def site_count(self) -> int:
+        return len(self.site_totals)
 
 
 @dataclass
@@ -57,6 +62,16 @@ class MissingSite:
 
 
 @dataclass
+class OtherFindingRow:
+    site_id: str
+    site_name: str
+    product_code: str
+    product_desc: str
+    qty: float
+    notes: str = ""
+
+
+@dataclass
 class Summary:
     file_name: str
     line_count: int
@@ -64,7 +79,10 @@ class Summary:
     tenant_blocks: list[TenantSiteBlock]
     fb_blocks: list[FBProductBlock]
     missing_sites: list[MissingSite]
-    other_counts: dict[str, int]  # mismatch types not in the three sections
+    products_not_on_master: list[OtherFindingRow]
+    tenant_price_missing: list[OtherFindingRow]
+    sites_in_sales_not_on_master: list[OtherFindingRow]
+    other_counts: dict[str, int]  # everything else (arithmetic_error, etc.)
     total_tenant_delta: float = 0.0
     total_fb_delta: float = 0.0
 
@@ -76,7 +94,13 @@ def build_summary(
     lines: list[InvoiceLine],
     mismatches: list[Mismatch],
     sites_master: dict[str, dict],
+    active_site_ids: set[str] | None = None,
 ) -> Summary:
+    """
+    active_site_ids — sites currently on the master (have at least one open
+    pricing rule). Section 3 ("didn't buy this week") is filtered to only
+    these. If None, falls back to all sites in sites_master (legacy behaviour).
+    """
     # 1. Tenant pricing mismatches grouped by site
     by_site: dict[str, TenantSiteBlock] = {}
     for m in mismatches:
@@ -106,7 +130,9 @@ def build_summary(
     for b in tenant_blocks:
         b.rows.sort(key=lambda r: -abs(r.delta_total))
 
-    # 2. FB pricing mismatches aggregated by product
+    # 2. FB pricing mismatches aggregated by product, then by distinct site.
+    # Multiple delivery rows for the same site/product collapse to one site
+    # entry whose qty is the sum across rows. site_count = distinct sites.
     fb_agg: dict[tuple[str, float, float], FBProductBlock] = {}
     for m in mismatches:
         if m.type != "wrong_fb_price":
@@ -126,32 +152,73 @@ def build_summary(
                 delta_per_unit=m.delta_per_unit,
             )
             fb_agg[key] = block
-        block.sites.append((m.line.site_id, m.line.site_name, m.line.qty))
+        existing = block.site_totals.get(m.line.site_id)
+        if existing:
+            block.site_totals[m.line.site_id] = (
+                existing[0],
+                existing[1] + m.line.qty,
+                existing[2] + m.delta_total,
+            )
+        else:
+            block.site_totals[m.line.site_id] = (m.line.site_name, m.line.qty, m.delta_total)
         block.total_qty += m.line.qty
         block.total_delta += m.delta_total
 
     fb_blocks = sorted(fb_agg.values(), key=lambda b: -abs(b.total_delta))
-    for b in fb_blocks:
-        b.sites.sort(key=lambda s: s[0])
 
-    # 3. Sites in the master that didn't appear in this file's lines
+    # 3. Sites in the master that didn't appear in this file's lines.
+    # Per addendum Patch 2: only include sites that are CURRENTLY on the
+    # master (have at least one active rule). YOF Ltd 840-style entries
+    # that are in the Sites table but not on the cost file shouldn't appear.
     sites_in_file = {l.site_id for l in lines if l.site_id}
+    expected_sites = active_site_ids if active_site_ids is not None else set(sites_master.keys())
     missing: list[MissingSite] = []
-    for sid, info in sorted(sites_master.items()):
+    for sid in sorted(expected_sites):
         if sid not in sites_in_file:
+            info = sites_master.get(sid) or {}
             missing.append(
                 MissingSite(
                     site_id=sid,
-                    site_name=(info or {}).get("name", ""),
-                    status=(info or {}).get("status", "tenanted"),
+                    site_name=info.get("name", ""),
+                    status=info.get("status", "tenanted"),
                 )
             )
 
+    # 4a-c. Split the former "Other findings" / no_rule_for_line into actionable buckets.
+    products_not_on_master: list[OtherFindingRow] = []
+    tenant_price_missing: list[OtherFindingRow] = []
+    sites_in_sales_not_on_master: list[OtherFindingRow] = []
+    seen_unknown_site_keys: set[tuple[str, str]] = set()
     other_counts: dict[str, int] = {}
+
     for m in mismatches:
-        if m.type in ("wrong_tenant_price", "wrong_fb_price"):
+        t = m.type
+        if t in ("wrong_tenant_price", "wrong_fb_price"):
             continue
-        other_counts[m.type] = other_counts.get(m.type, 0) + 1
+        line = m.line
+        row = OtherFindingRow(
+            site_id=line.site_id,
+            site_name=line.site_name,
+            product_code=line.product_code,
+            product_desc=line.product_desc,
+            qty=line.qty,
+            notes=m.notes,
+        )
+        if t == "product_not_on_master":
+            products_not_on_master.append(row)
+        elif t == "tenant_price_missing":
+            tenant_price_missing.append(row)
+        elif t == "unknown_site":
+            key = (line.site_id, line.site_name)
+            if key not in seen_unknown_site_keys:
+                seen_unknown_site_keys.add(key)
+                sites_in_sales_not_on_master.append(row)
+        else:
+            other_counts[t] = other_counts.get(t, 0) + 1
+
+    products_not_on_master.sort(key=lambda r: (r.product_code, r.site_id))
+    tenant_price_missing.sort(key=lambda r: (r.site_id, r.product_code))
+    sites_in_sales_not_on_master.sort(key=lambda r: r.site_id)
 
     return Summary(
         file_name=file_name,
@@ -160,6 +227,9 @@ def build_summary(
         tenant_blocks=tenant_blocks,
         fb_blocks=fb_blocks,
         missing_sites=missing,
+        products_not_on_master=products_not_on_master,
+        tenant_price_missing=tenant_price_missing,
+        sites_in_sales_not_on_master=sites_in_sales_not_on_master,
         other_counts=other_counts,
         total_tenant_delta=sum(b.total_delta for b in tenant_blocks),
         total_fb_delta=sum(b.total_delta for b in fb_blocks),
@@ -225,7 +295,7 @@ def render_summary_html(s: Summary) -> str:
 
     parts.append("<h2>2. FB Taverns pricing mismatches — by product</h2>")
     if not s.fb_blocks:
-        parts.append("<p><em>No FB pricing mismatches.</em></p>")
+        parts.append("<p><em>No FB pricing mismatches above the £0.05 / unit threshold.</em></p>")
     else:
         parts.append(
             """<table>
@@ -239,7 +309,10 @@ def render_summary_html(s: Summary) -> str:
         )
         for b in s.fb_blocks:
             cls = "neg" if b.total_delta < 0 else "pos"
-            sites_attr = "; ".join(f"{sid} {name} (qty {q:g})" for sid, name, q in b.sites)
+            sites_attr = "; ".join(
+                f"{sid} {name} (qty {q:g})"
+                for sid, (name, q, _d) in sorted(b.site_totals.items())
+            )
             parts.append(
                 f"<tr class='{cls}'>"
                 f"<td>{escape(b.product_code)}</td>"
@@ -247,7 +320,7 @@ def render_summary_html(s: Summary) -> str:
                 f"<td class='r'>{_money_neutral(b.expected)}</td>"
                 f"<td class='r'>{_money_neutral(b.actual)}</td>"
                 f"<td class='r'>{_money(b.delta_per_unit)}</td>"
-                f"<td class='r' title='{escape(sites_attr)}'>{len(b.sites)}</td>"
+                f"<td class='r' title='{escape(sites_attr)}'>{b.site_count}</td>"
                 f"<td class='r'>{b.total_qty:g}</td>"
                 f"<td class='r'><strong>{_money(b.total_delta)}</strong></td>"
                 f"</tr>"
@@ -267,9 +340,55 @@ def render_summary_html(s: Summary) -> str:
             )
         parts.append("</tbody></table>")
 
+    parts.append("<h2>4. Other findings</h2>")
+
+    parts.append(
+        f"<h3>Products not on master <span class='pill'>{len(s.products_not_on_master)}</span></h3>"
+    )
+    if not s.products_not_on_master:
+        parts.append("<p><em>None.</em></p>")
+    else:
+        parts.append("<p class='sub'>Add a product row to the master, or treat as a one-off guest line.</p>")
+        parts.append(
+            "<table><thead><tr><th>Code</th><th>Description</th><th>Site</th><th>Site name</th><th class='r'>Qty</th></tr></thead><tbody>"
+        )
+        for r in s.products_not_on_master:
+            parts.append(
+                f"<tr><td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
+                f"<td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
+                f"<td class='r'>{r.qty:g}</td></tr>"
+            )
+        parts.append("</tbody></table>")
+
+    parts.append(
+        f"<h3>Tenant price missing for site <span class='pill'>{len(s.tenant_price_missing)}</span></h3>"
+    )
+    if not s.tenant_price_missing:
+        parts.append("<p><em>None.</em></p>")
+    else:
+        parts.append("<p class='sub'>Product is on the master but the tenant-price cell for this site is blank — populate it.</p>")
+        parts.append(
+            "<table><thead><tr><th>Site</th><th>Site name</th><th>Code</th><th>Description</th><th class='r'>Qty</th></tr></thead><tbody>"
+        )
+        for r in s.tenant_price_missing:
+            parts.append(
+                f"<tr><td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
+                f"<td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
+                f"<td class='r'>{r.qty:g}</td></tr>"
+            )
+        parts.append("</tbody></table>")
+
+    if s.sites_in_sales_not_on_master:
+        parts.append(
+            f"<h3>Sites in sales but not on master <span class='pill'>{len(s.sites_in_sales_not_on_master)}</span></h3>"
+        )
+        parts.append("<table><thead><tr><th>Site</th><th>Site name</th></tr></thead><tbody>")
+        for r in s.sites_in_sales_not_on_master:
+            parts.append(f"<tr><td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td></tr>")
+        parts.append("</tbody></table>")
+
     if s.other_counts:
-        parts.append("<h2>Other findings</h2>")
-        parts.append("<div class='result'>")
+        parts.append("<h3>Other</h3><div class='result'>")
         for t, c in sorted(s.other_counts.items(), key=lambda kv: -kv[1]):
             parts.append(f"<div class='summary-row'><span>{escape(t)}</span><strong>{c}</strong></div>")
         parts.append("</div>")

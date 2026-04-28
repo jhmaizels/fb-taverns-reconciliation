@@ -421,6 +421,7 @@ LWC_COLUMN_MAP = {
     "ACCOUNT NO": "account_no",
     "SITE ID": "site_id",
     "ACCOUNT": "account_name",
+    "OUTLET": "account_name",  # newer LWC files (Apr 2026+) renamed ACCOUNT → OUTLET
     "PRODUCT CODE": "product_code",
     "PRODUCT DESC": "product_desc",
     "INVOICE NO": "invoice_no",
@@ -433,6 +434,14 @@ LWC_COLUMN_MAP = {
     "DIFF. MASTER": "diff_master",
     "DIFF. + VAT": "diff_plus_vat",
 }
+
+# Sales-report account number → cost-file account number bridge.
+# Only populate entries where LWC has reassigned the same site to a new
+# account on the sales report but the master still has the old account.
+# Once the master is updated, remove the entry. Empty dict is the normal state.
+# Our reconciliation joins by site_id (col SITE ID), not account, so this
+# bridge is mainly future-proofing / used only in diagnostics.
+ACCOUNT_BRIDGE: dict[str, str] = {}
 
 
 @dataclass
@@ -595,9 +604,22 @@ def reconcile_lines(
     rules: list[Rule],
     sites: dict[str, dict],
     tolerance: float = 0.01,
+    fb_tolerance: float | None = None,
 ) -> list[Mismatch]:
+    """
+    tolerance     — per-unit £ tolerance for tenant_price comparisons (default 1p).
+    fb_tolerance  — per-unit £ tolerance for fb_price comparisons. Defaults to 5p
+                    because LWC's MASTER column is rounded to 2dp while our list
+                    price can be a formula result with sub-penny artefacts.
+    """
+    if fb_tolerance is None:
+        fb_tolerance = 0.05
     idx = _index_rules(rules)
-    sites_with_rules = {sid for sid, _ in {(r.site_id, r.product_code) for r in rules}}
+    # Only count CURRENTLY-active rules (valid_to is None) when deciding what's
+    # "on the master" — historical rules that have been superseded shouldn't
+    # make a product look present when it was dropped from a newer master.
+    sites_with_rules = {r.site_id for r in rules if r.valid_to is None}
+    products_in_master = {r.product_code for r in rules if r.valid_to is None}
     mismatches: list[Mismatch] = []
 
     for line in lines:
@@ -648,17 +670,34 @@ def reconcile_lines(
                     )
                 )
                 continue
-            mismatches.append(
-                Mismatch(
-                    type="no_rule_for_line",
-                    severity="medium",
-                    line=line,
-                    notes=(
-                        f"No rule for site {line.site_id} / product {line.product_code} "
-                        f"on {line.invoice_date}"
-                    ),
+            # Split former no_rule_for_line into two actionable buckets:
+            #   product not on master  → master needs a new product row added
+            #   tenant price missing   → master has the product, but the cell
+            #                             for this site is blank (needs filling)
+            if line.product_code not in products_in_master:
+                mismatches.append(
+                    Mismatch(
+                        type="product_not_on_master",
+                        severity="medium",
+                        line=line,
+                        notes=(
+                            f"Product {line.product_code} ({line.product_desc}) "
+                            "not present in any master rule — add it (or treat as guest)."
+                        ),
+                    )
                 )
-            )
+            else:
+                mismatches.append(
+                    Mismatch(
+                        type="tenant_price_missing",
+                        severity="medium",
+                        line=line,
+                        notes=(
+                            f"Site {line.site_id} ({line.site_name}) has no tenant "
+                            f"price set for {line.product_code} — populate the cell."
+                        ),
+                    )
+                )
             continue
 
         if rule.status == "managed":
@@ -696,7 +735,7 @@ def reconcile_lines(
 
         if rule.fb_price is not None:
             delta_unit = line.master_price - rule.fb_price
-            if abs(delta_unit) > tolerance:
+            if abs(delta_unit) > fb_tolerance:
                 mismatches.append(
                     Mismatch(
                         type="wrong_fb_price",
@@ -790,7 +829,8 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--master", default="master_pricing.csv", help="Master pricing CSV (ignored if --use-airtable)")
     rp.add_argument("--sites", default="sites.csv", help="Sites CSV (ignored if --use-airtable)")
     rp.add_argument("--out", default=None, help="Mismatch report CSV (default: outputs/<sales-stem>__mismatches.csv)")
-    rp.add_argument("--tolerance", type=float, default=0.01, help="Per-unit £ tolerance")
+    rp.add_argument("--tolerance", type=float, default=0.01, help="Per-unit £ tenant-price tolerance")
+    rp.add_argument("--fb-tolerance", type=float, default=0.05, help="Per-unit £ FB-price tolerance (rounding-noise threshold)")
     rp.add_argument(
         "--use-airtable",
         action="store_true",
@@ -839,7 +879,7 @@ def main(argv: list[str] | None = None) -> int:
         lines = parse_lwc_sales(args.sales_file)
         if not rules:
             sys.exit("No pricing rules loaded — refusing to reconcile.")
-        mismatches = reconcile_lines(lines, rules, sites, tolerance=args.tolerance)
+        mismatches = reconcile_lines(lines, rules, sites, tolerance=args.tolerance, fb_tolerance=args.fb_tolerance)
 
         out_path = args.out
         if out_path is None:

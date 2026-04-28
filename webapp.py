@@ -138,6 +138,7 @@ async def upload(
         if not rules:
             return _error_page("No pricing rules found in Airtable. Run build-master first.")
         sites = load_sites_from_airtable()
+        active_site_ids = {r.site_id for r in rules if r.valid_to is None}
 
         lines = parse_lwc_sales(tmp_path)
         mismatches = reconcile_lines(lines, rules, sites)
@@ -158,7 +159,7 @@ async def upload(
             except OSError:
                 pass
 
-    summary = build_summary(original_name, lines, mismatches, sites)
+    summary = build_summary(original_name, lines, mismatches, sites, active_site_ids=active_site_ids)
     summary_html = render_summary_html(summary)
 
     return f"""{PAGE_HEAD}
