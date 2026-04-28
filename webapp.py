@@ -99,6 +99,15 @@ def healthz():
     return {"status": "ok"}
 
 
+@app.get("/version")
+def version():
+    """Returns the running git commit (Render injects RENDER_GIT_COMMIT)."""
+    return {
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(_user: str = Depends(check_auth)):
     return f"""{PAGE_HEAD}
