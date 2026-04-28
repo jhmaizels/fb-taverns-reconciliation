@@ -64,7 +64,6 @@ def build_master_xlsx_bytes(as_of: date | None = None) -> bytes:
     # product_codes: anything with an active rule OR a retro on the master
     codes_active = {r.product_code for r in active_rules}
     codes_retro = {c for c, p in products_by_code.items() if p["retro_per_keg"] > 0}
-    product_codes = sorted(codes_active | codes_retro)
 
     # fb_price per product: take from any active rule for that product (they're equal)
     product_fb: dict[str, float] = {}
@@ -76,6 +75,12 @@ def build_master_xlsx_bytes(as_of: date | None = None) -> bytes:
             product_name[r.product_code] = r.product_desc
     for code, p in products_by_code.items():
         product_name.setdefault(code, p["name"])
+
+    # Sort products alphabetically by name (case-insensitive); code as tiebreaker
+    product_codes = sorted(
+        codes_active | codes_retro,
+        key=lambda c: (product_name.get(c, "").upper(), c),
+    )
 
     # tenant prices: (site, product) -> price
     tenant: dict[tuple[str, str], float] = {}
