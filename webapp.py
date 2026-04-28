@@ -202,10 +202,6 @@ def home(_user: str = Depends(check_auth)):
     &bull; Annual RPI: the agreed uplift date (e.g. 1 April).<br>
     &bull; New tenant: the handover date.<br>
     &bull; <strong>Fixing a typo in the current master:</strong> use the same date the current master started, so historical reconciliations get re-run against the corrected prices.</p>
-    <label for="reason">What changed?</label>
-    <input type="text" name="reason" id="reason" maxlength="200"
-       placeholder="e.g. April 2026 RPI uplift v8 — fixes Fosters retro">
-    <p class="help">A short note for the audit trail. One sentence is enough.</p>
     <label for="m-file">Master file (.xlsx)</label>
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
     <button type="submit">Upload new version</button>
