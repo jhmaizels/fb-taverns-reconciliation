@@ -401,6 +401,179 @@ def _rule_lookup() -> dict[str, str]:
     }
 
 
+# ---------- Tennents Direct I/O ----------
+
+def load_tennents_agreements():
+    """Load TennentsAgreements rows as Agreement dataclass instances."""
+    from tennents import Agreement  # local import to avoid circular dep
+    out = []
+    for rec in _list_all(T["TennentsAgreements"]):
+        f = rec["fields"]
+        if not f.get("account") or not f.get("sku_code"):
+            continue
+        out.append(Agreement(
+            account=f.get("account", "") or "",
+            customer_name=f.get("customer_name", "") or "",
+            sku_code=f.get("sku_code", "") or "",
+            sku_desc=f.get("sku_desc", "") or "",
+            tenant_invoice=float(f.get("tenant_invoice") or 0),
+            fb_net_price=float(f.get("fb_net_price") or 0),
+            off_invoice_per_brl=float(f.get("off_invoice_per_brl") or 0),
+            retro_per_brl=float(f.get("retro_per_brl") or 0),
+            total_per_brl=float(f.get("total_per_brl") or 0),
+            source=f.get("source", "") or "",
+        ))
+    return out
+
+
+def replace_tennents_master(agreements, source: str) -> tuple[int, int]:
+    """
+    Wipe TennentsAgreements and replace with new master.
+    Returns (deleted, created).
+    """
+    table_id = T["TennentsAgreements"]
+    existing_ids = [rec["id"] for rec in _list_all(table_id, fields=["agreement_key"])]
+    deleted = 0
+    if existing_ids:
+        for i in range(0, len(existing_ids), 10):
+            chunk = existing_ids[i:i+10]
+            r = requests.delete(f"{DATA_URL}/{table_id}", headers=HEADERS, params={"records[]": chunk})
+            r.raise_for_status()
+            deleted += len(chunk)
+            time.sleep(0.25)
+
+    payload = []
+    for ag in agreements:
+        payload.append({"fields": {
+            "agreement_key": f"{ag.account}|{ag.sku_code}",
+            "account": ag.account,
+            "customer_name": ag.customer_name,
+            "sku_code": ag.sku_code,
+            "sku_desc": ag.sku_desc,
+            "tenant_invoice": float(ag.tenant_invoice),
+            "fb_net_price": float(ag.fb_net_price),
+            "off_invoice_per_brl": float(ag.off_invoice_per_brl),
+            "retro_per_brl": float(ag.retro_per_brl),
+            "total_per_brl": float(ag.total_per_brl),
+            "source": source,
+        }})
+    created = len(_batch(payload, "create", table_id)) if payload else 0
+    return deleted, created
+
+
+def get_tennents_master_info() -> dict:
+    """Summary for the Tennents card on the index page."""
+    from collections import Counter
+    sources: Counter[str] = Counter()
+    customers: set = set()
+    latest: str | None = None
+    count = 0
+    for rec in _list_all(T["TennentsAgreements"]):
+        f = rec["fields"]
+        count += 1
+        if f.get("source"):
+            sources[f["source"]] += 1
+        if f.get("account"):
+            customers.add(f["account"])
+        ct = rec.get("createdTime")
+        if ct and (latest is None or ct > latest):
+            latest = ct
+    return {
+        "sources": [s for s, _ in sources.most_common()],
+        "agreement_count": count,
+        "customer_count": len(customers),
+        "latest_uploaded_at": latest,
+    }
+
+
+def write_tennents_findings(summary, file_record_id: str) -> int:
+    """Persist Tennents reconciliation findings to the Mismatches table."""
+    table_id = T["Mismatches"]
+    payload = []
+
+    def _key(prefix: str, *bits) -> str:
+        return f"{file_record_id}|tennents|{prefix}|" + "|".join(str(b) for b in bits)
+
+    for r in summary.invoice_mismatches:
+        payload.append({"fields": {
+            "mismatch_key": _key("invoice", r.account, r.sku_code),
+            "type": "tennents_wrong_invoice",
+            "severity": "high" if abs(r.delta_per_unit * r.kegs) >= 50 else "medium",
+            "file": [file_record_id],
+            "expected_tenant_price": float(r.expected),
+            "actual_tenant_price": float(r.actual),
+            "delta_per_unit": float(r.delta_per_unit),
+            "delta_total": float(r.delta_per_unit * r.kegs),
+            "qty": float(r.kegs),
+            "status": "open",
+            "notes": f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc}",
+        }})
+
+    for r in summary.fb_price_mismatches:
+        payload.append({"fields": {
+            "mismatch_key": _key("fb", r.sku_code, round(r.expected, 4), round(r.actual, 4)),
+            "type": "tennents_wrong_fb_price",
+            "severity": "medium",
+            "file": [file_record_id],
+            "expected_fb_price": float(r.expected),
+            "actual_fb_price": float(r.actual),
+            "delta_per_unit": float(r.delta_per_unit),
+            "delta_total": float(r.delta_per_unit * r.total_kegs),
+            "qty": float(r.total_kegs),
+            "status": "open",
+            "notes": f"Tennents {r.sku_code} {r.sku_desc} across {len(r.sites_affected)} sites",
+        }})
+
+    for r in summary.discount_mismatches:
+        sev = "high" if abs(r.delta_total) >= 100 else ("medium" if abs(r.delta_total) >= 10 else "low")
+        payload.append({"fields": {
+            "mismatch_key": _key("disc", r.account, r.sku_code),
+            "type": "tennents_wrong_discount",
+            "severity": sev,
+            "file": [file_record_id],
+            "expected_fb_price": float(r.expected),  # repurpose for £/Brl
+            "actual_fb_price": float(r.actual),
+            "delta_per_unit": float(r.delta_per_brl),
+            "delta_total": float(r.delta_total),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — "
+                f"discount £/Brl: master {r.expected:+.2f}, actual {r.actual:+.2f}"
+            ),
+        }})
+
+    for r in summary.not_on_master:
+        payload.append({"fields": {
+            "mismatch_key": _key("nomaster", r.account, r.sku_code),
+            "type": "tennents_not_on_master",
+            "severity": "medium",
+            "file": [file_record_id],
+            "qty": float(r.kegs),
+            "status": "open",
+            "notes": (
+                f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — "
+                f"delivered {r.kegs:g} kegs but no master agreement exists. "
+                f"Avg invoice £{r.avg_invoice:.2f}, avg discount £{r.avg_discount_per_brl:.2f}/Brl."
+            ),
+        }})
+
+    for r in summary.customers_not_on_master:
+        acct, name = r
+        payload.append({"fields": {
+            "mismatch_key": _key("newcust", acct),
+            "type": "tennents_new_customer",
+            "severity": "medium",
+            "file": [file_record_id],
+            "status": "open",
+            "notes": f"Tennents new customer {acct} {name} — needs master entries built.",
+        }})
+
+    if not payload:
+        return 0
+    return len(_batch(payload, "create", table_id))
+
+
 def write_retro_findings(retro_summary, file_record_id: str) -> int:
     """
     Persist retro findings (under-paid, over-paid, paid-not-on-master) to the

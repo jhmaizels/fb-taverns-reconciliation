@@ -49,7 +49,17 @@ from airtable_io import (  # noqa: E402
     get_active_master_info,
     upsert_pricing_rules,
     upsert_products_with_retros,
+    load_tennents_agreements,
+    replace_tennents_master,
+    get_tennents_master_info,
+    write_tennents_findings,
     BASE_ID,
+)
+from tennents import (  # noqa: E402
+    parse_master as parse_tennents_master,
+    parse_monthly as parse_tennents_monthly,
+    reconcile as reconcile_tennents,
+    render_summary_html as render_tennents_summary_html,
 )
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
@@ -107,6 +117,13 @@ PAGE_HEAD = """<!doctype html>
   .pill { display: inline-block; background: #eef; color: #335; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.8em; margin-left: 0.6em; font-weight: 400; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; max-width: 1080px; }
   .grid2 form h3 { margin-top: 0; color: #2c5aa0; }
+  .card-link { display: block; padding: 1.5em; background: #f6f9ff; border: 1px solid #c7d8f0; border-radius: 8px; text-decoration: none; color: #222; transition: background 0.1s; }
+  .card-link:hover { background: #eaf1fa; }
+  .card-link h2 { color: #2c5aa0; border-bottom: none; padding-bottom: 0; }
+  .card-tag { display: inline-block; background: #e0e8f0; color: #2c5aa0; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.5em; font-weight: 600; vertical-align: middle; margin-left: 0.5em; }
+  .card-meta { background: #fff; padding: 0.7em 1em; border-radius: 4px; font-size: 0.9em; }
+  .card-cta { color: #2c5aa0; font-weight: 600; }
+  .estate-tag { display: inline-block; background: #e0e8f0; color: #2c5aa0; padding: 0.15em 0.7em; border-radius: 12px; font-size: 0.4em; font-weight: 600; vertical-align: middle; margin-left: 0.5em; }
   .grid2 form > h3 + h3, .grid2 form .second-h3 { margin-top: 1.5em; padding-top: 1em; border-top: 1px solid #ddd; }
   textarea { width: 100%; padding: 0.5em; box-sizing: border-box; font-family: inherit; font-size: 0.95em; min-height: 80px; }
   .support-tag { display: inline-block; background: #fff4cf; color: #8a6500; padding: 0.05em 0.5em; border-radius: 8px; font-size: 0.7em; font-weight: 700; margin-left: 0.5em; vertical-align: middle; }
@@ -168,10 +185,55 @@ def _master_banner_html() -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(_user: str = Depends(check_auth)):
-    today_iso = date.today().isoformat()
+def index(_user: str = Depends(check_auth)):
+    """Two-card index — pick a supplier estate."""
+    try:
+        lwc_info = get_active_master_info()
+    except Exception:
+        lwc_info = {}
+    try:
+        ten_info = get_tennents_master_info()
+    except Exception:
+        ten_info = {}
+
+    lwc_master = (lwc_info.get("sources") or ["—"])[0]
+    lwc_rules = lwc_info.get("active_rule_count", 0)
+    ten_master = (ten_info.get("sources") or ["—"])[0]
+    ten_count = ten_info.get("agreement_count", 0)
+    ten_customers = ten_info.get("customer_count", 0)
+
     return f"""{PAGE_HEAD}
 <h1>FB Taverns Reconciliation</h1>
+<p class="sub">Pick the supplier estate to reconcile against. Each has its own master and reconciliation flow.</p>
+<div class="grid2">
+  <a href="/lwc" class="card-link">
+    <h2 style="margin-top:0">LWC <span class="card-tag">England</span></h2>
+    <p>Weekly sales report + monthly retro statement. Per-site, per-product tenant pricing with FB cost and retro.</p>
+    <p class="card-meta">
+      <strong>Master:</strong> <code>{escape(lwc_master)}</code><br>
+      <strong>{lwc_rules}</strong> active pricing rules
+    </p>
+    <p><span class="card-cta">Open LWC reconciliation →</span></p>
+  </a>
+  <a href="/tennents" class="card-link">
+    <h2 style="margin-top:0">Tennents Direct <span class="card-tag">Scotland</span></h2>
+    <p>Monthly draught pricing report combining invoice, discount and retro data. Per-(customer, SKU) discount agreements.</p>
+    <p class="card-meta">
+      <strong>Master:</strong> <code>{escape(ten_master)}</code><br>
+      <strong>{ten_count}</strong> agreements across <strong>{ten_customers}</strong> customers
+    </p>
+    <p><span class="card-cta">Open Tennents reconciliation →</span></p>
+  </a>
+</div>
+{PAGE_FOOT}"""
+
+
+@app.get("/lwc", response_class=HTMLResponse)
+def lwc_home(_user: str = Depends(check_auth)):
+    today_iso = date.today().isoformat()
+    return f"""{PAGE_HEAD}
+<p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
+<h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
 <p class="sub">Upload a supplier file to reconcile. Or update the pricing master.</p>
 {_master_banner_html()}
 
@@ -535,6 +597,162 @@ async def add_support(
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Back to home</a>
 </p>
+{PAGE_FOOT}"""
+
+
+# ---------- Tennents Direct ----------
+
+def _tennents_master_banner_html() -> str:
+    try:
+        info = get_tennents_master_info()
+    except Exception:
+        return ""
+    sources = info.get("sources") or []
+    src_text = sources[0] if sources else "<em>none uploaded yet</em>"
+    if len(sources) > 1:
+        src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
+    uploaded_at = (info.get("latest_uploaded_at") or "").replace("T", " ")[:16]
+    upload_chip = (
+        f' <span class="sep">·</span> uploaded <strong>{uploaded_at}</strong>'
+        if uploaded_at else ""
+    )
+    return (
+        '<div class="master-banner">'
+        f'<strong>Current master:</strong> {src_text}'
+        f'{upload_chip}'
+        f' <span class="sep">·</span> {info.get("agreement_count", 0)} agreements'
+        f' <span class="sep">·</span> {info.get("customer_count", 0)} customers'
+        '</div>'
+    )
+
+
+@app.get("/tennents", response_class=HTMLResponse)
+def tennents_home(_user: str = Depends(check_auth)):
+    return f"""{PAGE_HEAD}
+<p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
+<h1>Tennents Direct Reconciliation <span class="estate-tag">Scotland</span></h1>
+<p class="sub">Upload the monthly draught pricing report. Or update the discount-agreement master.</p>
+{_tennents_master_banner_html()}
+
+<h2>Reconcile a monthly file</h2>
+<form action="/upload-tennents" method="post" enctype="multipart/form-data" style="max-width: 540px">
+  <h3 style="margin-top:0; color: #2c5aa0">Monthly draught pricing report</h3>
+  <p class="sub">e.g. <code>FB Taverns Draught Pricing Report - January.xlsx</code>. The <code>Data</code> tab is the per-delivery line items.</p>
+  <label for="ten-file">Monthly file (.xlsx)</label>
+  <input type="file" name="file" id="ten-file" accept=".xlsx" required>
+  <button type="submit">Upload &amp; reconcile</button>
+</form>
+
+<h2>Discount-agreement master</h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0">The <strong>FB Taverns - Commercial Data</strong> Excel is the master. The <code>FB Taverns Discount</code> tab holds (Customer, SKU) discount agreements. Re-upload to replace the master wholesale.</p>
+</div>
+<form action="/upload-tennents-master" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
+  <h3 style="margin-top:0; color: #2c5aa0">Upload new master</h3>
+  <p class="sub">Replaces every Tennents agreement currently in the system. Old agreements are deleted; the new file's rows take their place.</p>
+  <label for="ten-master-file">Commercial Data file (.xlsx)</label>
+  <input type="file" name="file" id="ten-master-file" accept=".xlsx" required>
+  <button type="submit">Replace master</button>
+</form>
+
+<p style="margin-top:2em"><a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable base</a></p>
+{PAGE_FOOT}"""
+
+
+@app.post("/upload-tennents-master", response_class=HTMLResponse)
+async def upload_tennents_master(
+    file: UploadFile = File(...),
+    _user: str = Depends(check_auth),
+):
+    original_name = file.filename or "uploaded.xlsx"
+    if not original_name.lower().endswith(".xlsx"):
+        return _error_page(f"File must be .xlsx (got {original_name!r})")
+
+    suffix = Path(original_name).suffix or ".xlsx"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        agreements = parse_tennents_master(tmp_path)
+        if not agreements:
+            return _error_page("Master file produced zero agreements after parsing.")
+        deleted, created = replace_tennents_master(agreements, source=original_name)
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    customer_count = len({a.account for a in agreements})
+    return f"""{PAGE_HEAD}
+<p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
+<h1>Tennents master replaced</h1>
+{_tennents_master_banner_html()}
+<div class="result">
+  <div class="summary-row"><span>File</span><code>{escape(original_name)}</code></div>
+  <div class="summary-row"><span>Agreements deleted</span><strong>{deleted}</strong></div>
+  <div class="summary-row"><span>Agreements created</span><strong>{created}</strong></div>
+  <div class="summary-row"><span>Distinct customers</span><strong>{customer_count}</strong></div>
+</div>
+<p style="margin-top:1.5em">
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="/tennents" style="background:#666">Back to Tennents</a>
+</p>
+{PAGE_FOOT}"""
+
+
+@app.post("/upload-tennents", response_class=HTMLResponse)
+async def upload_tennents(
+    file: UploadFile = File(...),
+    _user: str = Depends(check_auth),
+):
+    original_name = file.filename or "uploaded.xlsx"
+    if not original_name.lower().endswith(".xlsx"):
+        return _error_page(f"File must be .xlsx (got {original_name!r})")
+
+    suffix = Path(original_name).suffix or ".xlsx"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        agreements = load_tennents_agreements()
+        if not agreements:
+            return _error_page("No Tennents master loaded yet — upload Commercial Data first.")
+        lines = parse_tennents_monthly(tmp_path)
+        summary = reconcile_tennents(original_name, agreements, lines)
+        file_rec_id = upsert_file_record(
+            tmp_path,
+            supplier="Tennents",
+            line_count=len(lines),
+            file_name_override=original_name,
+        )
+        n_findings = write_tennents_findings(summary, file_rec_id)
+    except Exception:
+        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    summary_html = render_tennents_summary_html(summary)
+    return f"""{PAGE_HEAD}
+<p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
+<h1>Tennents reconciliation complete</h1>
+<p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
+{_tennents_master_banner_html()}
+<p>
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="/tennents" style="background:#666">Upload another</a>
+</p>
+{summary_html}
 {PAGE_FOOT}"""
 
 
