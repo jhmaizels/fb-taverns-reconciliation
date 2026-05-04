@@ -20,7 +20,7 @@ from html import escape
 from pathlib import Path
 from typing import Annotated
 
-from datetime import date
+from datetime import date, timedelta
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
@@ -230,7 +230,13 @@ def index(_user: str = Depends(check_auth)):
 
 @app.get("/lwc", response_class=HTMLResponse)
 def lwc_home(_user: str = Depends(check_auth)):
-    today_iso = date.today().isoformat()
+    # Default "Effective from" to today minus 14 days. Master uploads are
+    # almost always corrections to the current master — this default makes
+    # the new master cover the most recent weekly LWC files (which span
+    # the past ~7 days) without any manual date entry. Override with an
+    # earlier date for full retroactive replacement, or a later one for
+    # genuine future-dated changes.
+    today_iso = (date.today() - timedelta(days=14)).isoformat()
     return f"""{PAGE_HEAD}
 <p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
@@ -270,10 +276,10 @@ def lwc_home(_user: str = Depends(check_auth)):
     <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
     <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
-    <p class="help">The date the new prices apply from. Sales <em>before</em> this date will still reconcile against the previous master.<br>
-    &bull; Annual RPI: the agreed uplift date (e.g. 1 April).<br>
-    &bull; New tenant: the handover date.<br>
-    &bull; <strong>Fixing a typo in the current master:</strong> use the same date the current master started, so historical reconciliations get re-run against the corrected prices.</p>
+    <p class="help">Defaults to <strong>today − 14 days</strong> — covers the latest LWC weekly file so a fresh upload immediately flows through. Sales <em>before</em> this date still reconcile against the previous master.<br>
+    &bull; <strong>Most uploads:</strong> leave the default. The new master picks up the most recent week's invoices.<br>
+    &bull; <strong>Fully retroactive correction</strong> (replace the prior master entirely): set this to whatever date the prior master started — typically the 1st of a month.<br>
+    &bull; <strong>Future-dated change</strong> (RPI agreed for a date that hasn't happened yet): set this to that date.</p>
     <label for="m-file">Master file (.xlsx)</label>
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
     <button type="submit">Upload new version</button>
