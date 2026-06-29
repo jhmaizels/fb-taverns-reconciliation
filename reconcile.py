@@ -16,7 +16,7 @@ import glob
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -474,7 +474,6 @@ class InvoiceLine:
     unit_price: float
     master_price: float
     diff_master: float
-    raw: dict = field(default_factory=dict)
 
 
 def _normalise_lwc_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -534,7 +533,6 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
                 unit_price=unit,
                 master_price=master,
                 diff_master=diff,
-                raw=row.to_dict(),
             )
         )
     return lines
@@ -935,4 +933,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _rc = main()
+    except Exception as _e:
+        # Airtable failures now raise AirtableError (instead of the old sys.exit).
+        # Surface a concise one-line message + non-zero exit for the CLI rather
+        # than a full traceback. Imported lazily — airtable_io is only loaded in
+        # --use-airtable / --to-airtable modes.
+        from airtable_io import AirtableError
+        if isinstance(_e, AirtableError):
+            raise SystemExit(f"Airtable error: {_e}")
+        raise
+    raise SystemExit(_rc)

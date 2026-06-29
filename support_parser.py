@@ -23,8 +23,6 @@ from __future__ import annotations
 import os
 from datetime import date
 
-import anthropic
-
 
 def parse_support_request(
     text: str,
@@ -45,6 +43,11 @@ def parse_support_request(
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise KeyError("ANTHROPIC_API_KEY environment variable is not set")
+
+    # Imported lazily: the Anthropic SDK is only needed by the /add-support
+    # route (~10 calls/year), so keeping it out of module import means it loads
+    # on demand rather than on every cold start / non-support request path.
+    import anthropic
 
     client = anthropic.Anthropic()
     today = date.today().isoformat()

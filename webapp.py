@@ -12,9 +12,11 @@ runs reconciliation, pushes mismatches + a Files row back to Airtable.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import tempfile
+import time
 import traceback
 from html import escape
 from pathlib import Path
@@ -38,9 +40,11 @@ from reconcile import (  # noqa: E402
     _parse_date,
     Rule,
 )
-from master_export import build_master_xlsx_bytes  # noqa: E402
+# master_export (which imports openpyxl) is imported lazily inside /export-master
+# so it stays off the cold-start / health-check readiness path.
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
+    load_master_snapshot,
     load_rules_from_airtable,
     load_sites_from_airtable,
     upsert_file_record,
@@ -77,6 +81,31 @@ WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD")
 
 AIRTABLE_BASE_URL = f"https://airtable.com/{BASE_ID}"
+
+# ---------- request + Airtable timing (INF-1) ----------
+# The service had never been profiled. Log one line per request (method, path,
+# status, ms) and rely on airtable_io's per-call _list_all/_batch lines (child
+# logger "fbtaverns.airtable") to break the upload down by table. Own handler +
+# propagate=False so logs land on stdout (Render captures it) without uvicorn
+# double-logging. Only counts/timing/paths are logged — never field contents or
+# the bearer token.
+logger = logging.getLogger("fbtaverns")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+@app.middleware("http")
+async def _timing_middleware(request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
+    logger.info("%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 def check_auth(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> str:
@@ -176,11 +205,12 @@ def version():
     }
 
 
-def _master_banner_html() -> str:
-    try:
-        info = get_active_master_info()
-    except Exception:
-        return ""
+def _master_banner_html(info: dict | None = None) -> str:
+    if info is None:
+        try:
+            info = get_active_master_info()
+        except Exception:
+            return ""
     sources = info.get("sources") or []
     src_text = sources[0] if sources else "<em>none uploaded yet</em>"
     if len(sources) > 1:
@@ -326,7 +356,7 @@ def lwc_home(_user: str = Depends(check_auth)):
 
 
 @app.post("/upload", response_class=HTMLResponse)
-async def upload(
+def upload(
     file: UploadFile = File(...),
     supplier: str = Form("LWC"),
     _user: str = Depends(check_auth),
@@ -339,13 +369,17 @@ async def upload(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(file.file.read())
             tmp_path = tmp.name
 
-        rules = load_rules_from_airtable()
+        # One coherent master read (Sites/Products/PricingRules fetched once),
+        # reused for reconcile, the mismatch link-resolution, and the banner —
+        # instead of re-fetching each table ~3x across this request.
+        snap = load_master_snapshot()
+        rules = snap.rules
         if not rules:
             return _error_page("No pricing rules found in Airtable. Run build-master first.")
-        sites = load_sites_from_airtable()
+        sites = snap.sites
         active_site_ids = {r.site_id for r in rules if r.valid_to is None}
 
         lines = parse_lwc_sales(tmp_path)
@@ -357,7 +391,10 @@ async def upload(
             line_count=len(lines),
             file_name_override=original_name,
         )
-        mismatch_count = write_mismatches(mismatches, file_rec_id)
+        mismatch_count = write_mismatches(
+            mismatches, file_rec_id,
+            site_ids=snap.site_ids, product_ids=snap.product_ids, rule_ids=snap.rule_ids,
+        )
     except Exception:
         return _error_page(f"<pre>{traceback.format_exc()}</pre>")
     finally:
@@ -373,7 +410,7 @@ async def upload(
     return f"""{PAGE_HEAD}
 <h1>Reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
-{_master_banner_html()}
+{_master_banner_html(snap.banner_info)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="/" style="background:#666">Upload another</a>
@@ -383,7 +420,7 @@ async def upload(
 
 
 @app.post("/upload-retro", response_class=HTMLResponse)
-async def upload_retro(
+def upload_retro(
     file: UploadFile = File(...),
     supplier: str = Form("LWC"),
     _user: str = Depends(check_auth),
@@ -396,7 +433,7 @@ async def upload_retro(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(file.file.read())
             tmp_path = tmp.name
 
         master = load_agreed_retros()
@@ -438,6 +475,7 @@ async def upload_retro(
 @app.get("/export-master")
 def export_master(_user: str = Depends(check_auth)):
     """Download the current Airtable master as a wide-form Excel."""
+    from master_export import build_master_xlsx_bytes  # lazy: keeps openpyxl off the boot path
     try:
         data = build_master_xlsx_bytes()
     except Exception:
@@ -451,7 +489,7 @@ def export_master(_user: str = Depends(check_auth)):
 
 
 @app.post("/upload-master", response_class=HTMLResponse)
-async def upload_master(
+def upload_master(
     file: UploadFile = File(...),
     valid_from: str = Form(...),
     reason: str = Form(""),
@@ -469,7 +507,7 @@ async def upload_master(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(file.file.read())
             tmp_path = tmp.name
 
         # Push directly to Airtable WITHOUT writing to local CSV — the deployed
@@ -484,8 +522,14 @@ async def upload_master(
         product_count = len(products)
         retros_with_value = sum(1 for p in products.values() if (p.get("retro_per_keg") or 0) > 0)
 
-        rules_created, rules_updated, rules_closed = upsert_pricing_rules(rules, close_keys_at_date=vf)
-        products_created, products_updated = upsert_products_with_retros(products)
+        lookups: dict = {}
+        rules_created, rules_updated, rules_closed = upsert_pricing_rules(
+            rules, close_keys_at_date=vf, lookups_out=lookups
+        )
+        # Reuse the product map built above so we don't re-read the Products table.
+        products_created, products_updated = upsert_products_with_retros(
+            products, existing_by_code=lookups.get("product_ids")
+        )
     except Exception:
         return _error_page(f"<pre>{traceback.format_exc()}</pre>")
     finally:
@@ -517,7 +561,7 @@ async def upload_master(
 
 
 @app.post("/add-support", response_class=HTMLResponse)
-async def add_support(
+def add_support(
     text: str = Form(...),
     _user: str = Depends(check_auth),
 ):
@@ -689,7 +733,7 @@ def tennents_home(_user: str = Depends(check_auth)):
 
 
 @app.post("/upload-tennents-master", response_class=HTMLResponse)
-async def upload_tennents_master(
+def upload_tennents_master(
     file: UploadFile = File(...),
     _user: str = Depends(check_auth),
 ):
@@ -701,7 +745,7 @@ async def upload_tennents_master(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(file.file.read())
             tmp_path = tmp.name
         agreements = parse_tennents_master(tmp_path)
         if not agreements:
@@ -735,7 +779,7 @@ async def upload_tennents_master(
 
 
 @app.post("/upload-tennents", response_class=HTMLResponse)
-async def upload_tennents(
+def upload_tennents(
     file: UploadFile = File(...),
     _user: str = Depends(check_auth),
 ):
@@ -747,7 +791,7 @@ async def upload_tennents(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(file.file.read())
             tmp_path = tmp.name
 
         agreements = load_tennents_agreements()
