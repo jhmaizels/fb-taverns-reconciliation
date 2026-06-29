@@ -130,7 +130,7 @@ PAGE_HEAD = """<!doctype html>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #222; }
   .container { max-width: 1080px; margin: 2em auto; padding: 0 1em; }
   .site-header { background: #324556; display: flex; align-items: center; justify-content: space-between; padding: 0.55em 1.5em; }
-  .site-header .brand img { height: 38px; display: block; }
+  .site-header .brand img { height: 44px; display: block; }
   .site-nav { display: flex; align-items: center; }
   .site-nav a { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; padding: 0.45em 1.1em; border-left: 1px solid rgba(255,255,255,0.22); }
   .site-nav a:first-child { border-left: 0; }
