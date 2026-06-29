@@ -197,7 +197,7 @@ def upsert_pricing_rules(rules: list[Rule], close_keys_at_date: date | None) -> 
 
     site_ids, product_ids = _ensure_sites_and_products(rules)
     table_id = T["PricingRules"]
-    existing = _list_all(table_id, fields=["rule_key", "valid_to", "site", "product"])
+    existing = _list_all(table_id, fields=["rule_key", "valid_from", "valid_to", "site", "product"])
     by_key = {rec["fields"].get("rule_key"): rec["id"] for rec in existing}
 
     keys_in_new = {(r.site_id, r.product_code) for r in rules}
