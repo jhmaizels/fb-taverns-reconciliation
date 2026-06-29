@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
@@ -65,6 +66,11 @@ from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 
 app = FastAPI(title="FB Taverns Reconciliation")
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    name="static",
+)
 security = HTTPBasic()
 
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
@@ -92,7 +98,14 @@ PAGE_HEAD = """<!doctype html>
 <meta charset="utf-8">
 <title>FB Taverns Reconciliation</title>
 <style>
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 1080px; margin: 2em auto; padding: 0 1em; color: #222; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #222; }
+  .container { max-width: 1080px; margin: 2em auto; padding: 0 1em; }
+  .site-header { background: #324556; display: flex; align-items: center; justify-content: space-between; padding: 0.55em 1.5em; }
+  .site-header .brand img { height: 38px; display: block; }
+  .site-nav { display: flex; align-items: center; }
+  .site-nav a { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; padding: 0.45em 1.1em; border-left: 1px solid rgba(255,255,255,0.22); }
+  .site-nav a:first-child { border-left: 0; }
+  .site-nav a:hover { color: #fff; }
   h1 { margin-bottom: 0.2em; }
   h2 { margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid #2c5aa0; color: #2c5aa0; }
   .sub { color: #666; margin-bottom: 2em; }
@@ -134,9 +147,19 @@ PAGE_HEAD = """<!doctype html>
   .help strong { color: #2c5aa0; }
 </style>
 </head><body>
+<header class="site-header">
+  <a class="brand" href="/"><img src="/static/fb-taverns-logo.png" alt="FB Taverns"></a>
+  <nav class="site-nav">
+    <a href="/">Home</a>
+    <a href="/lwc">LWC</a>
+    <a href="/tennents">Tennents</a>
+    <a href="https://tenancy-master.onrender.com/tenancy" target="_blank" rel="noopener">Tenancy Hub &#8599;</a>
+  </nav>
+</header>
+<main class="container">
 """
 
-PAGE_FOOT = "</body></html>"
+PAGE_FOOT = "</main></body></html>"
 
 
 @app.get("/healthz")
