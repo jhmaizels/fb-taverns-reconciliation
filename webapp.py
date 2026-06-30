@@ -14,22 +14,43 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
 import tempfile
 import time
 import traceback
 from html import escape
 from pathlib import Path
-from typing import Annotated
 
 from datetime import date, timedelta
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
+
+# Supabase auth core (per-user drinks roles, RLS-scoped; dual-mode legacy Basic
+# fallback during cutover). See auth_supabase.py + the integration contract.
+from auth_supabase import (  # noqa: E402
+    DrinksPrincipal,
+    FORBIDDEN_DETAIL,
+    NO_ACCESS_DETAIL,
+    ROLE_RANK,
+    SUPABASE_ANON_KEY,
+    SUPABASE_URL,
+    TENANCY_ADMIN_URL,
+    clear_session_cookies,
+    install_auth_handlers,
+    require_drinks_role,
+    role_at_least,
+    set_session_cookies,
+    validate_token,
+)
+from login_page import (  # noqa: E402
+    render_callback_page,
+    render_login_page,
+    render_no_access_page,
+)
 
 from reconcile import (  # noqa: E402
     parse_lwc_sales,
@@ -75,10 +96,11 @@ app.mount(
     StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
     name="static",
 )
-security = HTTPBasic()
 
-WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
-WEB_PASSWORD = os.environ.get("WEB_PASSWORD")
+# Register the auth core's redirect-as-exception handler. Without this, an
+# unauthenticated GET raises _RedirectException -> unhandled 500 instead of a
+# relative 303 to /login. Must be called once, right after app creation.
+install_auth_handlers(app)
 
 AIRTABLE_BASE_URL = f"https://airtable.com/{BASE_ID}"
 
@@ -102,27 +124,52 @@ if not logger.handlers:
 async def _timing_middleware(request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
+    # Apply any session-cookie op the auth dependency staged on request.state.
+    # Done HERE, on the real outgoing response, because routes that return their
+    # own Response/HTMLResponse (e.g. /export-master, _error_page) drop cookies
+    # set on the FastAPI-injected Response. scope["state"] is shared between the
+    # dependency and this middleware (starlette 0.41.x), so the staged op is
+    # visible after call_next regardless of how the route returned.
+    rewrite = getattr(request.state, "drinks_cookie_rewrite", None)
+    if rewrite:
+        set_session_cookies(response, rewrite[0], rewrite[1])
+    elif getattr(request.state, "drinks_clear_cookies", False):
+        clear_session_cookies(response)
     elapsed_ms = (time.perf_counter() - start) * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
     logger.info("%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed_ms)
     return response
 
 
-def check_auth(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> str:
-    if not WEB_PASSWORD:
-        raise HTTPException(503, "Server misconfigured: WEB_PASSWORD env var missing")
-    ok_user = secrets.compare_digest(credentials.username.encode(), WEB_USERNAME.encode())
-    ok_pass = secrets.compare_digest(credentials.password.encode(), WEB_PASSWORD.encode())
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
+# ---------- auth 403 rendering ----------
+# require_drinks_role raises HTTPException(403, detail=NO_ACCESS_DETAIL) for a
+# signed-in user with no drinks row, and HTTPException(403, detail=FORBIDDEN_DETAIL)
+# for a role below the route minimum. Render friendly pages for those; everything
+# else falls back to FastAPI's default HTTPException handling. Cookie rewrites that
+# the dependency staged on a refreshed-but-unauthorised request are preserved by
+# copying any Set-Cookie headers from exc.headers (the dependency does not set
+# them on the exception, so this is a no-op today, but keeps the contract honest).
+@app.exception_handler(StarletteHTTPException)
+async def _auth_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 403 and exc.detail == NO_ACCESS_DETAIL:
+        principal = getattr(request.state, "drinks", None)
+        email = principal.email if principal else ""
+        return HTMLResponse(render_no_access_page(email, TENANCY_ADMIN_URL), status_code=403)
+    if exc.status_code == 403 and exc.detail == FORBIDDEN_DETAIL:
+        return HTMLResponse(
+            f"""{render_head("", "")}
+<h1>Not allowed</h1>
+<div class="result err">You don't have permission to perform this action. Ask an admin to raise your drinks access level.</div>
+<p><a href="/">Back</a></p>
+{PAGE_FOOT}""",
+            status_code=403,
         )
-    return credentials.username
+    # Default behaviour for all other HTTPExceptions (401, 404, etc.).
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                        headers=getattr(exc, "headers", None) or None)
 
 
-PAGE_HEAD = """<!doctype html>
+HEAD_STYLE = """<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <title>FB Taverns Reconciliation</title>
@@ -135,6 +182,13 @@ PAGE_HEAD = """<!doctype html>
   .site-nav a { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; padding: 0.45em 1.1em; border-left: 1px solid rgba(255,255,255,0.22); }
   .site-nav a:first-child { border-left: 0; }
   .site-nav a:hover { color: #fff; }
+  .site-user { display: flex; align-items: center; gap: 0.6em; }
+  .site-user .who { color: rgba(255,255,255,0.85); font-size: 0.8em; }
+  .site-user a.admin-link { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; }
+  .site-user a.admin-link:hover { color: #fff; }
+  .site-user form { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
+  .site-user button.signout { background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 0.3em 0.8em; border-radius: 4px; font-size: 0.78em; cursor: pointer; }
+  .site-user button.signout:hover { background: rgba(255,255,255,0.25); }
   h1 { margin-bottom: 0.2em; }
   h2 { margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid #2c5aa0; color: #2c5aa0; }
   .sub { color: #666; margin-bottom: 2em; }
@@ -176,7 +230,39 @@ PAGE_HEAD = """<!doctype html>
   .help strong { color: #2c5aa0; }
 </style>
 </head><body>
-<header class="site-header">
+"""
+
+
+def render_head(user_email: str = "", drinks_role: str = "") -> str:
+    """Full page head + navy site header + opening <main>.
+
+    Replaces the old PAGE_HEAD constant. Preserves the existing nav
+    (Home / LWC / Tennents / Tenancy Hub) and adds, on the right:
+      * the signed-in email (escaped),
+      * a relative sign-out form (POST /auth/signout),
+      * a conditional cross-domain Admin link (only for drinks 'admin').
+    Called with empty strings for error / pre-auth pages — the nav still
+    renders, just without identity or the Admin link.
+    """
+    user_block = ""
+    if user_email or drinks_role:
+        admin_link = ""
+        if role_at_least(drinks_role, "admin"):
+            admin_link = (
+                f'<a class="admin-link" href="{escape(TENANCY_ADMIN_URL)}" '
+                f'target="_blank" rel="noopener">Admin &#8599;</a>'
+            )
+        who = f'<span class="who">{escape(user_email)}</span>' if user_email else ""
+        user_block = (
+            '<div class="site-user">'
+            f'{who}'
+            f'{admin_link}'
+            '<form method="post" action="/auth/signout">'
+            '<button type="submit" class="signout">Sign out</button>'
+            '</form>'
+            '</div>'
+        )
+    return f"""{HEAD_STYLE}<header class="site-header">
   <a class="brand" href="/"><img src="/static/fb-taverns-logo.png" alt="FB Taverns"></a>
   <nav class="site-nav">
     <a href="/">Home</a>
@@ -184,6 +270,7 @@ PAGE_HEAD = """<!doctype html>
     <a href="/tennents">Tennents</a>
     <a href="https://tenancy-master.onrender.com/tenancy" target="_blank" rel="noopener">Tenancy Hub &#8599;</a>
   </nav>
+  {user_block}
 </header>
 <main class="container">
 """
@@ -203,6 +290,79 @@ def version():
         "commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
         "branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints — all OPEN (no auth dependency). The login/callback pages run
+# supabase-js client-side (PKCE) and POST the resulting tokens to /auth/session,
+# which validates them and sets HttpOnly cookies. Sign-out clears the cookies
+# and relative-redirects to /login. SUPABASE_URL + anon key are injected
+# server-side into the login/callback HTML (anon key is public by design).
+# ---------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    """Self-contained login page (M365 + email/password + sign-up toggle)."""
+    return HTMLResponse(render_login_page(supabase_url=SUPABASE_URL, anon_key=SUPABASE_ANON_KEY))
+
+
+@app.get("/auth/callback", response_class=HTMLResponse)
+def auth_callback():
+    """OAuth/PKCE callback landing page. supabase-js completes the exchange
+    client-side, then POSTs tokens to /auth/session and relative-redirects."""
+    return HTMLResponse(render_callback_page(supabase_url=SUPABASE_URL, anon_key=SUPABASE_ANON_KEY))
+
+
+def _is_cross_origin(request: Request) -> bool:
+    """True iff the request carries an Origin header that differs from our own
+    origin. Used to block login-CSRF (forged token POST to /auth/session) and
+    forced-signout from another site. A same-origin fetch/form (or a non-browser
+    client with no Origin header) returns False. Trusts Render's X-Forwarded-*."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    return origin.rstrip("/") != f"{proto}://{host}".rstrip("/")
+
+
+@app.post("/auth/session")
+async def auth_session(request: Request):
+    """Receive {access_token, refresh_token, next} from the callback page,
+    validate the access token, set HttpOnly cookies. Never logs token values."""
+    # Login-CSRF guard: a cross-site page must not be able to mint a session
+    # cookie in this user's browser by POSTing attacker-supplied tokens.
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    access_token = (body.get("access_token") or "").strip() if isinstance(body, dict) else ""
+    refresh_token = (body.get("refresh_token") or "").strip() if isinstance(body, dict) else ""
+    if not access_token or not refresh_token:
+        raise HTTPException(status_code=400, detail="Missing tokens")
+
+    # Confirm the token is real before trusting it (do not set cookies on junk).
+    if validate_token(access_token) is None:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    nxt = body.get("next") if isinstance(body, dict) else None
+    safe_next = nxt if isinstance(nxt, str) and nxt.startswith("/") else "/"
+
+    resp = JSONResponse({"ok": True, "next": safe_next})
+    set_session_cookies(resp, access_token, refresh_token)
+    return resp
+
+
+@app.post("/auth/signout")
+def auth_signout(request: Request):
+    """Clear both session cookies and relative-redirect to /login."""
+    # Same-origin guard so a cross-site page can't force-sign-out the user.
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    resp = RedirectResponse(url="/login", status_code=303)
+    clear_session_cookies(resp)
+    return resp
 
 
 def _master_banner_html(info: dict | None = None) -> str:
@@ -238,7 +398,7 @@ def _master_banner_html(info: dict | None = None) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(_user: str = Depends(check_auth)):
+def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     """Two-card index — pick a supplier estate."""
     try:
         lwc_info = get_active_master_info()
@@ -255,7 +415,7 @@ def index(_user: str = Depends(check_auth)):
     ten_count = ten_info.get("agreement_count", 0)
     ten_customers = ten_info.get("customer_count", 0)
 
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <h1>FB Taverns Reconciliation</h1>
 <p class="sub">Pick the supplier estate to reconcile against. Each has its own master and reconciliation flow.</p>
 <div class="grid2">
@@ -282,7 +442,7 @@ def index(_user: str = Depends(check_auth)):
 
 
 @app.get("/lwc", response_class=HTMLResponse)
-def lwc_home(_user: str = Depends(check_auth)):
+def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     # Default "Effective from" to today minus 14 days. Master uploads are
     # almost always corrections to the current master — this default makes
     # the new master cover the most recent weekly LWC files (which span
@@ -290,7 +450,7 @@ def lwc_home(_user: str = Depends(check_auth)):
     # earlier date for full retroactive replacement, or a later one for
     # genuine future-dated changes.
     today_iso = (date.today() - timedelta(days=14)).isoformat()
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
 <p class="sub">Upload a supplier file to reconcile. Or update the pricing master.</p>
@@ -359,7 +519,7 @@ def lwc_home(_user: str = Depends(check_auth)):
 def upload(
     file: UploadFile = File(...),
     supplier: str = Form("LWC"),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("editor")),
 ):
     original_name = file.filename or "uploaded.xlsx"
     if not original_name.lower().endswith(".xlsx"):
@@ -407,7 +567,7 @@ def upload(
     summary = build_summary(original_name, lines, mismatches, sites, active_site_ids=active_site_ids)
     summary_html = render_summary_html(summary)
 
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <h1>Reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
 {_master_banner_html(snap.banner_info)}
@@ -423,7 +583,7 @@ def upload(
 def upload_retro(
     file: UploadFile = File(...),
     supplier: str = Form("LWC"),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("editor")),
 ):
     original_name = file.filename or "uploaded.xlsx"
     if not original_name.lower().endswith(".xlsx"):
@@ -460,7 +620,7 @@ def upload_retro(
                 pass
 
     summary_html = render_retro_summary_html(summary)
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <h1>Retro reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
 {_master_banner_html()}
@@ -473,7 +633,7 @@ def upload_retro(
 
 
 @app.get("/export-master")
-def export_master(_user: str = Depends(check_auth)):
+def export_master(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     """Download the current Airtable master as a wide-form Excel."""
     from master_export import build_master_xlsx_bytes  # lazy: keeps openpyxl off the boot path
     try:
@@ -493,7 +653,7 @@ def upload_master(
     file: UploadFile = File(...),
     valid_from: str = Form(...),
     reason: str = Form(""),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
 ):
     original_name = file.filename or "uploaded.xlsx"
     if not original_name.lower().endswith(".xlsx"):
@@ -539,7 +699,7 @@ def upload_master(
             except OSError:
                 pass
 
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <h1>Master uploaded</h1>
 <p class="sub">{escape(original_name)} &middot; effective from {vf.isoformat()}</p>
 {_master_banner_html()}
@@ -563,7 +723,7 @@ def upload_master(
 @app.post("/add-support", response_class=HTMLResponse)
 def add_support(
     text: str = Form(...),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
 ):
     """Parse a natural-language support request and create the rule in Airtable."""
     text = (text or "").strip()
@@ -652,7 +812,7 @@ def add_support(
     site_name = (sites.get(sid) or {}).get("name", "")
     product_desc = products.get(code, {}).get("description", existing_desc)
 
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <h1>Support added</h1>
 <p class="sub">Standard rule remains active — this support layers on top until it ends.</p>
 {_master_banner_html()}
@@ -700,8 +860,8 @@ def _tennents_master_banner_html() -> str:
 
 
 @app.get("/tennents", response_class=HTMLResponse)
-def tennents_home(_user: str = Depends(check_auth)):
-    return f"""{PAGE_HEAD}
+def tennents_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
 <h1>Tennents Direct Reconciliation <span class="estate-tag">Scotland</span></h1>
 <p class="sub">Upload the monthly draught pricing report. Or update the discount-agreement master.</p>
@@ -735,7 +895,7 @@ def tennents_home(_user: str = Depends(check_auth)):
 @app.post("/upload-tennents-master", response_class=HTMLResponse)
 def upload_tennents_master(
     file: UploadFile = File(...),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
 ):
     original_name = file.filename or "uploaded.xlsx"
     if not original_name.lower().endswith(".xlsx"):
@@ -761,7 +921,7 @@ def upload_tennents_master(
                 pass
 
     customer_count = len({a.account for a in agreements})
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
 <h1>Tennents master replaced</h1>
 {_tennents_master_banner_html()}
@@ -781,7 +941,7 @@ def upload_tennents_master(
 @app.post("/upload-tennents", response_class=HTMLResponse)
 def upload_tennents(
     file: UploadFile = File(...),
-    _user: str = Depends(check_auth),
+    principal: DrinksPrincipal = Depends(require_drinks_role("editor")),
 ):
     original_name = file.filename or "uploaded.xlsx"
     if not original_name.lower().endswith(".xlsx"):
@@ -816,7 +976,7 @@ def upload_tennents(
                 pass
 
     summary_html = render_tennents_summary_html(summary)
-    return f"""{PAGE_HEAD}
+    return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
 <h1>Tennents reconciliation complete</h1>
 <p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
@@ -831,7 +991,7 @@ def upload_tennents(
 
 def _error_page(message: str) -> HTMLResponse:
     return HTMLResponse(
-        f"""{PAGE_HEAD}
+        f"""{render_head("", "")}
 <h1>Error</h1>
 <div class="result err">{message}</div>
 <p><a href="/">Back</a></p>

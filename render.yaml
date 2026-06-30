@@ -14,7 +14,24 @@ services:
         sync: false
       - key: AIRTABLE_BASE_ID
         sync: false
+      # Legacy HTTP Basic — kept through the dual-mode cutover window only.
+      # At cutover the operator removes WEB_PASSWORD and sets
+      # LEGACY_BASIC_FALLBACK=false (a later commit deletes the dead Basic code).
       - key: WEB_USERNAME
         value: admin
       - key: WEB_PASSWORD
         sync: false
+      # --- Supabase auth (per-user drinks roles via user_app_roles, RLS) ---
+      # The drinks app holds ONLY the public anon key + URL — never the
+      # service-role key. anon key is public by design but kept sync:false so
+      # it's set per-environment in the dashboard, not committed.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Dual-mode ON during cutover; operator sets "false" at cutover.
+      - key: LEGACY_BASIC_FALLBACK
+        value: "true"
+      # Non-secret: target of the conditional Admin link (tenancy enforces its own gate).
+      - key: TENANCY_ADMIN_URL
+        value: https://tenancy-master.onrender.com/tenancy/admin/users
