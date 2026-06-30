@@ -54,6 +54,30 @@ logger = logging.getLogger("fbtaverns.auth")
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
 
+# ---------------------------------------------------------------------------
+# External base-path mechanism (reverse-proxy mounting under /drinks).
+#
+# tenancy-master proxies /drinks/* to this service with a rewrite that STRIPS
+# the /drinks prefix, so the FastAPI ROUTES stay at root (/lwc, /upload, ...).
+# Only the browser-facing URLs this app EMITS (links, form actions, redirects,
+# fetch targets, cookie Path, supabase redirectTo) get the prefix.
+#
+#   EXTERNAL_BASE_PATH = "" (standalone, default) or "/drinks" (under proxy)
+#   PUBLIC_ORIGIN      = the public origin the browser sees under the proxy,
+#                        e.g. "https://tenancy-master.onrender.com" — accepted
+#                        by the login-CSRF same-origin guard in addition to the
+#                        request's own derived origin.
+# ---------------------------------------------------------------------------
+EXTERNAL_BASE_PATH = (os.environ.get("EXTERNAL_BASE_PATH") or "").rstrip("/")
+PUBLIC_ORIGIN = (os.environ.get("PUBLIC_ORIGIN") or "").rstrip("/")
+
+
+def ext_url(path: str) -> str:
+    """Prefix an internal (root-relative) path with EXTERNAL_BASE_PATH so it is
+    correct for the browser under the proxy. `path` must begin with "/".
+    With BASE unset this is the identity, so the app runs standalone unchanged."""
+    return f"{EXTERNAL_BASE_PATH}{path}"
+
 TENANCY_ADMIN_URL = (
     os.environ.get("TENANCY_ADMIN_URL")
     or "https://tenancy-master.onrender.com/tenancy/admin/users"
@@ -93,23 +117,31 @@ COOKIE_RT = "fb_drinks_rt"   # Supabase refresh token
 _RT_MAX_AGE = 30 * 24 * 3600
 
 
+# Cookie Path is scoped to the external base path so the drinks session cookies
+# are NOT sent on sibling tenancy-master requests under the same host. set and
+# clear MUST use the SAME path or the browser won't match (and so won't clear)
+# the cookie. BASE unset => Path "/" (standalone, unchanged behaviour).
+_COOKIE_PATH = EXTERNAL_BASE_PATH or "/"
+
+
 def set_session_cookies(response: Response, at: str, rt: str) -> None:
-    """Write both session cookies: HttpOnly, Secure, SameSite=Lax, Path=/."""
+    """Write both session cookies: HttpOnly, Secure, SameSite=Lax, Path=BASE."""
     response.set_cookie(
         COOKIE_AT, at,
-        httponly=True, secure=True, samesite="lax", path="/",
+        httponly=True, secure=True, samesite="lax", path=_COOKIE_PATH,
     )
     response.set_cookie(
         COOKIE_RT, rt,
-        httponly=True, secure=True, samesite="lax", path="/",
+        httponly=True, secure=True, samesite="lax", path=_COOKIE_PATH,
         max_age=_RT_MAX_AGE,
     )
 
 
 def clear_session_cookies(response: Response) -> None:
-    """Delete both session cookies (sign-out / failed refresh)."""
-    response.delete_cookie(COOKIE_AT, path="/", samesite="lax")
-    response.delete_cookie(COOKIE_RT, path="/", samesite="lax")
+    """Delete both session cookies (sign-out / failed refresh). Path MUST match
+    set_session_cookies or the browser won't clear them."""
+    response.delete_cookie(COOKIE_AT, path=_COOKIE_PATH, samesite="lax")
+    response.delete_cookie(COOKIE_RT, path=_COOKIE_PATH, samesite="lax")
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +431,12 @@ def require_drinks_role(minimum: str = "viewer"):
             if request.url.query:
                 nxt = f"{nxt}?{request.url.query}"
             # RELATIVE redirect only (Render proxy leaks internal host on
-            # absolute server-side redirects).
-            target = f"/login?next={quote(nxt, safe='')}"
+            # absolute server-side redirects). Under the proxy the login lives
+            # at BASE/login, and `next` must be the EXTERNAL path so the user
+            # returns to /drinks/<path> after signing in — nxt here is the
+            # internal (prefix-stripped) path, so prepend BASE.
+            external_next = quote(EXTERNAL_BASE_PATH + nxt, safe="")
+            target = f"{ext_url('/login')}?next={external_next}"
             raise _RedirectException(target)
         raise HTTPException(
             status_code=401,

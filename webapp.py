@@ -33,13 +33,16 @@ load_dotenv()
 # fallback during cutover). See auth_supabase.py + the integration contract.
 from auth_supabase import (  # noqa: E402
     DrinksPrincipal,
+    EXTERNAL_BASE_PATH,
     FORBIDDEN_DETAIL,
     NO_ACCESS_DETAIL,
+    PUBLIC_ORIGIN,
     ROLE_RANK,
     SUPABASE_ANON_KEY,
     SUPABASE_URL,
     TENANCY_ADMIN_URL,
     clear_session_cookies,
+    ext_url,
     install_auth_handlers,
     require_drinks_role,
     role_at_least,
@@ -160,7 +163,7 @@ async def _auth_http_exception_handler(request: Request, exc: StarletteHTTPExcep
             f"""{render_head("", "")}
 <h1>Not allowed</h1>
 <div class="result err">You don't have permission to perform this action. Ask an admin to raise your drinks access level.</div>
-<p><a href="/">Back</a></p>
+<p><a href="{ext_url('/')}">Back</a></p>
 {PAGE_FOOT}""",
             status_code=403,
         )
@@ -257,17 +260,17 @@ def render_head(user_email: str = "", drinks_role: str = "") -> str:
             '<div class="site-user">'
             f'{who}'
             f'{admin_link}'
-            '<form method="post" action="/auth/signout">'
+            f'<form method="post" action="{ext_url("/auth/signout")}">'
             '<button type="submit" class="signout">Sign out</button>'
             '</form>'
             '</div>'
         )
     return f"""{HEAD_STYLE}<header class="site-header">
-  <a class="brand" href="/"><img src="/static/fb-taverns-logo.png" alt="FB Taverns"></a>
+  <a class="brand" href="{ext_url('/')}"><img src="{ext_url('/static/fb-taverns-logo.png')}" alt="FB Taverns"></a>
   <nav class="site-nav">
-    <a href="/">Home</a>
-    <a href="/lwc">LWC</a>
-    <a href="/tennents">Tennents</a>
+    <a href="{ext_url('/')}">Home</a>
+    <a href="{ext_url('/lwc')}">LWC</a>
+    <a href="{ext_url('/tennents')}">Tennents</a>
     <a href="https://tenancy-master.onrender.com/tenancy" target="_blank" rel="noopener">Tenancy Hub &#8599;</a>
   </nav>
   {user_block}
@@ -313,16 +316,29 @@ def auth_callback():
 
 
 def _is_cross_origin(request: Request) -> bool:
-    """True iff the request carries an Origin header that differs from our own
-    origin. Used to block login-CSRF (forged token POST to /auth/session) and
-    forced-signout from another site. A same-origin fetch/form (or a non-browser
-    client with no Origin header) returns False. Trusts Render's X-Forwarded-*."""
+    """True iff the request carries an Origin header that differs from BOTH our
+    own derived origin AND the configured PUBLIC_ORIGIN. Used to block login-CSRF
+    (forged token POST to /auth/session) and forced-signout from another site. A
+    same-origin fetch/form (or a non-browser client with no Origin header)
+    returns False. Trusts Render's X-Forwarded-*.
+
+    Under the tenancy-master proxy the browser Origin is the PUBLIC host
+    (https://tenancy-master.onrender.com), NOT this drinks service host, so the
+    request's own derived origin won't match. PUBLIC_ORIGIN (env) is accepted as
+    an additional allowed origin so legitimate proxied logins aren't wrongly
+    blocked. Genuinely foreign origins are still rejected."""
     origin = request.headers.get("origin")
     if not origin:
         return False
+    origin = origin.rstrip("/")
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
-    return origin.rstrip("/") != f"{proto}://{host}".rstrip("/")
+    own_origin = f"{proto}://{host}".rstrip("/")
+    if origin == own_origin:
+        return False
+    if PUBLIC_ORIGIN and origin == PUBLIC_ORIGIN:
+        return False
+    return True
 
 
 @app.post("/auth/session")
@@ -360,7 +376,7 @@ def auth_signout(request: Request):
     # Same-origin guard so a cross-site page can't force-sign-out the user.
     if _is_cross_origin(request):
         raise HTTPException(status_code=403, detail="Cross-origin request rejected")
-    resp = RedirectResponse(url="/login", status_code=303)
+    resp = RedirectResponse(url=ext_url("/login"), status_code=303)
     clear_session_cookies(resp)
     return resp
 
@@ -419,7 +435,7 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
 <h1>FB Taverns Reconciliation</h1>
 <p class="sub">Pick the supplier estate to reconcile against. Each has its own master and reconciliation flow.</p>
 <div class="grid2">
-  <a href="/lwc" class="card-link">
+  <a href="{ext_url('/lwc')}" class="card-link">
     <h2 style="margin-top:0">LWC <span class="card-tag">England</span></h2>
     <p>Weekly sales report + monthly retro statement. Per-site, per-product tenant pricing with FB cost and retro.</p>
     <p class="card-meta">
@@ -428,7 +444,7 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     </p>
     <p><span class="card-cta">Open LWC reconciliation →</span></p>
   </a>
-  <a href="/tennents" class="card-link">
+  <a href="{ext_url('/tennents')}" class="card-link">
     <h2 style="margin-top:0">Tennents Direct <span class="card-tag">Scotland</span></h2>
     <p>Monthly draught pricing report combining invoice, discount and retro data. Per-(customer, SKU) discount agreements.</p>
     <p class="card-meta">
@@ -451,14 +467,14 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
     # genuine future-dated changes.
     today_iso = (date.today() - timedelta(days=14)).isoformat()
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
 <p class="sub">Upload a supplier file to reconcile. Or update the pricing master.</p>
 {_master_banner_html()}
 
 <h2>Reconcile a supplier file</h2>
 <div class="grid2">
-  <form action="/upload" method="post" enctype="multipart/form-data">
+  <form action="{ext_url('/upload')}" method="post" enctype="multipart/form-data">
     <h3>Weekly sales</h3>
     <p class="sub">LWC weekly sales report — checks tenant and FB pricing line by line.</p>
     <label for="ws-file">Weekly sales (.xlsx)</label>
@@ -466,7 +482,7 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
     <input type="hidden" name="supplier" value="LWC">
     <button type="submit">Upload &amp; reconcile</button>
   </form>
-  <form action="/upload-retro" method="post" enctype="multipart/form-data">
+  <form action="{ext_url('/upload-retro')}" method="post" enctype="multipart/form-data">
     <h3>Monthly retro</h3>
     <p class="sub">LWC Rate Per Keg — checks the per-keg retro paid against the agreed rate.</p>
     <label for="retro-file">Monthly retro (.xlsx)</label>
@@ -482,9 +498,9 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
 </div>
 
 <div class="grid2" style="margin-top:1em">
-  <form action="/upload-master" method="post" enctype="multipart/form-data">
+  <form action="{ext_url('/upload-master')}" method="post" enctype="multipart/form-data">
     <h3>Download current master</h3>
-    <p class="sub">The version currently in force. <a href="/export-master">Download master.xlsx</a> — anyone with the link can use it.</p>
+    <p class="sub">The version currently in force. <a href="{ext_url('/export-master')}">Download master.xlsx</a> — anyone with the link can use it.</p>
     <h3 class="second-h3">Upload new master version</h3>
     <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
@@ -497,7 +513,7 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
     <input type="file" name="file" id="m-file" accept=".xlsx" required>
     <button type="submit">Upload new version</button>
   </form>
-  <form action="/add-support" method="post">
+  <form action="{ext_url('/add-support')}" method="post">
     <h3>Tenant support</h3>
     <p class="sub">A temporary support price for one site &amp; product. Reconciliations during the support window flag the mismatch but tag it with the support context, so you can see why LWC is charging the standard price.</p>
     <label for="support-text">Describe the support in plain English</label>
@@ -573,7 +589,7 @@ def upload(
 {_master_banner_html(snap.banner_info)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/" style="background:#666">Upload another</a>
+  <a class="button" href="{ext_url('/')}" style="background:#666">Upload another</a>
 </p>
 {summary_html}
 {PAGE_FOOT}"""
@@ -626,7 +642,7 @@ def upload_retro(
 {_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/" style="background:#666">Upload another</a>
+  <a class="button" href="{ext_url('/')}" style="background:#666">Upload another</a>
 </p>
 {summary_html}
 {PAGE_FOOT}"""
@@ -715,7 +731,7 @@ def upload_master(
 </div>
 <p style="margin-top:1.5em">
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/" style="background:#666">Back to home</a>
+  <a class="button" href="{ext_url('/')}" style="background:#666">Back to home</a>
 </p>
 {PAGE_FOOT}"""
 
@@ -828,7 +844,7 @@ def add_support(
 </div>
 <p style="margin-top:1.5em">
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/" style="background:#666">Back to home</a>
+  <a class="button" href="{ext_url('/')}" style="background:#666">Back to home</a>
 </p>
 {PAGE_FOOT}"""
 
@@ -862,13 +878,13 @@ def _tennents_master_banner_html() -> str:
 @app.get("/tennents", response_class=HTMLResponse)
 def tennents_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="/">← Back to estate picker</a></p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>Tennents Direct Reconciliation <span class="estate-tag">Scotland</span></h1>
 <p class="sub">Upload the monthly draught pricing report. Or update the discount-agreement master.</p>
 {_tennents_master_banner_html()}
 
 <h2>Reconcile a monthly file</h2>
-<form action="/upload-tennents" method="post" enctype="multipart/form-data" style="max-width: 540px">
+<form action="{ext_url('/upload-tennents')}" method="post" enctype="multipart/form-data" style="max-width: 540px">
   <h3 style="margin-top:0; color: #2c5aa0">Monthly draught pricing report</h3>
   <p class="sub">e.g. <code>FB Taverns Draught Pricing Report - January.xlsx</code>. The <code>Data</code> tab is the per-delivery line items.</p>
   <label for="ten-file">Monthly file (.xlsx)</label>
@@ -880,7 +896,7 @@ def tennents_home(principal: DrinksPrincipal = Depends(require_drinks_role("view
 <div class="result" style="max-width: none">
   <p style="margin-top:0">The <strong>FB Taverns - Commercial Data</strong> Excel is the master. The <code>FB Taverns Discount</code> tab holds (Customer, SKU) discount agreements. Re-upload to replace the master wholesale.</p>
 </div>
-<form action="/upload-tennents-master" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
+<form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
   <h3 style="margin-top:0; color: #2c5aa0">Upload new master</h3>
   <p class="sub">Replaces every Tennents agreement currently in the system. Old agreements are deleted; the new file's rows take their place.</p>
   <label for="ten-master-file">Commercial Data file (.xlsx)</label>
@@ -922,7 +938,7 @@ def upload_tennents_master(
 
     customer_count = len({a.account for a in agreements})
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents master replaced</h1>
 {_tennents_master_banner_html()}
 <div class="result">
@@ -933,7 +949,7 @@ def upload_tennents_master(
 </div>
 <p style="margin-top:1.5em">
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/tennents" style="background:#666">Back to Tennents</a>
+  <a class="button" href="{ext_url('/tennents')}" style="background:#666">Back to Tennents</a>
 </p>
 {PAGE_FOOT}"""
 
@@ -977,13 +993,13 @@ def upload_tennents(
 
     summary_html = render_tennents_summary_html(summary)
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="/tennents">← Back to Tennents</a></p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents reconciliation complete</h1>
 <p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
 {_tennents_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="/tennents" style="background:#666">Upload another</a>
+  <a class="button" href="{ext_url('/tennents')}" style="background:#666">Upload another</a>
 </p>
 {summary_html}
 {PAGE_FOOT}"""
@@ -994,7 +1010,7 @@ def _error_page(message: str) -> HTMLResponse:
         f"""{render_head("", "")}
 <h1>Error</h1>
 <div class="result err">{message}</div>
-<p><a href="/">Back</a></p>
+<p><a href="{ext_url('/')}">Back</a></p>
 {PAGE_FOOT}""",
         status_code=400,
     )

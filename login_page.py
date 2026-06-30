@@ -35,6 +35,13 @@ from __future__ import annotations
 
 from html import escape
 
+# External base path under the reverse proxy (e.g. "/drinks"); "" standalone.
+# These pages are SERVED at BASE/login & BASE/auth/callback, so
+# window.location.origin is just scheme+host (no path) — every emitted/fetched
+# URL must therefore carry BASE explicitly. Imported from the auth core so the
+# whole app reads one source of truth.
+from auth_supabase import EXTERNAL_BASE_PATH
+
 # supabase-js v2 from a CDN, imported as an ESM module. Pinned to a major to
 # avoid surprise breaking changes while staying patch-current.
 _SUPABASE_JS_CDN = "https://esm.sh/@supabase/supabase-js@2"
@@ -77,14 +84,16 @@ _BASE_CSS = """
   .spin { text-align: center; padding: 2em 0; color: #555; }
 """
 
-_HEADER_HTML = (
-    '<header class="site-header">'
-    '<a class="brand" href="/"><img src="/static/fb-taverns-logo.png" alt="FB Taverns"></a>'
-    "</header>"
-)
+def _header_html(base: str = "") -> str:
+    """Navy header with the brand link + logo, BASE-prefixed for the proxy."""
+    return (
+        '<header class="site-header">'
+        f'<a class="brand" href="{base}/"><img src="{base}/static/fb-taverns-logo.png" alt="FB Taverns"></a>'
+        "</header>"
+    )
 
 
-def _doc(title: str, body: str, head_extra: str = "") -> str:
+def _doc(title: str, body: str, head_extra: str = "", base: str = "") -> str:
     """Assemble a full HTML document with shared CSS + navy header."""
     return (
         "<!doctype html>\n"
@@ -95,14 +104,15 @@ def _doc(title: str, body: str, head_extra: str = "") -> str:
         f"<style>{_BASE_CSS}</style>\n"
         f"{head_extra}"
         "</head><body>\n"
-        f"{_HEADER_HTML}\n"
+        f"{_header_html(base)}\n"
         f"{body}\n"
         "</body></html>"
     )
 
 
-def _inject(template: str, supabase_url: str, anon_key: str) -> str:
-    """Replace the JS sentinels with JSON-safe string literals of url/anon key.
+def _inject(template: str, supabase_url: str, anon_key: str, base: str = "") -> str:
+    """Replace the JS sentinels with JSON-safe string literals of url/anon
+    key/base.
 
     Using sentinel replacement (not str.format / %) means the embedded JS braces
     need no escaping. The values are wrapped in JSON-quoted form so any stray
@@ -114,18 +124,23 @@ def _inject(template: str, supabase_url: str, anon_key: str) -> str:
         template
         .replace("__SUPABASE_URL_JSON__", json.dumps(supabase_url or ""))
         .replace("__SUPABASE_ANON_KEY_JSON__", json.dumps(anon_key or ""))
+        .replace("__EXTERNAL_BASE_JSON__", json.dumps(base or ""))
     )
 
 
 # ---------------------------------------------------------------------------
 # /login
 # ---------------------------------------------------------------------------
-def render_login_page(supabase_url: str, anon_key: str) -> str:
+def render_login_page(supabase_url: str, anon_key: str, base: str | None = None) -> str:
     """The sign-in page. Microsoft 365 + email/password + a sign-up toggle.
 
     `supabase_url` and `anon_key` are injected server-side (anon key is public).
-    All redirect URLs are derived from location.origin at runtime.
+    `base` is the external base path (e.g. "/drinks"); defaults to
+    EXTERNAL_BASE_PATH. All same-origin URLs are built as origin + BASE + path
+    at runtime so the page is correct under the proxy and standalone alike.
     """
+    if base is None:
+        base = EXTERNAL_BASE_PATH
     body = """
 <div class="wrap">
   <div class="card">
@@ -162,6 +177,7 @@ def render_login_page(supabase_url: str, anon_key: str) -> str:
 
   const SUPABASE_URL = __SUPABASE_URL_JSON__;
   const ANON_KEY = __SUPABASE_ANON_KEY_JSON__;
+  const BASE = __EXTERNAL_BASE_JSON__;   // external prefix ("" or "/drinks")
   const supabase = createClient(SUPABASE_URL, ANON_KEY);
 
   const msgEl = document.getElementById("msg");
@@ -173,9 +189,11 @@ def render_login_page(supabase_url: str, anon_key: str) -> str:
   const form = document.getElementById("pw-form");
 
   // Read next + any error surfaced by the callback redirect from the query.
+  // A present `next` is already an EXTERNAL (/drinks/...) path from the server
+  // redirect, so use it as-is; default to BASE + "/" when empty.
   const params = new URLSearchParams(window.location.search);
-  let nextPath = params.get("next") || "/";
-  if (!nextPath.startsWith("/")) nextPath = "/";   // relative-only, no open redirect
+  let nextPath = params.get("next") || (BASE + "/");
+  if (!nextPath.startsWith("/")) nextPath = BASE + "/";   // relative-only, no open redirect
   const errDesc = params.get("error_description") || params.get("error");
 
   function showMsg(text, kind) {
@@ -187,8 +205,9 @@ def render_login_page(supabase_url: str, anon_key: str) -> str:
   if (errDesc) showMsg(errDesc, "err");
 
   // The redirect target after OAuth / after a password sign-in's cookie set.
+  // origin is scheme+host only (no path), so prepend BASE explicitly.
   function callbackUrl() {
-    return window.location.origin + "/auth/callback?next=" + encodeURIComponent(nextPath);
+    return window.location.origin + BASE + "/auth/callback?next=" + encodeURIComponent(nextPath);
   }
 
   // Sign-in vs sign-up mode toggle ("set a password").
@@ -274,7 +293,7 @@ def render_login_page(supabase_url: str, anon_key: str) -> str:
     const rt = session.refresh_token;
     if (!at || !rt) { showMsg("Incomplete session returned. Please try again.", "err"); return; }
     try {
-      const resp = await fetch("/auth/session", {
+      const resp = await fetch(BASE + "/auth/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ access_token: at, refresh_token: rt, next: nextPath }),
@@ -292,21 +311,23 @@ def render_login_page(supabase_url: str, anon_key: str) -> str:
 </script>
 """
     body = body.replace("__SUPABASE_JS_CDN__", _SUPABASE_JS_CDN)
-    body = _inject(body, supabase_url, anon_key)
-    return _doc("Sign in — FB Taverns Reconciliation", body)
+    body = _inject(body, supabase_url, anon_key, base)
+    return _doc("Sign in — FB Taverns Reconciliation", body, base=base)
 
 
 # ---------------------------------------------------------------------------
 # /auth/callback
 # ---------------------------------------------------------------------------
-def render_callback_page(supabase_url: str, anon_key: str) -> str:
+def render_callback_page(supabase_url: str, anon_key: str, base: str | None = None) -> str:
     """The OAuth/PKCE landing page.
 
     supabase-js (detectSessionInUrl) completes the code exchange in the browser,
     then we read the session and POST {access_token, refresh_token} to
-    /auth/session, then redirect (relative) to `next`. On error, redirect back
-    to /login?error_description=...
+    BASE/auth/session, then redirect (relative) to `next`. On error, redirect
+    back to BASE/login?error_description=...
     """
+    if base is None:
+        base = EXTERNAL_BASE_PATH
     body = """
 <div class="wrap">
   <div class="card">
@@ -320,6 +341,7 @@ def render_callback_page(supabase_url: str, anon_key: str) -> str:
 
   const SUPABASE_URL = __SUPABASE_URL_JSON__;
   const ANON_KEY = __SUPABASE_ANON_KEY_JSON__;
+  const BASE = __EXTERNAL_BASE_JSON__;   // external prefix ("" or "/drinks")
   // detectSessionInUrl lets supabase-js complete the PKCE exchange from the URL.
   const supabase = createClient(SUPABASE_URL, ANON_KEY, {
     auth: { detectSessionInUrl: true, flowType: "pkce" },
@@ -328,16 +350,17 @@ def render_callback_page(supabase_url: str, anon_key: str) -> str:
   const spin = document.getElementById("spin");
   const msgEl = document.getElementById("msg");
 
-  // next from query; relative-only.
+  // next from query; relative-only. A present `next` is already EXTERNAL
+  // (/drinks/...); default to BASE + "/" when empty.
   const params = new URLSearchParams(window.location.search);
-  let nextPath = params.get("next") || "/";
-  if (!nextPath.startsWith("/")) nextPath = "/";
+  let nextPath = params.get("next") || (BASE + "/");
+  if (!nextPath.startsWith("/")) nextPath = BASE + "/";
 
   function bounceToLogin(desc) {
     const q = new URLSearchParams();
     q.set("next", nextPath);
     if (desc) q.set("error_description", desc);
-    window.location.assign("/login?" + q.toString());   // relative
+    window.location.assign(BASE + "/login?" + q.toString());   // relative
   }
 
   function fail(desc) {
@@ -372,7 +395,7 @@ def render_callback_page(supabase_url: str, anon_key: str) -> str:
         return;
       }
 
-      const resp = await fetch("/auth/session", {
+      const resp = await fetch(BASE + "/auth/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -393,20 +416,23 @@ def render_callback_page(supabase_url: str, anon_key: str) -> str:
 </script>
 """
     body = body.replace("__SUPABASE_JS_CDN__", _SUPABASE_JS_CDN)
-    body = _inject(body, supabase_url, anon_key)
-    return _doc("Signing in — FB Taverns Reconciliation", body)
+    body = _inject(body, supabase_url, anon_key, base)
+    return _doc("Signing in — FB Taverns Reconciliation", body, base=base)
 
 
 # ---------------------------------------------------------------------------
 # 403 — authenticated but no drinks role
 # ---------------------------------------------------------------------------
-def render_no_access_page(email: str, tenancy_admin_url: str) -> str:
+def render_no_access_page(email: str, tenancy_admin_url: str, base: str | None = None) -> str:
     """The "signed in but no drinks entitlement" page (403 NO_ACCESS_DETAIL).
 
     Shows the signed-in email, a clear ask-an-admin message, a link to the
     tenancy admin users page, and a sign-out form so a wrong-account user can
-    switch.
+    switch. `base` (external prefix) defaults to EXTERNAL_BASE_PATH; the
+    (email, tenancy_admin_url) signature is preserved for existing callers.
     """
+    if base is None:
+        base = EXTERNAL_BASE_PATH
     safe_email = escape(email or "")
     safe_admin = escape(tenancy_admin_url or "")
     email_line = (
@@ -426,11 +452,11 @@ def render_no_access_page(email: str, tenancy_admin_url: str) -> str:
       An administrator can grant access on the
       <a href="{safe_admin}" target="_blank" rel="noopener">tenancy admin page &#8599;</a>.
     </p>
-    <form method="post" action="/auth/signout" style="margin-top:1.4em;">
+    <form method="post" action="{base}/auth/signout" style="margin-top:1.4em;">
       <button type="submit">Sign out</button>
     </form>
   </div>
   <div class="foot">F&amp;B Taverns &middot; access is managed centrally</div>
 </div>
 """
-    return _doc("No access — FB Taverns Reconciliation", body)
+    return _doc("No access — FB Taverns Reconciliation", body, base=base)
