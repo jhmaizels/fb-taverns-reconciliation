@@ -16,7 +16,6 @@ import logging
 import os
 import tempfile
 import time
-import traceback
 from html import escape
 from pathlib import Path
 
@@ -45,7 +44,6 @@ from auth_supabase import (  # noqa: E402
     ext_url,
     install_auth_handlers,
     require_drinks_role,
-    role_at_least,
     set_session_cookies,
     validate_token,
 )
@@ -177,14 +175,11 @@ async def _timing_middleware(request, call_next):
 
 @app.exception_handler(Exception)
 async def _unhandled_error(request: Request, exc: Exception):
-    # Log the full traceback (Render captures stderr) so 500s are diagnosable, and
-    # — TEMPORARY — surface it in-page when the URL carries ?__debug=1, so the
-    # operator can copy the real error instead of a bare "Internal Server Error".
+    # Log the full traceback (Render captures stderr) so 500s are diagnosable.
+    # The response is always the plain 500 — never surface tracebacks in-page.
     import traceback as _tb
     tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
     logger.error("unhandled error on %s %s:\n%s", request.method, request.url.path, tb)
-    if request.query_params.get("__debug") == "1":
-        return PlainTextResponse("INTERNAL ERROR (debug)\n\n" + tb, status_code=500)
     return PlainTextResponse("Internal Server Error", status_code=500)
 
 
@@ -203,10 +198,13 @@ async def _auth_http_exception_handler(request: Request, exc: StarletteHTTPExcep
         email = principal.email if principal else ""
         return HTMLResponse(render_no_access_page(email, TENANCY_ADMIN_URL), status_code=403)
     if exc.status_code == 403 and exc.detail == FORBIDDEN_DETAIL:
+        # The dependency attaches the principal before the role check, so the
+        # signed-in identity + sign-out render even on refusal.
+        principal = getattr(request.state, "drinks", None)
         return HTMLResponse(
-            f"""{render_head("", "")}
+            f"""{render_head(principal.email if principal else "", principal.role if principal else "")}
 <h1>Not allowed</h1>
-<div class="result err">You don't have permission to perform this action. Ask an admin to raise your drinks access level.</div>
+<div class="result err">You don't have permission to perform this action. Ask an administrator to raise your drinks access level.</div>
 <p><a href="{ext_url('/')}">Back</a></p>
 {PAGE_FOOT}""",
             status_code=403,
@@ -219,20 +217,14 @@ async def _auth_http_exception_handler(request: Request, exc: StarletteHTTPExcep
 HEAD_STYLE = """<!doctype html>
 <html><head>
 <meta charset="utf-8">
-<title>FB Taverns Reconciliation</title>
+<title>FB Taverns — Drinks Reconciliation</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #222; }
   .container { max-width: 1080px; margin: 2em auto; padding: 0 1em; }
   .site-header { background: #324556; display: flex; align-items: center; justify-content: space-between; padding: 0.55em 1.5em; }
   .site-header .brand img { height: 44px; display: block; }
-  .site-nav { display: flex; align-items: center; }
-  .site-nav a { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; padding: 0.45em 1.1em; border-left: 1px solid rgba(255,255,255,0.22); }
-  .site-nav a:first-child { border-left: 0; }
-  .site-nav a:hover { color: #fff; }
   .site-user { display: flex; align-items: center; gap: 0.6em; }
   .site-user .who { color: rgba(255,255,255,0.85); font-size: 0.8em; }
-  .site-user a.admin-link { color: rgba(255,255,255,0.85); text-decoration: none; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.03em; }
-  .site-user a.admin-link:hover { color: #fff; }
   .site-user form { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
   .site-user button.signout { background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 0.3em 0.8em; border-radius: 4px; font-size: 0.78em; cursor: pointer; }
   .site-user button.signout:hover { background: rgba(255,255,255,0.25); }
@@ -283,40 +275,31 @@ HEAD_STYLE = """<!doctype html>
 def render_head(user_email: str = "", drinks_role: str = "") -> str:
     """Full page head + navy site header + opening <main>.
 
-    Replaces the old PAGE_HEAD constant. Preserves the existing nav
-    (Home / LWC / Tennents / Tenancy Hub) and adds, on the right:
-      * the signed-in email (escaped),
-      * a relative sign-out form (POST /auth/signout),
-      * a conditional cross-domain Admin link (only for drinks 'admin').
-    Called with empty strings for error / pre-auth pages — the nav still
-    renders, just without identity or the Admin link.
+    Replaces the old PAGE_HEAD constant. The header is deliberately minimal:
+    the FB logo (always returns to the HUB portal — "/" when proxied under
+    EXTERNAL_BASE_PATH, the app root when standalone) plus, on the right,
+    the signed-in email (escaped) and a relative sign-out form
+    (POST /auth/signout). No duplicate nav links, no cross-app links —
+    the hub portal is the crossroads (admin is reached from its Admin tile).
+    Called with empty strings for error / pre-auth pages — the header still
+    renders, just without identity.
     """
     user_block = ""
     if user_email or drinks_role:
-        admin_link = ""
-        if role_at_least(drinks_role, "admin"):
-            admin_link = (
-                f'<a class="admin-link" href="{escape(TENANCY_ADMIN_URL)}" '
-                f'target="_blank" rel="noopener">Admin &#8599;</a>'
-            )
         who = f'<span class="who">{escape(user_email)}</span>' if user_email else ""
         user_block = (
             '<div class="site-user">'
             f'{who}'
-            f'{admin_link}'
             f'<form method="post" action="{ext_url("/auth/signout")}">'
             '<button type="submit" class="signout">Sign out</button>'
             '</form>'
             '</div>'
         )
+    # Proxied: the logo goes to the hub portal at the PUBLIC root. Standalone:
+    # ext_url("/") is the app's own root (identity with no base path).
+    brand_href = "/" if EXTERNAL_BASE_PATH else ext_url("/")
     return f"""{HEAD_STYLE}<header class="site-header">
-  <a class="brand" href="{ext_url('/')}"><img src="{ext_url('/static/fb-taverns-logo.png')}" alt="FB Taverns"></a>
-  <nav class="site-nav">
-    <a href="{ext_url('/')}">Home</a>
-    <a href="{ext_url('/lwc')}">LWC</a>
-    <a href="{ext_url('/tennents')}">Tennents</a>
-    <a href="https://tenancy-master.onrender.com/tenancy" target="_blank" rel="noopener">Tenancy Hub &#8599;</a>
-  </nav>
+  <a class="brand" href="{brand_href}"><img src="{ext_url('/static/fb-taverns-logo.png')}" alt="FB Taverns"></a>
   {user_block}
 </header>
 <main class="container">
@@ -431,11 +414,20 @@ async def auth_session(request: Request):
 
 @app.post("/auth/signout")
 def auth_signout(request: Request):
-    """Clear both session cookies and relative-redirect to /login."""
+    """Clear the drinks session cookies, then end the WHOLE session.
+
+    Proxied (EXTERNAL_BASE_PATH set): after clearing our cookies, 307-redirect
+    to the HUB's /auth/signout — 307 preserves the POST method so the hub's
+    signout handler actually runs, kills the hub Supabase session, and then
+    redirects to its login. Standalone: keep the original behaviour — 303 to
+    our own /login."""
     # Same-origin guard so a cross-site page can't force-sign-out the user.
     if _is_cross_origin(request):
         raise HTTPException(status_code=403, detail="Cross-origin request rejected")
-    resp = RedirectResponse(url=ext_url("/login"), status_code=303)
+    if EXTERNAL_BASE_PATH:
+        resp = RedirectResponse(url="/auth/signout", status_code=307)
+    else:
+        resp = RedirectResponse(url=ext_url("/login"), status_code=303)
     clear_session_cookies(resp)
     return resp
 
@@ -570,7 +562,7 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
 <div class="grid2" style="margin-top:1em">
   <form action="{ext_url('/upload-master')}" method="post" enctype="multipart/form-data">
     <h3>Download current master</h3>
-    <p class="sub">The version currently in force. <a href="{ext_url('/export-master')}">Download master.xlsx</a> — anyone with the link can use it.</p>
+    <p class="sub">The version currently in force. <a href="{ext_url('/export-master')}">Download master.xlsx</a> (signed-in team members only).</p>
     <h3 class="second-h3">Upload new master version</h3>
     <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
     <label for="vf">Effective from</label>
@@ -642,7 +634,8 @@ def upload(
             site_ids=snap.site_ids, product_ids=snap.product_ids, rule_ids=snap.rule_ids,
         )
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -659,7 +652,7 @@ def upload(
 {_master_banner_html(snap.banner_info)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="{ext_url('/')}" style="background:#666">Upload another</a>
+  <a class="button" href="{ext_url('/lwc')}" style="background:#666">Upload another</a>
 </p>
 {summary_html}
 {PAGE_FOOT}"""
@@ -697,7 +690,8 @@ def upload_retro(
         )
         n_findings = write_retro_findings(summary, file_rec_id)
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -712,7 +706,7 @@ def upload_retro(
 {_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
-  <a class="button" href="{ext_url('/')}" style="background:#666">Upload another</a>
+  <a class="button" href="{ext_url('/lwc')}" style="background:#666">Upload another</a>
 </p>
 {summary_html}
 {PAGE_FOOT}"""
@@ -725,7 +719,8 @@ def export_master(principal: DrinksPrincipal = Depends(require_drinks_role("view
     try:
         data = build_master_xlsx_bytes()
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     filename = f"FB_Taverns_Cost_Price_File_{date.today().isoformat()}.xlsx"
     return Response(
         content=data,
@@ -777,7 +772,8 @@ def upload_master(
             products, existing_by_code=lookups.get("product_ids")
         )
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -893,7 +889,8 @@ def add_support(
             f"<p>Set <code>ANTHROPIC_API_KEY</code> in the Render environment to enable natural-language parsing.</p>"
         )
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
 
     site_name = (sites.get(sid) or {}).get("name", "")
     product_desc = products.get(code, {}).get("description", existing_desc)
@@ -998,7 +995,8 @@ def upload_tennents_master(
             return _error_page("Master file produced zero agreements after parsing.")
         deleted, created = replace_tennents_master(agreements, source=original_name)
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -1053,7 +1051,8 @@ def upload_tennents(
         )
         n_findings = write_tennents_findings(summary, file_rec_id)
     except Exception:
-        return _error_page(f"<pre>{traceback.format_exc()}</pre>")
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:

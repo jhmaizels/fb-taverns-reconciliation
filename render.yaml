@@ -32,6 +32,6 @@ services:
       # Dual-mode ON during cutover; operator sets "false" at cutover.
       - key: LEGACY_BASIC_FALLBACK
         value: "true"
-      # Non-secret: target of the conditional Admin link (tenancy enforces its own gate).
+      # Non-secret: unified admin area linked from the no-access page (tenancy enforces its own gate).
       - key: TENANCY_ADMIN_URL
-        value: https://tenancy-master.onrender.com/tenancy/admin/users
+        value: https://tenancy-master.onrender.com/admin

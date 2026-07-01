@@ -81,7 +81,7 @@ def ext_url(path: str) -> str:
 
 TENANCY_ADMIN_URL = (
     os.environ.get("TENANCY_ADMIN_URL")
-    or "https://tenancy-master.onrender.com/tenancy/admin/users"
+    or "https://tenancy-master.onrender.com/admin"
 )
 
 # Legacy HTTP Basic — dual-mode fallback ONLY (D2). Removed at cutover.
@@ -470,13 +470,15 @@ def require_drinks_role(minimum: str = "viewer"):
             request.state.drinks_cookie_rewrite = cookie_rewrites
 
         if principal is not None:
-            # Authed Supabase user.
+            # Authed Supabase user. Attach the principal BEFORE the role checks
+            # so the 403 pages (no-access / forbidden) can show the signed-in
+            # identity + a working sign-out even when access is refused.
+            request.state.drinks = principal
             if not principal.role:
                 # Signed in, but no drinks entitlement (GET and non-GET alike).
                 raise HTTPException(status_code=403, detail=NO_ACCESS_DETAIL)
             if not role_at_least(principal.role, minimum):
                 raise HTTPException(status_code=403, detail=FORBIDDEN_DETAIL)
-            request.state.drinks = principal
             return principal
 
         # No Supabase session — dual-mode legacy Basic fallback (D2).

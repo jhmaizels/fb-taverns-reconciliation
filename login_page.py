@@ -85,10 +85,13 @@ _BASE_CSS = """
 """
 
 def _header_html(base: str = "") -> str:
-    """Navy header with the brand link + logo, BASE-prefixed for the proxy."""
+    """Navy header with the brand link + logo (logo src BASE-prefixed).
+
+    The brand link is always "/": under the proxy that is the TEAM HUB portal
+    (the FB logo returns to the hub everywhere); standalone it is the app root."""
     return (
         '<header class="site-header">'
-        f'<a class="brand" href="{base}/"><img src="{base}/static/fb-taverns-logo.png" alt="FB Taverns"></a>'
+        f'<a class="brand" href="/"><img src="{base}/static/fb-taverns-logo.png" alt="FB Taverns"></a>'
         "</header>"
     )
 
@@ -169,7 +172,7 @@ def render_login_page(supabase_url: str, anon_key: str, base: str | None = None)
       <button type="button" class="link" id="toggle-btn">Set a password</button>
     </div>
   </div>
-  <div class="foot">F&amp;B Taverns &middot; secure sign-in</div>
+  <div class="foot">FB Taverns &middot; secure sign-in</div>
 </div>
 
 <script type="module">
@@ -312,7 +315,7 @@ def render_login_page(supabase_url: str, anon_key: str, base: str | None = None)
 """
     body = body.replace("__SUPABASE_JS_CDN__", _SUPABASE_JS_CDN)
     body = _inject(body, supabase_url, anon_key, base)
-    return _doc("Sign in — FB Taverns Reconciliation", body, base=base)
+    return _doc("FB Taverns — Sign in", body, base=base)
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +420,7 @@ def render_callback_page(supabase_url: str, anon_key: str, base: str | None = No
 """
     body = body.replace("__SUPABASE_JS_CDN__", _SUPABASE_JS_CDN)
     body = _inject(body, supabase_url, anon_key, base)
-    return _doc("Signing in — FB Taverns Reconciliation", body, base=base)
+    return _doc("FB Taverns — Signing in", body, base=base)
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +452,14 @@ def render_no_access_page(email: str, tenancy_admin_url: str, base: str | None =
       Ask an administrator to grant you a Drinks role.
     </div>
     <p style="font-size:0.92em;color:#555;">
-      An administrator can grant access on the
-      <a href="{safe_admin}" target="_blank" rel="noopener">tenancy admin page &#8599;</a>.
+      An administrator can grant access under
+      <a href="{safe_admin}">Admin &rarr; Users &amp; roles</a> on the Team Hub.
     </p>
     <form method="post" action="{base}/auth/signout" style="margin-top:1.4em;">
       <button type="submit">Sign out</button>
     </form>
   </div>
-  <div class="foot">F&amp;B Taverns &middot; access is managed centrally</div>
+  <div class="foot">FB Taverns &middot; access is managed centrally</div>
 </div>
 """
-    return _doc("No access — FB Taverns Reconciliation", body, base=base)
+    return _doc("FB Taverns — No access", body, base=base)
