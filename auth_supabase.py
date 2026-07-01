@@ -35,6 +35,7 @@ timeouts and fail safe (no session => not authorised, never => allowed).
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import secrets
@@ -315,6 +316,61 @@ def _basic_creds_valid(request: Request) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# SINGLE SIGN-ON: trust the hub's Supabase session.
+#
+# Under the tenancy-master proxy this app is same-origin with the hub, so the
+# hub's @supabase/ssr session cookie (sb-<ref>-auth-token) is sent to /drinks
+# and forwarded here by the proxy. Reading it lets a hub-signed-in user into
+# drinks with NO separate drinks login and NO handoff route — their per-user
+# drinks role still gates access. @supabase/ssr (0.6.x) stores the value as
+# `base64-<base64url(JSON session)>`, chunked into `<name>.0`, `.1`, … at 3180
+# chars. Never raises.
+# ---------------------------------------------------------------------------
+def _hub_cookie_name() -> str:
+    """sb-<project-ref>-auth-token, ref = the SUPABASE_URL subdomain."""
+    ref = ""
+    try:
+        ref = SUPABASE_URL.split("://", 1)[-1].split(".", 1)[0]
+    except Exception:
+        ref = ""
+    return f"sb-{ref}-auth-token"
+
+
+def _hub_access_token(request: Request) -> Optional[str]:
+    """Return the access token from the hub's Supabase session cookie, or None."""
+    try:
+        base = _hub_cookie_name()
+        if not base or base == "sb--auth-token":
+            return None
+        cookies = request.cookies
+        if f"{base}.0" in cookies:
+            parts, i = [], 0
+            while f"{base}.{i}" in cookies:
+                parts.append(cookies[f"{base}.{i}"])
+                i += 1
+            raw = "".join(parts)
+        elif base in cookies:
+            raw = cookies[base]
+        else:
+            return None
+        if raw.startswith("base64-"):
+            b = raw[len("base64-"):]
+            decoded = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8")
+        else:
+            from urllib.parse import unquote
+            decoded = unquote(raw)
+        data = json.loads(decoded)
+        tok = None
+        if isinstance(data, dict):
+            tok = data.get("access_token") or (data.get("currentSession") or {}).get("access_token")
+        elif isinstance(data, list) and data:
+            tok = data[0]
+        return tok if isinstance(tok, str) and tok else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Internal: resolve a Supabase principal from the request cookies, refreshing
 # if needed. Returns (principal_or_None, cookie_rewrites_or_None).
 # cookie_rewrites is (new_at, new_rt) when a refresh happened — the dependency
@@ -336,6 +392,18 @@ def _resolve_supabase(request: Request) -> Tuple[Optional[DrinksPrincipal], Opti
             if user is not None:
                 cookie_rewrites = (new_at, new_rt)
                 at = new_at
+
+    # SINGLE SIGN-ON: if this app's own cookies didn't resolve a user, trust the
+    # hub's Supabase session (same-origin cookie sent to /drinks). The user is
+    # then validated + role-gated exactly as normal — `at` becomes their own
+    # (hub) access token so the RLS self-read for the drinks role uses it.
+    if user is None:
+        hub_at = _hub_access_token(request)
+        if hub_at:
+            hub_user = validate_token(hub_at)
+            if hub_user is not None:
+                user = hub_user
+                at = hub_at
 
     if user is None:
         return None, cookie_rewrites  # cookie_rewrites is None here
@@ -427,21 +495,12 @@ def require_drinks_role(minimum: str = "viewer"):
             request.state.drinks_clear_cookies = True
 
         if request.method == "GET":
-            nxt = request.url.path
-            if request.url.query:
-                nxt = f"{nxt}?{request.url.query}"
-            # RELATIVE redirect only (Render proxy leaks internal host on
-            # absolute server-side redirects). `next` is the EXTERNAL path so the
-            # user returns to /drinks/<path> after signing in — nxt here is the
-            # internal (prefix-stripped) path, so prepend BASE.
-            external_next = quote(EXTERNAL_BASE_PATH + nxt, safe="")
-            # Use THIS app's own login (BASE/login). We previously handed off to
-            # the hub's /tenancy/drinks-sso for single sign-on, but that route was
-            # 500-ing in the hub runtime, so drinks was unreachable. Its own login
-            # is self-contained (client-side supabase-js on this origin) and does
-            # not depend on the hub route — reliable, at the cost of a second
-            # sign-in. Re-introduce SSO later once the hub handoff is fixed.
-            target = f"{ext_url('/login')}?next={external_next}"
+            # No drinks session AND no hub session → the single sign-in lives at
+            # the HUB. Send them to the team-hub root to sign in there; drinks has
+            # no login of its own now (it trusts the hub session — see
+            # _hub_access_token). Relative "/" so the Render proxy's internal host
+            # isn't leaked, and standalone (no hub) falls back to its own login.
+            target = "/" if EXTERNAL_BASE_PATH else f"{ext_url('/login')}"
             raise _RedirectException(target)
         raise HTTPException(
             status_code=401,
