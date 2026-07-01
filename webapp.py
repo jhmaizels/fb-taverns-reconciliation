@@ -125,6 +125,19 @@ if not logger.handlers:
 
 @app.middleware("http")
 async def _timing_middleware(request, call_next):
+    # Direct-host bounce. The hub proxy STRIPS the /drinks prefix, so any request
+    # that still carries EXTERNAL_BASE_PATH must have hit the OLD direct service
+    # URL (a stale bookmark) — on which /drinks/<x> is a non-existent route (404).
+    # Redirect it to the canonical proxied URL so it keeps working. Loop-safe:
+    # proxied requests never carry the prefix, so this only fires on the direct host.
+    if EXTERNAL_BASE_PATH and PUBLIC_ORIGIN:
+        _p = request.url.path
+        if _p == EXTERNAL_BASE_PATH or _p.startswith(EXTERNAL_BASE_PATH + "/"):
+            _tgt = f"{PUBLIC_ORIGIN}{_p}"
+            if request.url.query:
+                _tgt = f"{_tgt}?{request.url.query}"
+            return RedirectResponse(_tgt, status_code=307)
+
     start = time.perf_counter()
     response = await call_next(request)
     # Apply any session-cookie op the auth dependency staged on request.state.
