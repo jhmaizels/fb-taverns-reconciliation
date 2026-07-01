@@ -395,11 +395,22 @@ def auth_signout(request: Request):
 
 
 def _master_banner_html(info: dict | None = None) -> str:
-    if info is None:
-        try:
+    # A cosmetic banner must NEVER take the page down: wrap the whole thing.
+    # The narrow try below only caught get_active_master_info() *raising* — if it
+    # returned None / a non-dict, the info.get(...) calls threw and 500'd every
+    # page that shows the banner (e.g. /lwc), while the estate picker (which
+    # doesn't render it) was fine.
+    try:
+        if info is None:
             info = get_active_master_info()
-        except Exception:
+        if not isinstance(info, dict):
             return ""
+        return _render_master_banner(info)
+    except Exception:
+        return ""
+
+
+def _render_master_banner(info: dict) -> str:
     sources = info.get("sources") or []
     src_text = sources[0] if sources else "<em>none uploaded yet</em>"
     if len(sources) > 1:
