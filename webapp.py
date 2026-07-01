@@ -123,6 +123,24 @@ if not logger.handlers:
     logger.propagate = False
 
 
+@app.on_event("startup")
+def _warm_master_cache() -> None:
+    """Build the master snapshot in the background at boot so the FIRST page
+    request after a deploy/restart doesn't do the ~30s inline Airtable rebuild
+    (which times out the tenancy-hub proxy → bare 500). Post-boot expiries are
+    handled by stale-while-revalidate in load_master_snapshot."""
+    import threading
+
+    def _warm() -> None:
+        try:
+            load_master_snapshot()
+            logger.info("master-cache warm-up complete")
+        except Exception:
+            logger.warning("master-cache warm-up failed", exc_info=True)
+
+    threading.Thread(target=_warm, daemon=True, name="master-cache-warmup").start()
+
+
 @app.middleware("http")
 async def _timing_middleware(request, call_next):
     # Direct-host bounce. The hub proxy STRIPS the /drinks prefix, so any request

@@ -248,7 +248,7 @@ class MasterSnapshot:
 # write (upsert_pricing_rules / upsert_products_with_retros). Never holds Files
 # or Mismatches (those are written every upload and must stay fresh).
 MASTER_CACHE_TTL = float(os.environ.get("MASTER_CACHE_TTL", "60"))
-_MASTER_CACHE: dict = {"snapshot": None, "ts": 0.0, "gen": 0}
+_MASTER_CACHE: dict = {"snapshot": None, "ts": 0.0, "gen": 0, "refreshing": False}
 _MASTER_CACHE_LOCK = threading.Lock()
 
 
@@ -257,6 +257,39 @@ def invalidate_master_cache() -> None:
         _MASTER_CACHE["snapshot"] = None
         _MASTER_CACHE["ts"] = 0.0
         _MASTER_CACHE["gen"] += 1
+
+
+def refresh_master_cache_async() -> None:
+    """Kick ONE background rebuild of the snapshot (no-op if one is running).
+
+    Exists so page reads can be STALE-WHILE-REVALIDATE: the inline rebuild takes
+    ~30s+ (three full-table Airtable sweeps, rate-limited), which blows through
+    the tenancy-hub proxy's ~30s timeout and surfaced to users as a bare
+    "Internal Server Error" whenever the 60s TTL had lapsed. Serving the stale
+    snapshot instantly and refreshing here keeps every page render sub-second."""
+    with _MASTER_CACHE_LOCK:
+        if _MASTER_CACHE["refreshing"]:
+            return
+        _MASTER_CACHE["refreshing"] = True
+        gen_before = _MASTER_CACHE["gen"]
+
+    def _work() -> None:
+        try:
+            snap = _fetch_master_snapshot()
+            with _MASTER_CACHE_LOCK:
+                # Publish only if no master write invalidated during the fetch.
+                if _MASTER_CACHE["gen"] == gen_before:
+                    _MASTER_CACHE["snapshot"] = snap
+                    _MASTER_CACHE["ts"] = time.monotonic()
+        except Exception:
+            logging.getLogger("fbtaverns.airtable").warning(
+                "background master-cache refresh failed", exc_info=True
+            )
+        finally:
+            with _MASTER_CACHE_LOCK:
+                _MASTER_CACHE["refreshing"] = False
+
+    threading.Thread(target=_work, daemon=True, name="master-cache-refresh").start()
 
 
 def _fetch_master_snapshot() -> MasterSnapshot:
@@ -347,7 +380,14 @@ def load_master_snapshot(force_refresh: bool = False) -> MasterSnapshot:
         cached = _MASTER_CACHE["snapshot"]
         ts = _MASTER_CACHE["ts"]
         gen_before = _MASTER_CACHE["gen"]
-    if not force_refresh and cached is not None and (time.monotonic() - ts) < MASTER_CACHE_TTL:
+    if not force_refresh and cached is not None:
+        if (time.monotonic() - ts) < MASTER_CACHE_TTL:
+            return cached
+        # STALE-WHILE-REVALIDATE: the inline rebuild takes ~30s+ and times out
+        # the tenancy-hub proxy (bare 500s to users). Serve the expired snapshot
+        # NOW and refresh in the background. Master writes still invalidate to
+        # None, so post-write reads take the coherent inline fetch below.
+        refresh_master_cache_async()
         return cached
     snap = _fetch_master_snapshot()
     with _MASTER_CACHE_LOCK:
