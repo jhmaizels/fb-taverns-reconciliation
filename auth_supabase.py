@@ -435,15 +435,13 @@ def require_drinks_role(minimum: str = "viewer"):
             # user returns to /drinks/<path> after signing in — nxt here is the
             # internal (prefix-stripped) path, so prepend BASE.
             external_next = quote(EXTERNAL_BASE_PATH + nxt, safe="")
-            if EXTERNAL_BASE_PATH:
-                # Proxied under the hub: SINGLE SIGN-ON. Hand identity off to the
-                # hub handoff route, which mints this app's session from the hub
-                # login (one sign-in point) — no separate drinks login. That route
-                # itself falls back to the hub login if the user isn't signed in.
-                target = f"/tenancy/drinks-sso?next={external_next}"
-            else:
-                # Standalone (no hub in front): use this app's own login.
-                target = f"{ext_url('/login')}?next={external_next}"
+            # Use THIS app's own login (BASE/login). We previously handed off to
+            # the hub's /tenancy/drinks-sso for single sign-on, but that route was
+            # 500-ing in the hub runtime, so drinks was unreachable. Its own login
+            # is self-contained (client-side supabase-js on this origin) and does
+            # not depend on the hub route — reliable, at the cost of a second
+            # sign-in. Re-introduce SSO later once the hub handoff is fixed.
+            target = f"{ext_url('/login')}?next={external_next}"
             raise _RedirectException(target)
         raise HTTPException(
             status_code=401,
