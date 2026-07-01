@@ -431,12 +431,19 @@ def require_drinks_role(minimum: str = "viewer"):
             if request.url.query:
                 nxt = f"{nxt}?{request.url.query}"
             # RELATIVE redirect only (Render proxy leaks internal host on
-            # absolute server-side redirects). Under the proxy the login lives
-            # at BASE/login, and `next` must be the EXTERNAL path so the user
-            # returns to /drinks/<path> after signing in — nxt here is the
+            # absolute server-side redirects). `next` is the EXTERNAL path so the
+            # user returns to /drinks/<path> after signing in — nxt here is the
             # internal (prefix-stripped) path, so prepend BASE.
             external_next = quote(EXTERNAL_BASE_PATH + nxt, safe="")
-            target = f"{ext_url('/login')}?next={external_next}"
+            if EXTERNAL_BASE_PATH:
+                # Proxied under the hub: SINGLE SIGN-ON. Hand identity off to the
+                # hub handoff route, which mints this app's session from the hub
+                # login (one sign-in point) — no separate drinks login. That route
+                # itself falls back to the hub login if the user isn't signed in.
+                target = f"/tenancy/drinks-sso?next={external_next}"
+            else:
+                # Standalone (no hub in front): use this app's own login.
+                target = f"{ext_url('/login')}?next={external_next}"
             raise _RedirectException(target)
         raise HTTPException(
             status_code=401,
