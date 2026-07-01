@@ -571,8 +571,12 @@ def get_active_master_info() -> dict:
 
     Served from the shared (TTL-cached) master snapshot so the index page, the
     post-upload banner and the /upload read path all share one fetch.
+
+    Always returns a dict — callers do .get(...) on it, so a None here would 500
+    the estate picker / banner.
     """
-    return load_master_snapshot().banner_info
+    info = load_master_snapshot().banner_info
+    return info if isinstance(info, dict) else {}
 
 
 def load_agreed_retros() -> dict[str, dict]:

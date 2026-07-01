@@ -24,7 +24,7 @@ from datetime import date, timedelta
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import HTTPException as StarletteHTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
@@ -155,6 +155,19 @@ async def _timing_middleware(request, call_next):
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
     logger.info("%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed_ms)
     return response
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    # Log the full traceback (Render captures stderr) so 500s are diagnosable, and
+    # — TEMPORARY — surface it in-page when the URL carries ?__debug=1, so the
+    # operator can copy the real error instead of a bare "Internal Server Error".
+    import traceback as _tb
+    tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error("unhandled error on %s %s:\n%s", request.method, request.url.path, tb)
+    if request.query_params.get("__debug") == "1":
+        return PlainTextResponse("INTERNAL ERROR (debug)\n\n" + tb, status_code=500)
+    return PlainTextResponse("Internal Server Error", status_code=500)
 
 
 # ---------- auth 403 rendering ----------
