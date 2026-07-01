@@ -312,12 +312,27 @@ def healthz():
     return {"status": "ok"}
 
 
+_PROCESS_START = time.time()
+
+
 @app.get("/version")
 def version():
-    """Returns the running git commit (Render injects RENDER_GIT_COMMIT)."""
+    """Running git commit (Render injects RENDER_GIT_COMMIT) + process vitals.
+
+    up_s resets to ~0 whenever the process restarts — the tell for a crash/OOM
+    kill (a burst of proxy-level 500s followed by up_s ~0 = the process died
+    mid-request). rss_mb is the peak resident memory (ru_maxrss, KB on Linux)."""
+    rss_mb = None
+    try:
+        import resource
+        rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        pass
     return {
         "commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
         "branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
+        "up_s": round(time.time() - _PROCESS_START, 1),
+        "rss_mb": rss_mb,
     }
 
 
