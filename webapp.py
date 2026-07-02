@@ -313,6 +313,12 @@ HEAD_STYLE = """<!doctype html>
   .cell-warn { color: #8a6500; }
   .cell-pos { color: #1f7a1f; }
   .pivot-empty { color: #cbd2da; }
+  table.pivot tr.section td { background: #e8edf3; font-weight: 600; color: #2c5aa0; font-size: 0.95em; padding: 0.25em 0.6em; }
+  table.pivot a.cell-edit { display: block; text-decoration: none; color: inherit; border-radius: 3px; }
+  table.pivot.editing td.num:has(a.cell-edit):hover { background: #dcebff; cursor: pointer; }
+  table.pivot a.cell-edit:hover .cell-price, table.pivot a.cell-edit:hover .cell-margin { text-decoration: underline; }
+  table.pivot a.cell-add { display: block; text-align: center; color: #9ab0c8; font-weight: 700; text-decoration: none; border: 1px dashed #c9d6e4; border-radius: 3px; padding: 0.05em 0; }
+  table.pivot a.cell-add:hover { background: #dcebff; color: #2c5aa0; border-color: #2c5aa0; }
 </style>
 </head><body>
 """
@@ -1061,11 +1067,15 @@ def master_end(
 
 @app.get("/master/add", response_class=HTMLResponse)
 def master_add(
+    site_id: str = "",
+    product_code: str = "",
     principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
 ):
+    """site_id/product_code (optional GET params) prefill the selects — the
+    pivot's edit mode links blank cells here."""
     try:
         snap = load_master_snapshot()
-        body = master_pages.render_add_page(snap)
+        body = master_pages.render_add_page(snap, site_id=site_id, product_code=product_code)
     except Exception:
         logger.exception("request failed")
         return _error_page(_GENERIC_ERR)

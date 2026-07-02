@@ -608,8 +608,9 @@ def test_render_master_pivot_shape_and_winner():
     assert "RONLY" in html and "Zed Retro-Only Keg" in html
     # today's winner is £200, NOT the future £999
     assert "£200.00" in html and "£999.00" not in html
-    # margin view present, and the loss cell (P2×S1) is flagged
-    assert "cell-margin" in html and "cell-neg" in html
+    # £-band colours (operator-set): P1×S1 margin £95 -> green; P2×S2 margin £50
+    # -> amber; P2×S1 margin -£20 -> red
+    assert "cell-pos" in html and "cell-warn" in html and "cell-neg" in html
     # P1 left columns: Retro P/Keg = product-level £15.00; Net = 120 − 15 = £105.00
     assert "£15.00" in html and "£105.00" in html
     # P2 has different FB across sites: Price/Net must flag it, not pick one
@@ -617,6 +618,51 @@ def test_render_master_pivot_shape_and_winner():
     # Excel column headers + row order by product NAME (Keg < Loss Keg < Zed…)
     assert "Product Code" in html and "Retro P/Keg" in html and "Net price" in html
     assert html.index(">Keg<") < html.index("Loss Keg") < html.index("Zed Retro-Only Keg")
+    # read-only by default: no edit affordances without ?edit=1
+    assert "cell-edit" not in html and "cell-add" not in html
+
+
+def test_render_master_pivot_cask_section_and_edit_mode():
+    from master_pages import render_master_pivot
+    S1, DR, CK = "001", "ZZZ", "AAA"
+    def R(site, code, tenant, desc, fb=120.0):
+        return Rule(site_id=site, product_code=code, product_desc=desc,
+                    tenant_price=tenant, fb_price=fb, retro_pct=0.0,
+                    valid_from=date(2026, 1, 1), valid_to=None, status="tenanted",
+                    reason="x", source="test")
+    # The cask product's name sorts FIRST alphabetically ("Aardvark…") but must
+    # still land AFTER every draught product (Excel section order).
+    S2 = "002"
+    rules = [
+        R(S1, DR, 200.0, "Zebra Lager 50L"),
+        R(S1, CK, 195.0, "Aardvark Cask 9G"),
+        R(S2, DR, 190.0, "Zebra Lager 50L"),  # CK×S2 has no price -> '+' in edit mode
+    ]
+    snap = MasterSnapshot(
+        sites={S1: {"name": "Alpha Arms"}, S2: {"name": "Beta Bar"}},
+        rules=rules, site_ids={S1: "r1", S2: "r2"},
+        product_ids={DR: "p1", CK: "p2"}, rule_ids={}, banner_info={},
+        products={DR: {"desc": "Zebra Lager 50L", "retro_per_keg": 0.0},
+                  CK: {"desc": "Aardvark Cask 9G", "retro_per_keg": 0.0}},
+    )
+    html = render_master_pivot(snap, {}, is_admin=True)
+    assert html.index("Zebra Lager") < html.index("Aardvark Cask"), (
+        "draught must come before cask regardless of alphabetical order"
+    )
+    # section divider rows present when a cask section exists
+    assert ">Draught<" in html and ">Cask<" in html
+    # edit mode (admin): priced cell links to the edit form, and a second site
+    # would show '+' add links; the add-product button appears
+    html_e = render_master_pivot(snap, {"edit": "1"}, is_admin=True)
+    assert "cell-edit" in html_e and "/master/edit" in html_e
+    assert "Add product" in html_e and "Done editing" in html_e
+    # blank CK×S2 cell -> '+' linking to the PREFILLED add form
+    assert "cell-add" in html_e
+    assert "site_id=002" in html_e and f"product_code={CK}" in html_e
+    # edit mode is admin-only: a viewer passing ?edit=1 gets the read-only grid
+    html_v = render_master_pivot(snap, {"edit": "1"}, is_admin=False)
+    assert "cell-edit" not in html_v and "/master/edit" not in html_v
+    assert "Edit prices" not in html_v
 
 
 def test_master_banner_escapes_source_filename():
@@ -861,7 +907,7 @@ def test_route_preview_apply_roundtrip():
     assert created[0]["fields"]["source"] == f"editor:{FakeAuthClient.EMAIL}", (
         f"provenance stamp wrong: {created[0]['fields'].get('source')!r}"
     )
-    assert "Rules created" in r2.text and "Back to master" in r2.text
+    assert "Rules created" in r2.text and "Back to price grid" in r2.text
 
 
 def test_route_apply_revalidates_tampered_hidden_inputs():
@@ -918,6 +964,7 @@ TESTS = [
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
     test_compute_margin_math,
     test_render_master_pivot_shape_and_winner,
+    test_render_master_pivot_cask_section_and_edit_mode,
     test_master_banner_escapes_source_filename,
     test_retro_pct_ge_one_is_blocked,
     test_retro_gbp_form_converts_to_fraction,

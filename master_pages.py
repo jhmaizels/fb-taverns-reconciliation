@@ -121,14 +121,15 @@ def _date_str(d: date | None, empty: str = "") -> str:
 
 
 def _margin_cell(rule) -> str:
-    """Grid Margin cell: net £/keg + gross-margin %, retro-inclusive. Negative
-    margin (selling under cost) is flagged red; the hover carries the full
-    breakdown (pre-retro £ and net cost). Blank when it can't be computed."""
+    """Grid Margin cell: net £/keg + gross-margin %, retro-inclusive. Uses the
+    same £/keg bands as the pivot (operator-set: green >£70, amber £40–70,
+    red <£40); the hover carries the full breakdown. Blank when it can't be
+    computed."""
     m = margin_of(rule)
     if m.net_gbp is None:
         return '<td class="r">—</td>'
     pct = f" ({m.pct:.1f}%)" if m.pct is not None else ""
-    colour = "#b00020" if m.net_gbp < 0 else ("#7a6a00" if (m.pct is not None and m.pct < 10) else "#1f7a1f")
+    colour = {"cell-neg": "#b00020", "cell-warn": "#7a6a00", "cell-pos": "#1f7a1f"}[_margin_band(m.net_gbp)]
     parts = []
     if m.gross_gbp is not None and rule.retro_pct:
         parts.append(f"vs list £{m.gross_gbp:,.2f}")
@@ -180,11 +181,14 @@ def errors_html(errors: list[str]) -> str:
 
 def _product_descs(snap: MasterSnapshot) -> dict[str, str]:
     """product_code -> best-known description (from rules; codes with no rule
-    yet still appear via snap.product_ids)."""
+    yet still appear via snap.product_ids, described from the Products table)."""
     out: dict[str, str] = {code: "" for code in snap.product_ids}
     for r in snap.rules:
         if r.product_code and r.product_desc and not out.get(r.product_code):
             out[r.product_code] = r.product_desc
+    for code, info in (getattr(snap, "products", {}) or {}).items():
+        if code in out and not out[code] and info.get("desc"):
+            out[code] = info["desc"]
     return out
 
 
@@ -311,25 +315,48 @@ def _pivot_winners(snap: MasterSnapshot, on: date) -> dict[tuple, Rule]:
     return winners
 
 
-def _pivot_cell(winner: Rule | None) -> str:
+# Margin colour bands (operator-set 2026-07-02): per-keg £ margin, not %.
+MARGIN_GREEN_ABOVE = 70.0   # > £70/keg  -> green
+MARGIN_RED_BELOW = 40.0     # < £40/keg  -> red; between -> amber
+
+
+def _margin_band(net_gbp: float) -> str:
+    if net_gbp < MARGIN_RED_BELOW:
+        return "cell-neg"
+    if net_gbp > MARGIN_GREEN_ABOVE:
+        return "cell-pos"
+    return "cell-warn"
+
+
+def _pivot_cell(winner: Rule | None, edit_url: str = "", add_url: str = "") -> str:
     """One site×product cell. Renders BOTH the tenant price and the £ margin
     (with % subline); the toggle swaps which is visible via a table class, so
-    no round-trip. Blank when the product isn't priced at that site."""
+    no round-trip. Blank when the product isn't priced at that site. In edit
+    mode the cell links to the rule's edit form (edit_url) or, for a blank
+    cell, to the prefilled add form (add_url)."""
     if winner is None or winner.tenant_price is None:
+        if add_url:
+            return (
+                f'<td class="num"><a class="cell-add" href="{add_url}"'
+                ' title="Add a price for this product at this site">+</a></td>'
+            )
         return '<td class="num"><span class="pivot-empty">·</span></td>'
     price = f'<span class="cell-price">{escape(_money(winner.tenant_price))}</span>'
     m = margin_of(winner)
     if m.net_gbp is None:
         margin = '<span class="cell-margin pivot-empty">n/a</span>'
     else:
-        cls = "cell-neg" if m.net_gbp < 0 else (
-            "cell-warn" if (m.pct is not None and m.pct < 10) else "cell-pos"
-        )
+        cls = _margin_band(m.net_gbp)
         pct = (
             f'<span class="pct">{m.pct:.1f}%</span>' if m.pct is not None
             else '<span class="pct">n/a</span>'
         )
         margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
+    if edit_url:
+        return (
+            f'<td class="num"><a class="cell-edit" href="{edit_url}"'
+            ' title="Change or delist this price">{}</a></td>'.format(price + margin)
+        )
     return f'<td class="num">{price}{margin}</td>'
 
 
@@ -380,31 +407,60 @@ def render_master_pivot(
             return True
         return q_low in f"{p} {prod_agg.get(p, {}).get('desc', '')}".lower()
 
-    # Row order = the export's (and the cost file's): alphabetical by product
-    # NAME, case-insensitive, code as tiebreaker.
+    # Row order = the cost file's: DRAUGHT products alphabetically, then CASK
+    # products alphabetically. There is no category field in the data — the
+    # Excel's section split lives only in its row order, which Airtable doesn't
+    # keep — so classify by the product NAME (LWC cask lines carry "cask" in
+    # the description). Within each section: name A-Z, code tiebreak.
+    def _is_cask(p: str) -> bool:
+        return "cask" in (prod_agg[p]["desc"] or "").lower()
+
     prod_codes = sorted(
         (p for p in prod_agg if _row_match(p)),
-        key=lambda c: ((prod_agg[c]["desc"] or "").upper(), c),
+        key=lambda c: (_is_cask(c), (prod_agg[c]["desc"] or "").upper(), c),
     )
 
     n_sites, n_prods = len(site_ids), len(prod_codes)
+    edit = bool(is_admin and (params.get("edit") == "1"))
 
-    # ---- toolbar (toggle + product search + link to the list/history view) ----
+    # ---- toolbar (toggle + search + edit mode + link to the list view) ----
     q_attr = escape(q)
+    base = ext_url("/master")
+    q_qs = f"?q={quote(q)}" if q else ""
+    clear_href = f"{base}?edit=1" if edit else base
     clear = (
-        f' <a href="{ext_url("/master")}" style="font-size:0.85em">clear</a>' if q else ""
+        f' <a href="{clear_href}" style="font-size:0.85em">clear</a>' if q else ""
     )
+    edit_keep = '<input type="hidden" name="edit" value="1">' if edit else ""
+    if not is_admin:
+        edit_btns = ""
+    elif edit:
+        done_href = f"{base}{q_qs}"
+        edit_btns = (
+            f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
+            f'<a class="button" style="margin-top:0; background:#666" href="{done_href}">Done editing</a>'
+        )
+    else:
+        edit_href = f"{base}?edit=1" + (f"&q={quote(q)}" if q else "")
+        edit_btns = f'<a class="button" style="margin-top:0" href="{edit_href}">Edit prices</a>'
     toolbar = f"""
 <div class="pivot-toolbar">
   <button type="button" id="pivot-toggle" class="toggle">Show margins</button>
   <form method="get" action="{ext_url('/master')}">
-    <input type="search" name="q" value="{q_attr}" placeholder="Filter products…">
+    {edit_keep}<input type="search" name="q" value="{q_attr}" placeholder="Filter products…">
     <button type="submit">Search</button>{clear}
   </form>
+  {edit_btns}
   <span class="grow"></span>
   <span class="help" style="margin:0">{n_prods} products × {n_sites} sites · prices current as of {today.isoformat()}</span>
   <a href="{ext_url('/master')}?view=list">Detailed list / history →</a>
 </div>"""
+    edit_help = (
+        '<p class="help" style="margin-top:0">Editing: <strong>click a price</strong> to change or '
+        'delist it, <strong>click +</strong> to add a price where a site doesn\'t stock the product, '
+        'or <strong>+ Add product</strong> for a brand-new line. Every change shows a preview to '
+        'confirm before anything is written; new prices take effect from today.</p>'
+    ) if edit else ""
 
     if not prod_codes or not site_ids:
         empty = (
@@ -448,8 +504,38 @@ def render_master_pivot(
             return "—", retro_c, "—"
         return escape(_money(fb)), retro_c, escape(_money(fb - retro))
 
+    def _cell(sid: str, p: str) -> str:
+        w = winners.get((sid, p))
+        if not edit:
+            return _pivot_cell(w)
+        if w is not None:
+            eu = ext_url("/master/edit") + "?rule_key=" + quote(rule_key_of(w), safe="")
+            return _pivot_cell(w, edit_url=eu)
+        au = (
+            ext_url("/master/add")
+            + "?site_id=" + quote(sid, safe="") + "&product_code=" + quote(p, safe="")
+        )
+        return _pivot_cell(None, add_url=au)
+
+    # Section divider rows (Draught / Cask), mirroring the cost file's split.
+    # The label sits in the sticky name column so it survives horizontal scroll.
+    def _section_row(label: str) -> str:
+        return (
+            '<tr class="section"><td class="sticky-col c1"></td>'
+            f'<td class="sticky-col c2">{escape(label)}</td>'
+            f'<td colspan="{3 + n_sites}"></td></tr>'
+        )
+
+    has_cask = any(_is_cask(p) for p in prod_codes)
     body: list[str] = []
-    for p in prod_codes:
+    cask_started = False
+    for i, p in enumerate(prod_codes):
+        if has_cask:
+            if i == 0 and not _is_cask(p):
+                body.append(_section_row("Draught"))
+            if _is_cask(p) and not cask_started:
+                body.append(_section_row("Cask"))
+                cask_started = True
         agg = prod_agg[p]
         price_c, retro_c, net_c = _left_cells(p, agg)
         prod_cells = (
@@ -461,19 +547,19 @@ def render_master_pivot(
             f'<td class="num pinfo">{retro_c}</td>'
             f'<td class="num pinfo">{net_c}</td>'
         )
-        cells = "".join(_pivot_cell(winners.get((sid, p))) for sid in site_ids)
+        cells = "".join(_cell(sid, p) for sid in site_ids)
         body.append(f"<tr>{prod_cells}{pinfo}{cells}</tr>")
 
     table = (
-        f'<div class="pivot-wrap"><table class="pivot" id="pivot-tbl">'
+        f'<div class="pivot-wrap"><table class="pivot{" editing" if edit else ""}" id="pivot-tbl">'
         f'{thead}<tbody>{"".join(body)}</tbody></table></div>'
     )
 
     legend = (
-        '<p class="help" style="margin-top:0">Margin view: '
-        '<span class="cell-pos">green</span> ≥10% · '
-        '<span class="cell-warn">amber</span> &lt;10% · '
-        '<span class="cell-neg">red</span> loss (selling under the net-of-retro FB cost). '
+        '<p class="help" style="margin-top:0">Margin view (per keg, net of retro): '
+        f'<span class="cell-pos">green</span> over £{MARGIN_GREEN_ABOVE:.0f} · '
+        f'<span class="cell-warn">amber</span> £{MARGIN_RED_BELOW:.0f}–£{MARGIN_GREEN_ABOVE:.0f} · '
+        f'<span class="cell-neg">red</span> under £{MARGIN_RED_BELOW:.0f}. '
         'Blank cell = product not priced at that site.</p>'
     )
 
@@ -486,7 +572,7 @@ def render_master_pivot(
 
     return (
         f'<div class="pivot-wide"><h1>Pricing master</h1>{banner_html}'
-        f'{toolbar}{table}{legend}{toggle_js}</div>'
+        f'{toolbar}{edit_help}{table}{legend}{toggle_js}</div>'
     )
 
 
@@ -889,15 +975,19 @@ def render_end_page(snap: MasterSnapshot, rule: Rule) -> str:
 # /master/add — add-rule form (§4.2c)
 # ---------------------------------------------------------------------------
 
-def render_add_page(snap: MasterSnapshot) -> str:
+def render_add_page(snap: MasterSnapshot, site_id: str = "", product_code: str = "") -> str:
+    """site_id / product_code prefill the selects — the pivot's edit mode links
+    a blank cell here with both set, so the operator only types the price."""
     today_iso = date.today().isoformat()
     site_opts = ['<option value="">— pick a site —</option>'] + [
-        f'<option value="{escape(sid)}">{escape(sid)} — {escape((snap.sites.get(sid) or {}).get("name", ""))}</option>'
+        f'<option value="{escape(sid)}"{" selected" if sid == site_id else ""}>'
+        f'{escape(sid)} — {escape((snap.sites.get(sid) or {}).get("name", ""))}</option>'
         for sid in sorted(snap.sites)
     ]
     descs = _product_descs(snap)
     prod_opts = ['<option value="">— pick a product —</option>'] + [
-        f'<option value="{escape(code)}">{escape(code)} — {escape(descs.get(code) or "")}</option>'
+        f'<option value="{escape(code)}"{" selected" if code == product_code else ""}>'
+        f'{escape(code)} — {escape(descs.get(code) or "")}</option>'
         for code in sorted(descs)
     ]
     back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?view=list">← Back to master (list)</a></p>'
@@ -1089,7 +1179,8 @@ def render_result_page(
 <p class="help" style="margin-top:1em">The master list is served from a cached snapshot — this change may take up to a
 minute to appear there (a background refresh has been kicked off). Exports and new reconciliations pick it up immediately.</p>
 <p style="margin-top:1.5em">
-  <a class="button" href="{ext_url('/master')}?view=list">Back to master (list)</a>
+  <a class="button" href="{ext_url('/master')}">Back to price grid</a>
+  <a class="button" href="{ext_url('/master')}?view=list" style="background:#666">Detailed list</a>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank" style="background:#666">Open Airtable</a>
 </p>
 """
