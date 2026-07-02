@@ -619,7 +619,7 @@ def test_render_master_pivot_shape_and_winner():
     assert "Product Code" in html and "Retro P/Keg" in html and "Net price" in html
     assert html.index(">Keg<") < html.index("Loss Keg") < html.index("Zed Retro-Only Keg")
     # read-only by default: no edit affordances without ?edit=1
-    assert "cell-edit" not in html and "cell-add" not in html
+    assert 'class="cellf"' not in html and "cell-input" not in html
 
 
 def test_render_master_pivot_cask_section_and_edit_mode():
@@ -654,11 +654,15 @@ def test_render_master_pivot_cask_section_and_edit_mode():
     # edit mode (admin): priced cell links to the edit form, and a second site
     # would show '+' add links; the add-product button appears
     html_e = render_master_pivot(snap, {"edit": "1"}, is_admin=True)
-    assert "cell-edit" in html_e and "/master/cell" in html_e
+    # in-grid editing: every cell is a one-field form posting to /master/cell/apply
+    assert 'class="cellf"' in html_e and "/master/cell/apply" in html_e
+    assert 'name="tenant_price"' in html_e and "cell-input" in html_e
     assert "Add product" in html_e and "Done editing" in html_e
-    # blank CK×S2 cell -> '+' linking to the PREFILLED cell editor
-    assert "cell-add" in html_e
-    assert "site_id=002" in html_e and f"product_code={CK}" in html_e
+    # priced DR×S1 cell prefilled + prev-tracked (clearing it = remove)
+    assert 'value="200.00" data-prev="200.00"' in html_e
+    # blank CK×S2 cell -> EMPTY input (type to add), identity in hidden fields
+    assert 'value="" data-prev=""' in html_e
+    assert 'name="site_id" value="002"' in html_e
     # site selector present, and filtering to one site drops the other column
     assert '<select name="site"' in html_e
     html_s1 = render_master_pivot(snap, {"site": S1}, is_admin=True)
@@ -666,9 +670,13 @@ def test_render_master_pivot_cask_section_and_edit_mode():
     assert "Alpha Arms" in thead_s1 and "Beta Bar" not in thead_s1, (
         "site filter must show ONLY the chosen site's column"
     )
+    # single-site view stays in the page column (no full-bleed breakout)
+    assert 'class="pivot-single"' in html_s1 and 'class="pivot-wide"' not in html_s1
+    html_all = render_master_pivot(snap, {}, is_admin=True)
+    assert 'class="pivot-wide"' in html_all
     # edit mode is admin-only: a viewer passing ?edit=1 gets the read-only grid
     html_v = render_master_pivot(snap, {"edit": "1"}, is_admin=False)
-    assert "cell-edit" not in html_v and "/master/cell" not in html_v
+    assert 'class="cellf"' not in html_v and "cell-input" not in html_v
     assert "Edit prices" not in html_v
 
 
@@ -953,13 +961,28 @@ def test_route_cell_editor_amend_and_remove():
             assert f["source"] == f"grid:{FakeAuthClient.EMAIL}"
 
             # The redirect target reads the PATCHED cache: new price visible
-            # immediately, no inline Airtable sweep.
+            # immediately (as the edit-mode cell input's value), no inline
+            # Airtable sweep; and in the read-only grid as £ text.
             r3 = client.get("/master", params={"edit": "1", "saved": "1"})
-            assert "£199.50" in r3.text and "Saved" in r3.text
+            assert 'value="199.50"' in r3.text and "Saved" in r3.text
+            r3v = client.get("/master")
+            assert "£199.50" in r3v.text
 
-            # Now remove it (winner started today -> ends tomorrow, bills today only)
+            # Excel semantics: re-entering the SAME price is a silent no-op —
+            # redirect without "saved" and NOTHING written.
+            calls_before = len(fa.calls)
+            r3b = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "do": "save", "tenant_price": "199.50",
+            }, follow_redirects=False)
+            assert r3b.status_code == 303 and "saved=1" not in r3b.headers["location"]
+            assert len(fa.calls) == calls_before, "same-price save must write NOTHING"
+
+            # Excel semantics: an EMPTIED cell removes the price (winner
+            # started today -> ends tomorrow, bills today only).
             r4 = client.post("/master/cell/apply", data={
-                "site_id": SITE_ID, "product_code": PROD_CODE, "do": "delete",
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "do": "save", "tenant_price": "",
             }, follow_redirects=False)
             assert r4.status_code == 303, r4.text[:300]
 

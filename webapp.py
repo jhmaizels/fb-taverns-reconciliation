@@ -323,11 +323,14 @@ HEAD_STYLE = """<!doctype html>
   .cell-pos { color: #1f7a1f; }
   .pivot-empty { color: #cbd2da; }
   table.pivot tr.section td { background: #e8edf3; font-weight: 600; color: #2c5aa0; font-size: 0.95em; padding: 0.25em 0.6em; }
-  table.pivot a.cell-edit { display: block; text-decoration: none; color: inherit; border-radius: 3px; }
-  table.pivot.editing td.num:has(a.cell-edit):hover { background: #dcebff; cursor: pointer; }
-  table.pivot a.cell-edit:hover .cell-price, table.pivot a.cell-edit:hover .cell-margin { text-decoration: underline; }
-  table.pivot a.cell-add { display: block; text-align: center; color: #9ab0c8; font-weight: 700; text-decoration: none; border: 1px dashed #c9d6e4; border-radius: 3px; padding: 0.05em 0; }
-  table.pivot a.cell-add:hover { background: #dcebff; color: #2c5aa0; border-color: #2c5aa0; }
+  /* in-grid editing: each cell is a one-field form (Enter submits) */
+  table.pivot form.cellf { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
+  table.pivot input.cell-input { width: 84px; text-align: right; font-variant-numeric: tabular-nums; padding: 0.25em 0.4em; margin: 0; border: 1px solid #c9d6e4; border-radius: 3px; font-size: 1em; box-sizing: border-box; display: inline-block; }
+  table.pivot input.cell-input:focus { border-color: #2c5aa0; outline: 2px solid #dcebff; background: #fbfdff; }
+  table.pivot td.edit-cell { padding: 0.2em 0.35em; }
+  /* single-site view: stay inside the normal page column, table hugs content */
+  .pivot-single .pivot-wrap { display: inline-block; max-width: 100%; }
+  .pivot-single table.pivot { min-width: 0; }
 </style>
 </head><body>
 """
@@ -1156,6 +1159,25 @@ async def master_cell_apply(
     winner = master_pages.pivot_winner_for(snap, site_id, product_code)
     today = date.today()
 
+    back = [("edit", "1")]
+    if fsite:
+        back.append(("site", fsite))
+    if fq:
+        back.append(("q", fq))
+
+    def _back_to_grid(saved: bool) -> RedirectResponse:
+        qs = ([("saved", "1")] if saved else []) + back
+        return RedirectResponse(
+            ext_url("/master") + "?" + urlencode(qs), status_code=303
+        )
+
+    # Excel semantics from the in-grid cells: an emptied cell means "remove
+    # this price"; an empty cell that never had a price is a no-op.
+    if do != "delete" and not tp_raw:
+        if winner is None:
+            return _back_to_grid(saved=False)
+        do = "delete"
+
     if do == "delete":
         if winner is None:
             return _rerender(["there is no current price to remove"])
@@ -1175,6 +1197,12 @@ async def master_cell_apply(
             tp = float(tp_raw)
         except (TypeError, ValueError):
             return _rerender(["enter the price in £, e.g. 182.50"])
+        # Excel-like: re-entering the same price is a no-op, not an error.
+        if (
+            winner is not None and winner.tenant_price is not None
+            and abs(tp - winner.tenant_price) < 0.005
+        ):
+            return _back_to_grid(saved=False)
         if winner is None:
             # New price at this site: inherit the product-level FB list price
             # (when consistent across sites) and retro so margins stay honest.
@@ -1235,15 +1263,7 @@ async def master_cell_apply(
     except Exception:
         logger.exception("snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
-
-    back = [("edit", "1"), ("saved", "1")]
-    if fsite:
-        back.append(("site", fsite))
-    if fq:
-        back.append(("q", fq))
-    return RedirectResponse(
-        ext_url("/master") + "?" + urlencode(back), status_code=303
-    )
+    return _back_to_grid(saved=True)
 
 
 def _fmt_price(v: float | None) -> str:

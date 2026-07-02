@@ -333,18 +333,12 @@ def _margin_band(pct: float | None) -> str:
     return "cell-warn"
 
 
-def _pivot_cell(winner: Rule | None, edit_url: str = "", add_url: str = "") -> str:
-    """One site×product cell. Renders BOTH the tenant price and the £ margin
-    (with % subline); the toggle swaps which is visible via a table class, so
-    no round-trip. Blank when the product isn't priced at that site. In edit
-    mode the cell links to the rule's edit form (edit_url) or, for a blank
-    cell, to the prefilled add form (add_url)."""
+def _pivot_cell(winner: Rule | None) -> str:
+    """One READ-ONLY site×product cell. Renders BOTH the tenant price and the
+    £ margin (with % subline); the toggle swaps which is visible via a table
+    class, so no round-trip. Blank when the product isn't priced at that site.
+    (Edit mode renders inline input cells instead — see _edit_cell.)"""
     if winner is None or winner.tenant_price is None:
-        if add_url:
-            return (
-                f'<td class="num"><a class="cell-add" href="{add_url}"'
-                ' title="Add a price for this product at this site">+</a></td>'
-            )
         return '<td class="num"><span class="pivot-empty">·</span></td>'
     price = f'<span class="cell-price">{escape(_money(winner.tenant_price))}</span>'
     m = margin_of(winner)
@@ -357,11 +351,6 @@ def _pivot_cell(winner: Rule | None, edit_url: str = "", add_url: str = "") -> s
             else '<span class="pct">n/a</span>'
         )
         margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
-    if edit_url:
-        return (
-            f'<td class="num"><a class="cell-edit" href="{edit_url}"'
-            ' title="Change or delist this price">{}</a></td>'.format(price + margin)
-        )
     return f'<td class="num">{price}{margin}</td>'
 
 
@@ -489,9 +478,12 @@ def render_master_pivot(
             'from Airtable within a minute.</div>'
         )
     edit_help = (
-        '<p class="help" style="margin-top:0">Editing: <strong>click a price</strong> to change or '
-        'remove it, <strong>click +</strong> to add a price where a site doesn\'t stock the product, '
-        'or <strong>+ Add product</strong> for a brand-new line. New prices take effect from today.</p>'
+        '<p class="help" style="margin-top:0">Editing works like the spreadsheet: '
+        '<strong>type in a cell and press Enter</strong> to save the price · '
+        '<strong>clear a cell and press Enter</strong> to remove it · '
+        '<strong>type into an empty cell</strong> to add one · '
+        '<strong>+ Add product</strong> for a brand-new line. '
+        'Changes take effect from today; history is kept underneath.</p>'
     ) if edit else ""
 
     if not prod_codes or not site_ids:
@@ -536,16 +528,40 @@ def render_master_pivot(
             return "—", retro_c, "—"
         return escape(_money(fb)), retro_c, escape(_money(fb - retro))
 
+    apply_url = ext_url("/master/cell/apply")
+
+    def _edit_cell(sid: str, p: str, w: Rule | None) -> str:
+        """Excel-style in-grid editing: the cell IS a price input. Enter saves;
+        clearing a priced cell removes it (JS confirm below); typing into an
+        empty cell adds a price. One tiny form per cell — the server derives
+        everything but the price itself."""
+        val = "" if w is None or w.tenant_price is None else f"{w.tenant_price:.2f}"
+        hidden = _hidden({
+            "site_id": sid, "product_code": p, "fsite": site_f, "fq": q,
+        })
+        margin = ""
+        if w is not None and w.tenant_price is not None:
+            m = margin_of(w)
+            if m.net_gbp is not None:
+                cls = _margin_band(m.pct)
+                pct = (
+                    f'<span class="pct">{m.pct:.1f}%</span>' if m.pct is not None
+                    else '<span class="pct">n/a</span>'
+                )
+                margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
+        return (
+            f'<td class="num edit-cell"><form method="post" action="{apply_url}" class="cellf">'
+            f'{hidden}<input type="number" step="0.01" min="0" name="tenant_price" '
+            f'class="cell-input" value="{val}" data-prev="{val}" '
+            f'title="{escape(_site_name(sid) or sid)} — type a price and press Enter; clear + Enter removes it">'
+            f'{margin}</form></td>'
+        )
+
     def _cell(sid: str, p: str) -> str:
         w = winners.get((sid, p))
         if not edit:
             return _pivot_cell(w)
-        # Excel-like cell editor: amend/remove when priced, add when blank.
-        # fsite/fq bring the operator back to the same filtered view after save.
-        url = ext_url("/master/cell") + _qs(site_id=sid, product_code=p, fsite=site_f, fq=q)
-        if w is not None:
-            return _pivot_cell(w, edit_url=url)
-        return _pivot_cell(None, add_url=url)
+        return _edit_cell(sid, p, w)
 
     # Section divider rows (Draught / Cask), mirroring the cost file's split.
     # The label sits in the sticky name column so it survives horizontal scroll.
@@ -597,11 +613,27 @@ def render_master_pivot(
         "<script>(function(){var t=document.getElementById('pivot-tbl'),"
         "b=document.getElementById('pivot-toggle');if(!t||!b)return;"
         "b.addEventListener('click',function(){var on=t.classList.toggle('show-margin');"
-        "b.textContent=on?'Show prices':'Show margins';});})();</script>"
+        "b.textContent=on?'Show prices':'Show margins';});"
+        # In-grid editing: Enter in a cell submits its one-cell form. Clearing a
+        # priced cell = remove (confirmed); Enter on an empty never-priced cell
+        # is a no-op rather than a round-trip.
+        "t.addEventListener('submit',function(e){"
+        "var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;"
+        "var i=f.querySelector('input[name=tenant_price]');if(!i)return;"
+        "var prev=i.getAttribute('data-prev')||'';"
+        "if(i.value===''){"
+        "if(!prev){e.preventDefault();return;}"
+        "if(!confirm('Remove this price? The product stops billing at this site from today.'))"
+        "{e.preventDefault();i.value=prev;}"
+        "}else if(i.value===prev){e.preventDefault();}"
+        "});})();</script>"
     )
 
+    # Single-site view stays compact inside the normal page column ("don't
+    # spread across the page") — the full estate keeps the wide breakout.
+    wrap_cls = "pivot-wide" if len(site_ids) > 1 else "pivot-single"
     return (
-        f'<div class="pivot-wide"><h1>Pricing master</h1>{banner_html}{saved_banner}'
+        f'<div class="{wrap_cls}"><h1>Pricing master</h1>{banner_html}{saved_banner}'
         f'{toolbar}{edit_help}{table}{legend}{toggle_js}</div>'
     )
 
