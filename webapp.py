@@ -67,6 +67,7 @@ from reconcile import (  # noqa: E402
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
     load_master_snapshot,
+    refresh_master_cache_async,
     load_rules_from_airtable,
     load_sites_from_airtable,
     upsert_file_record,
@@ -90,6 +91,12 @@ from tennents import (  # noqa: E402
 )
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
+# Master editor (design docs/master-editor-design.md): master_changes is the
+# single seam every edit flows through; master_pages holds the HTML bodies +
+# form codec so the routes below stay thin.
+import master_pages  # noqa: E402
+from master_changes import apply_master_change, preview_master_change  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 app = FastAPI(title="FB Taverns Reconciliation")
 app.mount(
@@ -265,6 +272,7 @@ HEAD_STYLE = """<!doctype html>
   tr.support-note td { background: #fffbe7; color: #4a3f10; border-bottom: 1px solid #eee; padding-top: 0.2em; padding-bottom: 0.4em; font-size: 0.85em; }
   .master-banner { background: #fffbe7; border: 1px solid #e6d480; border-radius: 6px; padding: 0.7em 1em; margin: 0 0 1.5em; font-size: 0.92em; color: #4a3f10; }
   .master-banner .sep { color: #b09d50; margin: 0 0.4em; }
+  tr.ended td { color: #999; }
   .help { font-size: 0.85em; color: #555; margin: -0.4em 0 1em; line-height: 1.4; }
   .help strong { color: #2c5aa0; }
 </style>
@@ -558,6 +566,11 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
 <div class="result" style="max-width: none">
   <p style="margin-top:0">The <strong>FB Taverns Cost Price File</strong> Excel is the master. Update it on the left for everyday changes (RPI, new tenants, corrections). Use the right-hand form for <em>temporary</em> tenant support that overrides the master price for a window — when reconciliations land in that window, mismatches get tagged with the support context.</p>
 </div>
+
+<p style="margin-top:1em"><a href="{ext_url('/master')}" class="card-link" style="max-width:none">
+  <span class="card-cta">Browse &amp; edit rules →</span>
+  <span style="color:#555"> — search the pricing master; change a price from a date, fix a mistake in place, or end (delist) a rule, each with a preview before anything is written.</span>
+</a></p>
 
 <div class="grid2" style="margin-top:1em">
   <form action="{ext_url('/upload-master')}" method="post" enctype="multipart/form-data">
@@ -914,6 +927,192 @@ def add_support(
   <a class="button" href="{ext_url('/')}" style="background:#666">Back to home</a>
 </p>
 {PAGE_FOOT}"""
+
+
+# ---------- Pricing-master editor (/master*) ----------
+# Design: docs/master-editor-design.md §3.3-§3.5, §4. Grid = viewer; every
+# mutation (and the preview) = admin, matching /upload-master and /add-support.
+# All mutating POSTs carry the _is_cross_origin guard — master writes are
+# exactly the blast radius CSRF matters for. Every mutation flows through
+# preview_master_change (validates) -> apply_master_change (the ONLY apply
+# path, stamps source="editor:<email>").
+
+_GENERIC_ERR = (
+    "Something went wrong processing this request — the details have been "
+    "logged. Try again, and if it recurs contact the administrator."
+)
+
+
+def _master_not_found_page(principal: DrinksPrincipal, rule_key: str) -> HTMLResponse:
+    """Polite 404 when a rule_key no longer resolves against the snapshot
+    (e.g. edited or removed since the grid page was rendered)."""
+    return HTMLResponse(
+        f"""{render_head(principal.email, principal.role)}
+<h1>Rule not found</h1>
+<div class="result err">No pricing rule matches <code>{escape(rule_key)}</code>.
+It may have been changed or removed since the list was loaded (the list is cached for up to a minute).</div>
+<p><a href="{ext_url('/master')}">Back to master</a></p>
+{PAGE_FOOT}""",
+        status_code=404,
+    )
+
+
+@app.get("/master", response_class=HTMLResponse)
+def master_grid(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
+):
+    """Searchable rule grid over the CACHED master snapshot (never a fresh
+    Airtable sweep — §3.4). Filters/view/pagination via GET params."""
+    try:
+        snap = load_master_snapshot()
+        body = master_pages.render_master_grid(
+            snap,
+            dict(request.query_params),
+            is_admin=principal.is_admin,
+            banner_html=_master_banner_html(snap.banner_info),
+        )
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.get("/master/edit", response_class=HTMLResponse)
+def master_edit(
+    rule_key: str = "",
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Single-rule page: current values + the two edit forms (change-from-date
+    vs fix-in-place — the semantic split is the main user-error surface)."""
+    try:
+        snap = load_master_snapshot()
+        rule = master_pages.find_rule(snap, rule_key)
+        if rule is None:
+            return _master_not_found_page(principal, rule_key)
+        body = master_pages.render_edit_page(snap, rule)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.get("/master/end", response_class=HTMLResponse)
+def master_end(
+    rule_key: str = "",
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    try:
+        snap = load_master_snapshot()
+        rule = master_pages.find_rule(snap, rule_key)
+        if rule is None:
+            return _master_not_found_page(principal, rule_key)
+        body = master_pages.render_end_page(snap, rule)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.get("/master/add", response_class=HTMLResponse)
+def master_add(
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    try:
+        snap = load_master_snapshot()
+        body = master_pages.render_add_page(snap)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/preview", response_class=HTMLResponse)
+async def master_preview(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """POST-echo confirm page: parse form -> MasterChange -> pure preview.
+    WRITES NOTHING. Blocking errors render without a Confirm button (400)."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    change, parse_errors = master_pages.parse_master_change_form(form)
+    if change is None or parse_errors:
+        return _error_page(master_pages.errors_html(parse_errors or ["missing operation"]))
+    try:
+        # run_in_threadpool: a post-write cache miss rebuilds inline (~30s) and
+        # must not block the event loop (the 66658ff proxy-timeout saga).
+        snap = await run_in_threadpool(load_master_snapshot)
+        preview = preview_master_change(change, snap)
+        body = master_pages.render_preview_page(change, preview)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return HTMLResponse(
+        f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+        status_code=400 if preview.errors else 200,
+    )
+
+
+@app.post("/master/apply", response_class=HTMLResponse)
+async def master_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Re-parse the confirm page's hidden inputs, RE-VALIDATE server-side
+    (never trust the echoed form), then apply via apply_master_change with
+    provenance stamped from the signed-in principal.
+
+    Double-submit safety = idempotent-ish apply semantics (§3.5/§2.2): a
+    re-confirmed price_change PATCHes the same key in place; a re-confirmed
+    end_rule refuses inside end_pricing_rule ("already ended") and lands on
+    the friendly refusal page below with nothing written.
+    """
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    change, parse_errors = master_pages.parse_master_change_form(form)
+    if change is None or parse_errors:
+        return _error_page(master_pages.errors_html(parse_errors or ["missing operation"]))
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+        # preview_master_change runs validate_master_change internally; the
+        # pre-write preview is also what the result page renders from (§3.4).
+        preview = preview_master_change(change, snap)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    if preview.errors:
+        return _error_page(master_pages.errors_html(preview.errors))
+    try:
+        result = await run_in_threadpool(
+            apply_master_change, change, principal.email
+        )
+    except ValueError as exc:
+        # Apply-time refusal from the primitives (state moved since the
+        # preview, or a double submit) — nothing was written.
+        return _error_page(
+            "<p>The change was refused at apply time — the rule's state has "
+            "changed since the preview (or this is a duplicate submission):</p>"
+            f"<p><strong>{escape(str(exc))}</strong></p>"
+            "<p>Nothing was written. Reload the rule and try again if it still needs changing.</p>"
+        )
+    except Exception:
+        logger.exception("master apply failed")
+        # A price_change/end closes BEFORE it creates, so a create-batch failure
+        # can leave a close already committed. Invalidate + rebuild the cache so
+        # the "check & repair" link reflects what actually landed (not a stale
+        # pre-close snapshot for up to the TTL), mirroring the success path.
+        from airtable_io import invalidate_master_cache  # noqa: E402
+        invalidate_master_cache()
+        refresh_master_cache_async()
+        return _error_page(master_pages.render_apply_failure(change, preview))
+    # §3.4: result page renders from in-hand data only; kick the background
+    # snapshot rebuild so "Back to master" doesn't eat the 30s inline fetch.
+    refresh_master_cache_async()
+    body = master_pages.render_result_page(change, preview, result)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
 
 
 # ---------- Tennents Direct ----------

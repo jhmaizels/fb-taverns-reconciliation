@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
@@ -241,6 +241,10 @@ class MasterSnapshot:
     product_ids: dict    # product_code -> record id
     rule_ids: dict       # rule_key -> record id
     banner_info: dict    # == get_active_master_info()
+    # rule_key -> Airtable createdTime (record metadata, already returned by
+    # _list_all regardless of projection). Creation-time ONLY: in-place fixes
+    # don't bump it. Powers the /master ?show=recent view (design §4.4).
+    rule_created: dict = field(default_factory=dict)
 
 
 # Module-level cache. Render `starter` is always-on, so it survives between
@@ -327,6 +331,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
 
     rules: list[Rule] = []
     rule_ids: dict[str, str] = {}
+    rule_created: dict[str, str] = {}
     sources: Counter = Counter()
     latest_vf: str | None = None
     latest_uploaded: str | None = None
@@ -336,6 +341,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
         rk = f.get("rule_key")
         if rk:
             rule_ids[rk] = rec["id"]
+            rule_created[rk] = rec.get("createdTime") or ""
         r = _rule_from_rec(rec, sites_by_id, products_by_id)
         if r is not None:
             rules.append(r)
@@ -364,6 +370,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
     return MasterSnapshot(
         sites=sites, rules=rules, site_ids=site_ids,
         product_ids=product_ids, rule_ids=rule_ids, banner_info=banner_info,
+        rule_created=rule_created,
     )
 
 
@@ -553,6 +560,47 @@ def upsert_pricing_rules(
     updated = len(_batch(to_update, "update", table_id)) if to_update else 0
     invalidate_master_cache()
     return created, updated, closed
+
+
+def end_pricing_rule(rule_key: str, valid_to: date, reason: str, source: str) -> str:
+    """Targeted close of ONE rule (the editor's "end rule" / delist action);
+    returns the Airtable record id. Creates nothing — unlike the upsert close
+    pass, no successor row is written.
+
+    Raises ValueError if the rule is missing, already ended, or
+    ``valid_to <= valid_from``. The read-then-check here doubles as the
+    apply-time openness re-check (snapshot Rule objects don't carry record
+    ids, so re-resolution is mandatory anyway).
+    """
+    table_id = T["PricingRules"]
+    existing = _list_all(table_id, fields=["rule_key", "valid_from", "valid_to", "reason"])
+    match = next((rec for rec in existing if rec["fields"].get("rule_key") == rule_key), None)
+    if match is None:
+        raise ValueError(f"no pricing rule with rule_key {rule_key!r}")
+    f = match["fields"]
+    if f.get("valid_to"):
+        raise ValueError(
+            f"rule {rule_key!r} is already ended at {f['valid_to']} — only open rules can be ended"
+        )
+    vf = _parse_date(f.get("valid_from"))
+    if vf and valid_to <= vf:
+        raise ValueError(
+            f"valid_to ({valid_to.isoformat()}) must be after the rule's valid_from ({vf.isoformat()})"
+        )
+    # Prepend to reason rather than replace: Airtable PATCH is a field-level
+    # merge for untouched fields but OVERWRITES any field we send.
+    old_reason = (f.get("reason") or "").strip()
+    new_reason = f"{reason}; {old_reason}" if old_reason else reason
+    _batch(
+        [{
+            "id": match["id"],
+            "fields": {"valid_to": valid_to.isoformat(), "reason": new_reason, "source": source},
+        }],
+        "update",
+        table_id,
+    )
+    invalidate_master_cache()
+    return match["id"]
 
 
 # ---------- write: file + mismatches ----------
