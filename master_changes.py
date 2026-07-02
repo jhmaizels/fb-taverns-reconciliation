@@ -51,6 +51,45 @@ PRICE_SANITY_BAND = (20.0, 500.0)
 
 
 # ---------------------------------------------------------------------------
+# Margin (pure) — the analytics overlay for the editor
+# ---------------------------------------------------------------------------
+#
+# fb_price = FB's list/buying price per keg; retro_pct = the supplier rebate as
+# a fraction of fb_price, so FB's NET COST after the retro = fb_price*(1-retro)
+# (this is master_export's "Net price"). The margin FB actually makes selling to
+# the tenant is tenant_price - net_cost; the pre-retro (cash-at-purchase) margin
+# is tenant_price - fb_price. pct is the retro-inclusive gross margin as a
+# percentage of the selling (tenant) price. Any input None => that figure None,
+# so partial rules (e.g. tenant-only) simply show blanks.
+
+@dataclass(frozen=True)
+class Margin:
+    net_cost: float | None      # fb_price * (1 - retro_pct)
+    gross_gbp: float | None     # tenant_price - fb_price (pre-retro £/keg)
+    net_gbp: float | None       # tenant_price - net_cost  (true £/keg, retro-incl)
+    pct: float | None           # net_gbp / tenant_price * 100 (of selling price)
+
+
+def compute_margin(
+    tenant_price: float | None,
+    fb_price: float | None,
+    retro_pct: float | None = 0.0,
+) -> Margin:
+    """FB's margin for one (site, product) rule. Pure; never raises."""
+    retro = retro_pct or 0.0
+    net_cost = fb_price * (1.0 - retro) if fb_price is not None else None
+    gross = (tenant_price - fb_price) if (tenant_price is not None and fb_price is not None) else None
+    net = (tenant_price - net_cost) if (tenant_price is not None and net_cost is not None) else None
+    pct = (net / tenant_price * 100.0) if (net is not None and tenant_price) else None
+    return Margin(net_cost=net_cost, gross_gbp=gross, net_gbp=net, pct=pct)
+
+
+def margin_of(rule) -> Margin:
+    """Convenience: compute_margin over a Rule's fields."""
+    return compute_margin(rule.tenant_price, rule.fb_price, rule.retro_pct)
+
+
+# ---------------------------------------------------------------------------
 # Data shapes
 # ---------------------------------------------------------------------------
 

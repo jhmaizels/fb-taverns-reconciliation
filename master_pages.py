@@ -34,6 +34,8 @@ from master_changes import (
     ChangeResult,
     MasterChange,
     _contains,
+    compute_margin,
+    margin_of,
 )
 from reconcile import Rule, _parse_date
 
@@ -99,6 +101,28 @@ def _retro_disp(v: float | None) -> str:
 
 def _date_str(d: date | None, empty: str = "") -> str:
     return d.isoformat() if d else empty
+
+
+def _margin_cell(rule) -> str:
+    """Grid Margin cell: net £/keg + gross-margin %, retro-inclusive. Negative
+    margin (selling under cost) is flagged red; the hover carries the full
+    breakdown (pre-retro £ and net cost). Blank when it can't be computed."""
+    m = margin_of(rule)
+    if m.net_gbp is None:
+        return '<td class="r">—</td>'
+    pct = f" ({m.pct:.1f}%)" if m.pct is not None else ""
+    colour = "#b00020" if m.net_gbp < 0 else ("#7a6a00" if (m.pct is not None and m.pct < 10) else "#1f7a1f")
+    parts = []
+    if m.gross_gbp is not None and rule.retro_pct:
+        parts.append(f"pre-retro £{m.gross_gbp:,.2f}")
+    if m.net_cost is not None:
+        parts.append(f"net cost £{m.net_cost:,.2f}")
+    title = " · ".join(parts)
+    return (
+        f'<td class="r" title="{escape(title)}">'
+        f'<strong style="color:{colour}">£{m.net_gbp:,.2f}</strong>'
+        f'<span style="color:#666;font-size:0.85em">{pct}</span></td>'
+    )
 
 
 def _hidden(fields: dict[str, str]) -> str:
@@ -348,6 +372,7 @@ def render_master_grid(
             f'<td class="r">{_money(r.tenant_price)}</td>'
             f'<td class="r">{_money(r.fb_price)}</td>'
             f'<td class="r">{_retro_disp(r.retro_pct)}</td>'
+            f"{_margin_cell(r)}"
             f"<td>{_date_str(r.valid_from, 'open')}</td>"
             f"<td>{_date_str(r.valid_to, '—')}</td>"
             f"<td>{status_disp}{pills}</td>"
@@ -358,6 +383,7 @@ def render_master_grid(
     table = (
         "<table><thead><tr><th>Site</th><th>Product</th>"
         '<th class="r">Tenant £</th><th class="r">FB £</th><th class="r">Retro %</th>'
+        '<th class="r" title="FB margin per keg (net of retro) and gross-margin % of the tenant price">Margin</th>'
         f"<th>Valid from</th><th>Valid to</th><th>Status</th><th>Source</th>{action_head}"
         "</tr></thead><tbody>"
         + "".join(body_rows)
@@ -472,6 +498,14 @@ def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
     site_name = (snap.sites.get(rule.site_id) or {}).get("name", "")
     retro = _frac_str(rule.retro_pct)
     retro_line = f"{retro} (≈{_retro_disp(rule.retro_pct)})" if retro else "—"
+    m = margin_of(rule)
+    if m.net_gbp is None:
+        margin_line = "—"
+    else:
+        pct = f" ({m.pct:.1f}%)" if m.pct is not None else ""
+        extra = f" · net cost £{m.net_cost:,.2f}" if m.net_cost is not None else ""
+        loss = " — loss-making" if m.net_gbp < 0 else ""
+        margin_line = f"£{m.net_gbp:,.2f}{pct}{extra}{loss}"
     rows = [
         ("Rule key", f"<code>{escape(rule_key_of(rule))}</code>"),
         ("Site", escape(f"{rule.site_id} {site_name}".strip())),
@@ -479,6 +513,7 @@ def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
         ("Tenant price", escape(_money(rule.tenant_price))),
         ("FB (list) price", escape(_money(rule.fb_price))),
         ("Retro (fraction of FB list)", escape(retro_line)),
+        ("Margin (net of retro)", escape(margin_line)),
         ("Valid from", escape(_date_str(rule.valid_from, "open (no start date)"))),
         ("Valid to", escape(_date_str(rule.valid_to, "open — on the master"))),
         ("Status", escape(rule.status or "tenanted")),
@@ -710,11 +745,41 @@ def _preview_detail_rows(preview: ChangePreview) -> str:
             f'<div class="summary-row"><span>Update <code>{escape(str(key))}</code> in place</span>'
             f"<span>{escape(' · '.join(diffs)) or 'no field changes'}</span></div>"
         )
+    margin_row = _preview_margin_row(preview)
+    if margin_row:
+        rows.append(margin_row)
     if preview.winner_note:
         rows.append(
             f'<div class="summary-row"><span>Who wins</span><span>{escape(preview.winner_note)}</span></div>'
         )
     return "".join(rows)
+
+
+def _preview_margin_row(preview: ChangePreview) -> str:
+    """Resulting FB margin (net of retro) of the change — old → new for a
+    fix-in-place, the new figure for a create/price change. Flags a loss."""
+    def _disp(fields: dict | None):
+        if not fields:
+            return None, None
+        m = compute_margin(
+            fields.get("tenant_price"), fields.get("fb_price"), fields.get("retro_pct")
+        )
+        if m.net_gbp is None:
+            return None, m
+        pct = f" ({m.pct:.1f}%)" if m.pct is not None else ""
+        return f"£{m.net_gbp:,.2f}{pct}", m
+
+    new_fields = preview.will_create[0] if preview.will_create else (
+        preview.will_update[0].get("new") if preview.will_update else None
+    )
+    old_fields = preview.will_update[0].get("old") if preview.will_update else None
+    new_disp, new_m = _disp(new_fields)
+    if new_disp is None:
+        return ""
+    old_disp, _ = _disp(old_fields)
+    val = f"{old_disp} → {new_disp}" if old_disp else new_disp
+    warn = ' <span style="color:#b00020">— loss-making</span>' if new_m.net_gbp < 0 else ""
+    return f'<div class="summary-row"><span>Margin (net of retro)</span><span>{escape(val)}{warn}</span></div>'
 
 
 def render_preview_page(change: MasterChange, preview: ChangePreview) -> str:

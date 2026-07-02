@@ -528,6 +528,27 @@ def test_backdated_price_change_behind_standing_open_rule_warns_with_window():
     assert "2026-06-15" in p.winner_note and "only applies" in p.winner_note, p.winner_note
 
 
+def test_compute_margin_math():
+    from master_changes import compute_margin
+    # no retro: net cost = fb; margin = tenant - fb; % of tenant
+    m = compute_margin(200.0, 120.0, 0.0)
+    assert m.net_cost == 120.0 and m.gross_gbp == 80.0 and m.net_gbp == 80.0
+    assert abs(m.pct - 40.0) < 1e-9
+    # with retro: net cost = fb*(1-retro); margin includes the rebate
+    m = compute_margin(200.0, 120.0, 0.125)  # net cost 105 -> net margin 95
+    assert abs(m.net_cost - 105.0) < 1e-9 and m.gross_gbp == 80.0
+    assert abs(m.net_gbp - 95.0) < 1e-9 and abs(m.pct - 47.5) < 1e-9
+    # selling under cost -> negative margin
+    m = compute_margin(100.0, 120.0, 0.0)
+    assert m.net_gbp == -20.0 and abs(m.pct - (-20.0)) < 1e-9
+    # partial data / div-by-zero guards -> None, never raises
+    assert compute_margin(200.0, None, 0.0).net_gbp is None
+    assert compute_margin(None, 120.0, 0.0).net_gbp is None
+    assert compute_margin(0.0, 120.0, 0.0).pct is None  # no divide-by-zero
+    # managed-style zero margin
+    assert compute_margin(120.0, 120.0, 0.0).net_gbp == 0.0
+
+
 def test_retro_pct_ge_one_is_blocked():
     # A percentage typed where a fraction belongs (12.5 vs 0.125) would inflate
     # retro_per_keg ~100x — block it rather than warn-through.
@@ -790,6 +811,7 @@ TESTS = [
     test_preview_price_change_close_create_winner,
     test_preview_close_pass_skips_bounded_support_and_future_rule,
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
+    test_compute_margin_math,
     test_retro_pct_ge_one_is_blocked,
     test_preview_winner_overlapping_support_wins_today,
     test_preview_end_rule_delist_and_takeover,
