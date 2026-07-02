@@ -20,6 +20,8 @@ from html import escape
 from pathlib import Path
 
 from datetime import date, timedelta
+from urllib.parse import urlencode
+
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import HTTPException as StarletteHTTPException
@@ -67,6 +69,7 @@ from reconcile import (  # noqa: E402
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
     load_master_snapshot,
+    publish_patched_snapshot,
     refresh_master_cache_async,
     load_rules_from_airtable,
     load_sites_from_airtable,
@@ -95,7 +98,13 @@ from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_htm
 # single seam every edit flows through; master_pages holds the HTML bodies +
 # form codec so the routes below stay thin.
 import master_pages  # noqa: E402
-from master_changes import apply_master_change, preview_master_change  # noqa: E402
+from master_changes import (  # noqa: E402
+    MasterChange,
+    apply_master_change,
+    patch_snapshot_for_change,
+    preview_master_change,
+    validate_master_change,
+)
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 app = FastAPI(title="FB Taverns Reconciliation")
@@ -1080,6 +1089,165 @@ def master_add(
         logger.exception("request failed")
         return _error_page(_GENERIC_ERR)
     return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.get("/master/cell", response_class=HTMLResponse)
+def master_cell(
+    site_id: str = "",
+    product_code: str = "",
+    fsite: str = "",
+    fq: str = "",
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """The Excel-like single-cell editor the pivot's edit mode links to:
+    amend / remove / add ONE price. fsite/fq return the operator to the same
+    filtered grid view after saving."""
+    try:
+        snap = load_master_snapshot()
+        if site_id not in snap.sites or product_code not in snap.product_ids:
+            return _master_not_found_page(principal, f"{site_id}|{product_code}")
+        body = master_pages.render_cell_page(snap, site_id, product_code, fsite=fsite, fq=fq)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/cell/apply")
+async def master_cell_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Apply ONE cell edit (save/remove/add a price) and bounce straight back
+    to the grid — the Excel-like flow. The client sends ONLY the new price and
+    the cell identity; everything else (fb/retro/status, which op applies) is
+    derived server-side from the current winner. After a successful write the
+    cached snapshot is PATCHED and re-published so the grid shows the change
+    instantly — a plain invalidate would leave the next page read doing the
+    ~30s inline sweep that times out the hub proxy."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    site_id = (form.get("site_id") or "").strip()
+    product_code = (form.get("product_code") or "").strip()
+    fsite = (form.get("fsite") or "").strip()
+    fq = (form.get("fq") or "").strip()
+    do = (form.get("do") or "save").strip()
+    tp_raw = (form.get("tenant_price") or "").strip()
+
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    if site_id not in snap.sites or product_code not in snap.product_ids:
+        return _master_not_found_page(principal, f"{site_id}|{product_code}")
+
+    def _rerender(errors: list[str], status_code: int = 400) -> HTMLResponse:
+        body = master_pages.render_cell_page(
+            snap, site_id, product_code, fsite=fsite, fq=fq,
+            errors=errors, tenant_val=tp_raw,
+        )
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=status_code,
+        )
+
+    winner = master_pages.pivot_winner_for(snap, site_id, product_code)
+    today = date.today()
+
+    if do == "delete":
+        if winner is None:
+            return _rerender(["there is no current price to remove"])
+        # Delist from today. A rule that STARTED today ends tomorrow instead
+        # (valid_to must be after valid_from) — it bills today only.
+        vt = today
+        if winner.valid_from is not None and winner.valid_from >= today:
+            vt = winner.valid_from + timedelta(days=1)
+        change = MasterChange(
+            op="end_rule", site_id=site_id, product_code=product_code,
+            valid_from=winner.valid_from, valid_to=vt,
+            reason=f"grid: price removed (was {_fmt_price(winner.tenant_price)})",
+            source_note="grid",
+        )
+    else:
+        try:
+            tp = float(tp_raw)
+        except (TypeError, ValueError):
+            return _rerender(["enter the price in £, e.g. 182.50"])
+        if winner is None:
+            # New price at this site: inherit the product-level FB list price
+            # (when consistent across sites) and retro so margins stay honest.
+            fbs = {
+                round(r.fb_price, 4) for r in snap.rules
+                if r.product_code == product_code and r.valid_to is None
+                and r.fb_price is not None
+            }
+            fb = fbs.pop() if len(fbs) == 1 else None
+            retro_per_keg = (
+                (getattr(snap, "products", {}) or {}).get(product_code) or {}
+            ).get("retro_per_keg") or 0.0
+            retro_pct = (retro_per_keg / fb) if (fb and retro_per_keg) else None
+            change = MasterChange(
+                op="add_rule", site_id=site_id, product_code=product_code,
+                tenant_price=tp, fb_price=fb, retro_pct=retro_pct,
+                status="tenanted", valid_from=today,
+                reason="grid: price added", source_note="grid",
+            )
+        elif winner.valid_from == today:
+            # Second edit the same day: same rule_key -> in-place fix. fb/retro
+            # None keep the stored values (the write path skips them).
+            change = MasterChange(
+                op="fix_in_place", site_id=site_id, product_code=product_code,
+                tenant_price=tp, fb_price=None, retro_pct=None,
+                status=winner.status or "tenanted", valid_from=today,
+                reason=f"grid: price corrected (was {_fmt_price(winner.tenant_price)})",
+                source_note="grid",
+            )
+        else:
+            change = MasterChange(
+                op="price_change", site_id=site_id, product_code=product_code,
+                tenant_price=tp, fb_price=winner.fb_price,
+                retro_pct=winner.retro_pct or None,
+                status=winner.status or "tenanted", valid_from=today,
+                reason=f"grid: price change (was {_fmt_price(winner.tenant_price)})",
+                source_note="grid",
+            )
+
+    errors, _warnings = validate_master_change(change, snap)
+    if errors:
+        return _rerender(errors)
+    try:
+        await run_in_threadpool(apply_master_change, change, principal.email)
+    except ValueError as exc:
+        # Apply-time refusal (state moved / duplicate submit) — nothing written.
+        return _rerender([f"refused at apply time: {exc}"], status_code=409)
+    except Exception:
+        logger.exception("grid cell apply failed")
+        return _error_page(_GENERIC_ERR)
+
+    # Instant-grid flow: publish a patched snapshot, then reconcile from
+    # Airtable in the background.
+    try:
+        publish_patched_snapshot(
+            patch_snapshot_for_change(snap, change, principal.email)
+        )
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+
+    back = [("edit", "1"), ("saved", "1")]
+    if fsite:
+        back.append(("site", fsite))
+    if fq:
+        back.append(("q", fq))
+    return RedirectResponse(
+        ext_url("/master") + "?" + urlencode(back), status_code=303
+    )
+
+
+def _fmt_price(v: float | None) -> str:
+    return "—" if v is None else f"£{v:,.2f}"
 
 
 @app.post("/master/preview", response_class=HTMLResponse)

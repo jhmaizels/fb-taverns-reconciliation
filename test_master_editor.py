@@ -654,14 +654,21 @@ def test_render_master_pivot_cask_section_and_edit_mode():
     # edit mode (admin): priced cell links to the edit form, and a second site
     # would show '+' add links; the add-product button appears
     html_e = render_master_pivot(snap, {"edit": "1"}, is_admin=True)
-    assert "cell-edit" in html_e and "/master/edit" in html_e
+    assert "cell-edit" in html_e and "/master/cell" in html_e
     assert "Add product" in html_e and "Done editing" in html_e
-    # blank CK×S2 cell -> '+' linking to the PREFILLED add form
+    # blank CK×S2 cell -> '+' linking to the PREFILLED cell editor
     assert "cell-add" in html_e
     assert "site_id=002" in html_e and f"product_code={CK}" in html_e
+    # site selector present, and filtering to one site drops the other column
+    assert '<select name="site"' in html_e
+    html_s1 = render_master_pivot(snap, {"site": S1}, is_admin=True)
+    thead_s1 = html_s1[html_s1.index("<thead>"):html_s1.index("</thead>")]
+    assert "Alpha Arms" in thead_s1 and "Beta Bar" not in thead_s1, (
+        "site filter must show ONLY the chosen site's column"
+    )
     # edit mode is admin-only: a viewer passing ?edit=1 gets the read-only grid
     html_v = render_master_pivot(snap, {"edit": "1"}, is_admin=False)
-    assert "cell-edit" not in html_v and "/master/edit" not in html_v
+    assert "cell-edit" not in html_v and "/master/cell" not in html_v
     assert "Edit prices" not in html_v
 
 
@@ -910,6 +917,64 @@ def test_route_preview_apply_roundtrip():
     assert "Rules created" in r2.text and "Back to price grid" in r2.text
 
 
+def test_route_cell_editor_amend_and_remove():
+    """The Excel-like cell editor: GET renders the tiny form; POST save closes
+    the old rule + creates today's successor INHERITING fb/retro/status
+    server-side (client sends only the price); the redirect returns to the
+    grid with the PATCHED cache already showing the new price; POST delete
+    ends the rule. Viewer role is locked out."""
+    today_iso = date.today().isoformat()
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 200.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.get("/master/cell", params={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+            })
+            assert r.status_code == 200 and "Change price" in r.text
+            assert 'name="tenant_price"' in r.text and "Remove price" in r.text
+
+            r2 = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "do": "save", "tenant_price": "199.50", "fsite": SITE_ID,
+            }, follow_redirects=False)
+            assert r2.status_code == 303, r2.text[:300]
+            loc = r2.headers["location"]
+            assert "saved=1" in loc and "edit=1" in loc and f"site={SITE_ID}" in loc
+
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"]
+            assert closes[0]["fields"]["valid_to"] == today_iso
+            created = _creates(fa)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["tenant_price"] == 199.5
+            assert f["fb_price"] == 200.0, "fb must be inherited server-side"
+            assert f["source"] == f"grid:{FakeAuthClient.EMAIL}"
+
+            # The redirect target reads the PATCHED cache: new price visible
+            # immediately, no inline Airtable sweep.
+            r3 = client.get("/master", params={"edit": "1", "saved": "1"})
+            assert "£199.50" in r3.text and "Saved" in r3.text
+
+            # Now remove it (winner started today -> ends tomorrow, bills today only)
+            r4 = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE, "do": "delete",
+            }, follow_redirects=False)
+            assert r4.status_code == 303, r4.text[:300]
+
+        with FakeAuthClient("viewer") as client:
+            r5 = client.get("/master/cell", params={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+            })
+            assert r5.status_code == 403
+            r6 = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "do": "save", "tenant_price": "1.00",
+            }, follow_redirects=False)
+            assert r6.status_code == 403
+
+
 def test_route_apply_revalidates_tampered_hidden_inputs():
     """/master/apply must re-validate server-side: a tampered/stale hidden
     form (key collision for op=price_change) is refused with nothing written."""
@@ -974,6 +1039,7 @@ TESTS = [
     test_route_grid_viewer_ok_edit_admin_only,
     test_route_end_add_forms_and_404,
     test_route_preview_apply_roundtrip,
+    test_route_cell_editor_amend_and_remove,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,
 ]

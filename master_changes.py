@@ -644,3 +644,91 @@ def apply_master_change(change: MasterChange, actor_email: str) -> ChangeResult:
     return ChangeResult(
         created=created, updated=updated, closed=closed, rule_keys_touched=[key]
     )
+
+
+# ---------------------------------------------------------------------------
+# patch_snapshot_for_change — in-memory mirror of an applied change
+# ---------------------------------------------------------------------------
+
+def patch_snapshot_for_change(
+    snap: MasterSnapshot, change: MasterChange, actor_email: str
+) -> MasterSnapshot:
+    """A NEW MasterSnapshot reflecting what ``change`` just wrote to Airtable.
+
+    Powers the grid cell editor's save -> redirect -> grid flow: publishing the
+    patched snapshot (airtable_io.publish_patched_snapshot) lets the very next
+    page read show the change instantly instead of leaving the cache at None —
+    where the next read would do the ~30s inline sweep that times out the hub
+    proxy. The background refresh replaces this patch with the authoritative
+    Airtable state within ~a minute.
+
+    Mirrors apply_master_change's semantics; call it only AFTER a successful
+    apply. Never mutates ``snap`` (concurrent renders may hold it) — the rules
+    list and any changed Rule are copied."""
+    from dataclasses import replace as _dc_replace
+
+    site, code = _norm(change)
+    key = airtable_io._rule_key(site, code, change.valid_from)
+    rules = list(snap.rules)
+
+    def _is_target(r: Rule) -> bool:
+        return (
+            r.site_id == site and r.product_code == code
+            and r.valid_from == change.valid_from
+        )
+
+    if change.op == "end_rule":
+        rules = [
+            _dc_replace(r, valid_to=change.valid_to) if _is_target(r) else r
+            for r in rules
+        ]
+        return _dc_replace(snap, rules=rules)
+
+    if change.op == "fix_in_place":
+        def _fixed(r: Rule) -> Rule:
+            return _dc_replace(
+                r,
+                tenant_price=(
+                    change.tenant_price if change.tenant_price is not None else r.tenant_price
+                ),
+                fb_price=change.fb_price if change.fb_price is not None else r.fb_price,
+                # zero/None retro keeps the stored value — the write path skips zeros
+                retro_pct=change.retro_pct if change.retro_pct else r.retro_pct,
+                status=change.status or r.status,
+            )
+        rules = [_fixed(r) if _is_target(r) else r for r in rules]
+        return _dc_replace(snap, rules=rules)
+
+    # price_change / add_rule: the close pass ends any OPEN rule for this
+    # (site, product) starting before the effective date, then the new rule
+    # is appended (upsert_pricing_rules semantics).
+    d = change.valid_from
+    def _closed(r: Rule) -> Rule:
+        if (
+            r.site_id == site and r.product_code == code
+            and r.valid_to is None and d is not None
+            and (r.valid_from or date.min) < d
+        ):
+            return _dc_replace(r, valid_to=d)
+        return r
+    rules = [_closed(r) for r in rules]
+    desc = change.product_desc or next(
+        (r.product_desc for r in snap.rules
+         if r.product_code == code and r.product_desc), "",
+    )
+    rules.append(Rule(
+        site_id=site,
+        product_code=code,
+        product_desc=desc,
+        tenant_price=change.tenant_price,
+        fb_price=change.fb_price,
+        retro_pct=change.retro_pct or 0.0,
+        valid_from=change.valid_from,
+        valid_to=change.valid_to,
+        status=change.status,
+        reason=change.reason,
+        source=f"{change.source_note or 'editor'}:{actor_email}",
+    ))
+    rule_ids = dict(snap.rule_ids)
+    rule_ids.setdefault(key, "pending-refresh")
+    return _dc_replace(snap, rules=rules, rule_ids=rule_ids)

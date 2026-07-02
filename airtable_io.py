@@ -300,6 +300,24 @@ def refresh_master_cache_async() -> None:
     threading.Thread(target=_work, daemon=True, name="master-cache-refresh").start()
 
 
+def publish_patched_snapshot(snap: MasterSnapshot) -> None:
+    """Install a locally-patched snapshot as the fresh cache entry.
+
+    The grid's Excel-like cell editor needs save -> redirect -> grid to show
+    the change IMMEDIATELY. A plain invalidate leaves the cache at None, and
+    the next page read then does the ~30s inline Airtable sweep — the exact
+    hub-proxy timeout that caused the 2026-07-01 outage. So the /master/cell
+    route applies the write to Airtable, patches the in-memory snapshot to
+    match, and publishes it here (bumping the generation so any in-flight
+    background fetch started against the older state is discarded). The caller
+    should kick refresh_master_cache_async() afterwards so the authoritative
+    Airtable state replaces the patch within ~a minute."""
+    with _MASTER_CACHE_LOCK:
+        _MASTER_CACHE["snapshot"] = snap
+        _MASTER_CACHE["ts"] = time.monotonic()
+        _MASTER_CACHE["gen"] += 1
+
+
 def _fetch_master_snapshot() -> MasterSnapshot:
     site_recs = _list_all(T["Sites"], fields=["site_id", "name", "status", "country", "notes"])
     product_recs = _list_all(T["Products"], fields=["product_code", "description", "retro_per_keg"])
