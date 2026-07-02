@@ -174,6 +174,13 @@ async def _timing_middleware(request, call_next):
         set_session_cookies(response, rewrite[0], rewrite[1])
     elif getattr(request.state, "drinks_clear_cookies", False):
         clear_session_cookies(response)
+    # Never let an authed HTML page (pricing/tenant data, and dynamic grids that
+    # change on every deploy) sit in a browser/proxy cache. Without this the app
+    # sends NO Cache-Control, so a browser can serve a stale copy after a deploy —
+    # "I don't see my change". Scoped to text/html so /export-master (xlsx) and
+    # /version (json) keep their own semantics.
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-store"
     elapsed_ms = (time.perf_counter() - start) * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
     logger.info("%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed_ms)
