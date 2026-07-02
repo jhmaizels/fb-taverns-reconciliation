@@ -998,6 +998,48 @@ def test_route_cell_editor_amend_and_remove():
             assert r6.status_code == 403
 
 
+def test_route_site_rename():
+    """Grid edit-mode site headers link to /master/site; POST renames the site
+    in Airtable (Sites PATCH), the patched cache shows the new name on the
+    redirect target immediately, and viewers are locked out."""
+    with FakeAirtable([_grid_rule()]) as fa:
+        with FakeAuthClient("admin") as client:
+            # edit-mode header links to the rename form
+            r0 = client.get("/master", params={"edit": "1"})
+            assert "/master/site" in r0.text and "site-head" in r0.text
+            r = client.get("/master/site", params={"site_id": SITE_ID})
+            assert r.status_code == 200 and 'name="name"' in r.text
+
+            r2 = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "name": "Victoria Barnsley",
+            }, follow_redirects=False)
+            assert r2.status_code == 303, r2.text[:300]
+            ups = [
+                (op, recs) for op, t, recs in fa.calls
+                if op == "update" and t == airtable_io.T["Sites"]
+            ]
+            assert len(ups) == 1 and ups[0][1][0]["fields"] == {"name": "Victoria Barnsley"}
+            assert ups[0][1][0]["id"] == SITE_REC
+
+            # patched cache: the new name is in the header immediately
+            r3 = client.get("/master")
+            assert "Victoria Barnsley" in r3.text
+
+            # empty name -> 400, nothing written
+            n_calls = len(fa.calls)
+            r4 = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "name": "  ",
+            }, follow_redirects=False)
+            assert r4.status_code == 400 and len(fa.calls) == n_calls
+
+        with FakeAuthClient("viewer") as client:
+            assert client.get("/master/site", params={"site_id": SITE_ID}).status_code == 403
+            r5 = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "name": "X",
+            }, follow_redirects=False)
+            assert r5.status_code == 403
+
+
 def test_route_apply_revalidates_tampered_hidden_inputs():
     """/master/apply must re-validate server-side: a tampered/stale hidden
     form (key collision for op=price_change) is refused with nothing written."""
@@ -1063,6 +1105,7 @@ TESTS = [
     test_route_end_add_forms_and_404,
     test_route_preview_apply_roundtrip,
     test_route_cell_editor_amend_and_remove,
+    test_route_site_rename,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,
 ]

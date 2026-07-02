@@ -300,6 +300,26 @@ def refresh_master_cache_async() -> None:
     threading.Thread(target=_work, daemon=True, name="master-cache-refresh").start()
 
 
+def rename_site(site_id: str, name: str) -> str:
+    """Set a site's display name (Sites.name). Returns the record id.
+
+    Exists because the add-rule flow auto-creates sites WITHOUT a name (only
+    the id), which then show as bare ids across the pivot, exports and
+    reconciliation reports. Admin-gated at the route layer."""
+    site_id = (site_id or "").strip()
+    name = (name or "").strip()
+    if not site_id:
+        raise ValueError("site_id is required")
+    if not name:
+        raise ValueError("the site name must not be empty")
+    rec_id = _site_lookup().get(site_id)
+    if not rec_id:
+        raise ValueError(f"site {site_id!r} is not in the master")
+    _batch([{"id": rec_id, "fields": {"name": name}}], "update", T["Sites"])
+    invalidate_master_cache()
+    return rec_id
+
+
 def publish_patched_snapshot(snap: MasterSnapshot) -> None:
     """Install a locally-patched snapshot as the fresh cache entry.
 

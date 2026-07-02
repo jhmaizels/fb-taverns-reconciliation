@@ -71,6 +71,7 @@ from airtable_io import (  # noqa: E402
     load_master_snapshot,
     publish_patched_snapshot,
     refresh_master_cache_async,
+    rename_site,
     load_rules_from_airtable,
     load_sites_from_airtable,
     upsert_file_record,
@@ -306,8 +307,8 @@ HEAD_STYLE = """<!doctype html>
   table.pivot thead th.site { max-width: 120px; white-space: normal; line-height: 1.15; }
   table.pivot thead th.site .sid { display: block; font-weight: 400; color: #789; font-size: 0.82em; }
   table.pivot .sticky-col { position: sticky; z-index: 2; background: #fff; text-align: left; white-space: normal; }
-  table.pivot .sticky-col.c1 { left: 0; width: 110px; min-width: 110px; max-width: 110px; box-sizing: border-box; overflow-wrap: anywhere; }
-  table.pivot .sticky-col.c2 { left: 110px; min-width: 180px; max-width: 240px; box-shadow: 1px 0 0 #ddd; }
+  table.pivot .sticky-col.c1 { left: 0; width: 72px; min-width: 72px; max-width: 72px; box-sizing: border-box; overflow-wrap: anywhere; }
+  table.pivot .sticky-col.c2 { left: 72px; min-width: 180px; max-width: 240px; box-shadow: 1px 0 0 #ddd; }
   table.pivot thead th.sticky-col { z-index: 5; background: #eef2f7; }
   table.pivot td.pcode, table.pivot .pcode { color: #567; font-size: 0.9em; font-variant-numeric: tabular-nums; }
   table.pivot td.num, table.pivot th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -331,6 +332,12 @@ HEAD_STYLE = """<!doctype html>
   /* single-site view: stay inside the normal page column, table hugs content */
   .pivot-single .pivot-wrap { display: inline-block; max-width: 100%; }
   .pivot-single table.pivot { min-width: 0; }
+  /* top scrollbar mirroring the bottom one (JS-synced; hidden when no overflow) */
+  .pivot-topscroll { overflow-x: auto; overflow-y: hidden; margin: 0.4em 0 0; }
+  .pivot-topscroll > div { height: 1px; }
+  /* edit mode: site headers open the rename form */
+  table.pivot a.site-head { color: inherit; text-decoration: none; border-bottom: 1px dashed #9ab0c8; }
+  table.pivot a.site-head:hover { color: #2c5aa0; border-bottom-color: #2c5aa0; }
 </style>
 </head><body>
 """
@@ -1114,6 +1121,87 @@ def master_cell(
         logger.exception("request failed")
         return _error_page(_GENERIC_ERR)
     return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.get("/master/site", response_class=HTMLResponse)
+def master_site(
+    site_id: str = "",
+    fsite: str = "",
+    fq: str = "",
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Set/correct a site's display name (linked from the grid's edit-mode
+    site headers — auto-created sites have no name)."""
+    try:
+        snap = load_master_snapshot()
+        if site_id not in snap.sites:
+            return _master_not_found_page(principal, site_id)
+        body = master_pages.render_site_name_page(snap, site_id, fsite=fsite, fq=fq)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/site/apply")
+async def master_site_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    site_id = (form.get("site_id") or "").strip()
+    fsite = (form.get("fsite") or "").strip()
+    fq = (form.get("fq") or "").strip()
+    name = (form.get("name") or "").strip()
+
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    if site_id not in snap.sites:
+        return _master_not_found_page(principal, site_id)
+
+    def _rerender(errors: list[str]) -> HTMLResponse:
+        body = master_pages.render_site_name_page(
+            snap, site_id, fsite=fsite, fq=fq, errors=errors
+        )
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=400,
+        )
+
+    if not name:
+        return _rerender(["the site name must not be empty"])
+    try:
+        await run_in_threadpool(rename_site, site_id, name)
+    except ValueError as exc:
+        return _rerender([str(exc)])
+    except Exception:
+        logger.exception("site rename failed")
+        return _error_page(_GENERIC_ERR)
+
+    # Same instant-grid pattern as the cell editor: patch the cached snapshot
+    # (new name in the sites dict) and re-publish, then reconcile async.
+    try:
+        from dataclasses import replace as _dc_replace
+        sites = dict(snap.sites)
+        sites[site_id] = {**sites[site_id], "name": name}
+        publish_patched_snapshot(_dc_replace(snap, sites=sites))
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+
+    back = [("edit", "1"), ("saved", "1")]
+    if fsite:
+        back.append(("site", fsite))
+    if fq:
+        back.append(("q", fq))
+    return RedirectResponse(
+        ext_url("/master") + "?" + urlencode(back), status_code=303
+    )
 
 
 @app.post("/master/cell/apply")

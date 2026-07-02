@@ -497,11 +497,22 @@ def render_master_pivot(
         )
 
     # ---- header row (the Excel's: Code | Name | Price | Retro P/Keg | Net price | sites…) ----
-    head_sites = "".join(
-        f'<th class="num site" title="{escape(sid)} — {escape(_site_name(sid))}">'
-        f'{escape(_site_name(sid) or sid)}<span class="sid">{escape(sid)}</span></th>'
-        for sid in site_ids
-    )
+    def _site_head(sid: str) -> str:
+        label = (
+            f'{escape(_site_name(sid) or sid)}<span class="sid">{escape(sid)}</span>'
+        )
+        if edit:
+            # Edit mode: the header opens the site-name form — auto-created
+            # sites have no name and show as bare ids until fixed here.
+            url = ext_url("/master/site") + _qs(site_id=sid, fsite=site_f, fq=q)
+            hint = "Rename this site" if _site_name(sid) else "Name this site"
+            label = f'<a class="site-head" href="{url}" title="{hint}">{label}</a>'
+        return (
+            f'<th class="num site" title="{escape(sid)} — {escape(_site_name(sid))}">'
+            f"{label}</th>"
+        )
+
+    head_sites = "".join(_site_head(sid) for sid in site_ids)
     thead = (
         '<thead><tr>'
         '<th class="sticky-col c1">Product Code</th>'
@@ -596,8 +607,11 @@ def render_master_pivot(
         cells = "".join(_cell(sid, p) for sid in site_ids)
         body.append(f"<tr>{prod_cells}{pinfo}{cells}</tr>")
 
+    # Top scrollbar mirroring the bottom one (synced by the script below) so a
+    # wide estate can be scrolled without first scrolling to the table's foot.
     table = (
-        f'<div class="pivot-wrap"><table class="pivot{" editing" if edit else ""}" id="pivot-tbl">'
+        '<div class="pivot-topscroll" id="pivot-top"><div id="pivot-top-inner"></div></div>'
+        f'<div class="pivot-wrap" id="pivot-wrap"><table class="pivot{" editing" if edit else ""}" id="pivot-tbl">'
         f'{thead}<tbody>{"".join(body)}</tbody></table></div>'
     )
 
@@ -626,7 +640,18 @@ def render_master_pivot(
         "if(!confirm('Remove this price? The product stops billing at this site from today.'))"
         "{e.preventDefault();i.value=prev;}"
         "}else if(i.value===prev){e.preventDefault();}"
-        "});})();</script>"
+        "});"
+        # Top scrollbar mirror: a spacer as wide as the table, scroll synced
+        # both ways. Collapses when the table doesn't overflow.
+        "var w=document.getElementById('pivot-wrap'),tp=document.getElementById('pivot-top'),"
+        "ti=document.getElementById('pivot-top-inner');"
+        "if(w&&tp&&ti){var sync=function(){ti.style.width=t.scrollWidth+'px';"
+        "tp.style.display=(t.scrollWidth>w.clientWidth)?'block':'none';};"
+        "sync();window.addEventListener('resize',sync);"
+        "var lock=false;"
+        "tp.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;w.scrollLeft=tp.scrollLeft;});"
+        "w.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;tp.scrollLeft=w.scrollLeft;});}"
+        "})();</script>"
     )
 
     # Single-site view stays compact inside the normal page column ("don't
@@ -742,6 +767,47 @@ def render_cell_page(
          autofocus style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
   <p class="help">{help_line}</p>
   {buttons}
+</form>
+"""
+
+
+# ---------------------------------------------------------------------------
+# /master/site — set/correct a site's display name (grid edit mode)
+# ---------------------------------------------------------------------------
+
+def render_site_name_page(
+    snap: MasterSnapshot,
+    site_id: str,
+    fsite: str = "",
+    fq: str = "",
+    errors: list[str] | None = None,
+) -> str:
+    """One field: the site's display name. Auto-created sites have none and
+    show as bare ids across the grid/exports — this is where that gets fixed."""
+    cur = (snap.sites.get(site_id) or {}).get("name") or ""
+    back_pairs = [("edit", "1")]
+    if fsite:
+        back_pairs.append(("site", fsite))
+    if fq:
+        back_pairs.append(("q", fq))
+    back_href = ext_url("/master") + "?" + urlencode(back_pairs)
+    back = f'<p class="sub" style="margin-top:0"><a href="{back_href}">← Back to the price grid</a></p>'
+    err_html = ""
+    if errors:
+        items = "".join(f"<li>{escape(e)}</li>" for e in errors)
+        err_html = f'<div class="err" style="margin-bottom:1em"><ul style="margin:0; padding-left:1.2em">{items}</ul></div>'
+    hidden = _hidden({"site_id": site_id, "fsite": fsite, "fq": fq})
+    return f"""{back}
+<h1>Site name</h1>
+<p class="sub" style="margin-bottom:1em">Site <strong>{escape(site_id)}</strong>{f" — currently “{escape(cur)}”" if cur else " — no name set"}</p>
+{err_html}
+<form method="post" action="{ext_url('/master/site/apply')}" style="max-width:540px">
+  {hidden}
+  <label for="sn-name">Site name</label>
+  <input type="text" name="name" id="sn-name" value="{escape(cur)}" autofocus required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">Shown across the price grid, exports and reconciliation reports.</p>
+  <button type="submit" style="margin-top:1em">Save name</button>
 </form>
 """
 
