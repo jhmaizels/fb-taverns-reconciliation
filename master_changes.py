@@ -732,3 +732,155 @@ def patch_snapshot_for_change(
     rule_ids = dict(snap.rule_ids)
     rule_ids.setdefault(key, "pending-refresh")
     return _dc_replace(snap, rules=rules, rule_ids=rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Universal (annual) price increase — pure builder + snapshot patch
+# ---------------------------------------------------------------------------
+
+# Warn outside this band; block outside ±50% (fat-finger guard).
+INCREASE_SANITY_BAND_PCT = (-20.0, 20.0)
+INCREASE_HARD_LIMIT_PCT = 50.0
+
+
+def build_universal_increase(
+    snap: MasterSnapshot, pct: float, effective: date, actor_email: str = ""
+) -> tuple[list[Rule], dict]:
+    """The successor rules for an across-the-board price increase of ``pct``%.
+
+    Operator semantics (2026-07-02): the increase moves the TENANT price and
+    the FB LIST price — the retro stays a FIXED £/keg. Because the stored
+    retro_pct is a fraction of the list price, the successor's retro_pct is
+    recomputed so retro £ is preserved exactly:
+        retro£ = retro_pct x fb  ==  retro_pct' x fb'   =>   retro_pct' = retro_pct x fb / fb'
+    The net price (list − retro) therefore rises with the list.
+
+    Included: every OPEN rule (valid_to None) with status 'tenanted' whose
+    valid_from is on/before ``effective``. A rule starting exactly ON the
+    effective date shares the successor's rule_key, so the upsert updates it
+    in place rather than closing it — same outcome, no duplicate.
+    Skipped (reported in stats): supported/managed rules (temporary or
+    zero-margin layers — an annual uplift doesn't apply), future-dated rules,
+    and rules with no tenant price.
+    """
+    mult = 1.0 + pct / 100.0
+    new_rules: list[Rule] = []
+    skipped_support = 0
+    skipped_future = 0
+    skipped_no_price = 0
+    examples: list[dict] = []
+    sites_seen: set = set()
+    products_seen: set = set()
+
+    for r in snap.rules:
+        if r.valid_to is not None:
+            continue
+        if (r.status or "tenanted") != "tenanted":
+            skipped_support += 1
+            continue
+        if r.valid_from is not None and r.valid_from > effective:
+            skipped_future += 1
+            continue
+        if r.tenant_price is None:
+            skipped_no_price += 1
+            continue
+        new_tenant = round(r.tenant_price * mult, 2)
+        if r.fb_price is not None:
+            new_fb = round(r.fb_price * mult, 2)
+            retro_gbp = (r.retro_pct or 0.0) * r.fb_price
+            new_retro_pct = (retro_gbp / new_fb) if new_fb else 0.0
+        else:
+            new_fb = None
+            new_retro_pct = r.retro_pct or 0.0
+        new_rules.append(Rule(
+            site_id=r.site_id,
+            product_code=r.product_code,
+            product_desc=r.product_desc,
+            tenant_price=new_tenant,
+            fb_price=new_fb,
+            retro_pct=new_retro_pct,
+            valid_from=effective,
+            valid_to=None,
+            status="tenanted",
+            reason=f"annual increase {pct:+g}% (was {r.tenant_price})",
+            source=f"increase:{actor_email}" if actor_email else "increase",
+        ))
+        sites_seen.add(r.site_id)
+        products_seen.add(r.product_code)
+        if len(examples) < 5:
+            examples.append({
+                "site_id": r.site_id,
+                "product_code": r.product_code,
+                "product_desc": r.product_desc,
+                "old_tenant": r.tenant_price,
+                "new_tenant": new_tenant,
+                "old_fb": r.fb_price,
+                "new_fb": new_fb,
+                "retro_gbp": (r.retro_pct or 0.0) * (r.fb_price or 0.0),
+            })
+
+    # Fingerprint of exactly which prices this increase would rewrite (and
+    # from what). The confirm page carries it and apply REFUSES on mismatch —
+    # so a double submit (the first apply already moved the prices) or a
+    # concurrent edit between preview and apply can never compound the
+    # increase.
+    import hashlib
+    old_prices = "|".join(
+        f"{r.site_id},{r.product_code},{_date_iso(r.valid_from)},{r.tenant_price}"
+        for r in sorted(
+            (r for r in snap.rules
+             if r.valid_to is None and (r.status or "tenanted") == "tenanted"
+             and r.tenant_price is not None
+             and (r.valid_from is None or r.valid_from <= effective)),
+            key=lambda r: (r.site_id, r.product_code, _date_iso(r.valid_from)),
+        )
+    )
+    checksum = hashlib.sha256(
+        f"{pct}|{effective.isoformat()}|{old_prices}".encode()
+    ).hexdigest()[:16]
+
+    stats = {
+        "n_rules": len(new_rules),
+        "n_sites": len(sites_seen),
+        "n_products": len(products_seen),
+        "skipped_support": skipped_support,
+        "skipped_future": skipped_future,
+        "skipped_no_price": skipped_no_price,
+        "examples": examples,
+        "checksum": checksum,
+    }
+    return new_rules, stats
+
+
+def _date_iso(d: date | None) -> str:
+    return d.isoformat() if d else "open"
+
+
+def patch_snapshot_for_increase(
+    snap: MasterSnapshot, new_rules: list[Rule], effective: date
+) -> MasterSnapshot:
+    """The in-memory mirror of applying ``new_rules`` via
+    upsert_pricing_rules(close_keys_at_date=effective) — same shape as
+    patch_snapshot_for_change but for the bulk annual increase."""
+    from dataclasses import replace as _dc_replace
+
+    touched = {(r.site_id, r.product_code) for r in new_rules}
+    new_keys = {(r.site_id, r.product_code, r.valid_from) for r in new_rules}
+    rules: list[Rule] = []
+    for r in snap.rules:
+        k3 = (r.site_id, r.product_code, r.valid_from)
+        if k3 in new_keys:
+            continue  # same-key rule is REPLACED in place by the successor
+        if (
+            (r.site_id, r.product_code) in touched
+            and r.valid_to is None
+            and (r.valid_from or date.min) < effective
+        ):
+            rules.append(_dc_replace(r, valid_to=effective))
+        else:
+            rules.append(r)
+    rules.extend(new_rules)
+    rule_ids = dict(snap.rule_ids)
+    for r in new_rules:
+        rule_ids.setdefault(_key_of(r), "pending-refresh")
+    return _dc_replace(snap, rules=rules, rule_ids=rule_ids)

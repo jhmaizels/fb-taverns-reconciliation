@@ -451,6 +451,8 @@ def render_master_pivot(
     elif edit:
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
+            f'<a class="button" style="margin-top:0" href="{ext_url("/master/site/new")}">+ Add site</a>'
+            f'<a class="button" style="margin-top:0; background:#7a5c00" href="{ext_url("/master/increase")}">Annual increase</a>'
             f'<a class="button" style="margin-top:0; background:#666" href="{base}{_qs(site=site_f, q=q)}">Done editing</a>'
         )
     else:
@@ -782,8 +784,9 @@ def render_site_name_page(
     fq: str = "",
     errors: list[str] | None = None,
 ) -> str:
-    """One field: the site's display name. Auto-created sites have none and
-    show as bare ids across the grid/exports — this is where that gets fixed."""
+    """Site settings: rename (auto-created sites have no name and show as bare
+    ids) plus the exits — end all its prices ('leaves the estate', history
+    kept) or, for a site with NO rule history at all, delete the record."""
     cur = (snap.sites.get(site_id) or {}).get("name") or ""
     back_pairs = [("edit", "1")]
     if fsite:
@@ -797,8 +800,41 @@ def render_site_name_page(
         items = "".join(f"<li>{escape(e)}</li>" for e in errors)
         err_html = f'<div class="err" style="margin-bottom:1em"><ul style="margin:0; padding-left:1.2em">{items}</ul></div>'
     hidden = _hidden({"site_id": site_id, "fsite": fsite, "fq": fq})
+
+    open_rules = [
+        r for r in snap.rules
+        if r.site_id == site_id and r.valid_to is None
+    ]
+    any_rules = any(r.site_id == site_id for r in snap.rules)
+    if open_rules:
+        danger = f"""
+<form method="post" action="{ext_url('/master/site/apply')}" style="max-width:540px; margin-top:1.5em; border-color:#caa; background:#fff8f8">
+  {hidden}
+  <h3 style="margin-top:0; color:#b00020">Remove this site from the master</h3>
+  <p class="help">Ends all <strong>{len(open_rules)}</strong> current price{"s" if len(open_rules) != 1 else ""} at this site from today —
+  it drops off the price grid and future deliveries would flag as not-on-master. History is kept, and
+  prices can be re-added later. Use when a site leaves the estate or stops buying through LWC.</p>
+  <button type="submit" name="do" value="end_all" style="background:#b00020"
+          onclick="return confirm('End all {len(open_rules)} current prices at this site from today?')">Remove from master</button>
+</form>"""
+    elif not any_rules:
+        danger = f"""
+<form method="post" action="{ext_url('/master/site/apply')}" style="max-width:540px; margin-top:1.5em; border-color:#caa; background:#fff8f8">
+  {hidden}
+  <h3 style="margin-top:0; color:#b00020">Delete this site</h3>
+  <p class="help">This site has no pricing history at all — deleting removes the record entirely
+  (use for a site added by mistake).</p>
+  <button type="submit" name="do" value="delete" style="background:#b00020"
+          onclick="return confirm('Delete site {escape(site_id)} entirely?')">Delete site</button>
+</form>"""
+    else:
+        danger = (
+            '<p class="help" style="margin-top:1.5em">This site has no current prices '
+            '(already off the master) but keeps its history, so it can\'t be deleted.</p>'
+        )
+
     return f"""{back}
-<h1>Site name</h1>
+<h1>Site settings</h1>
 <p class="sub" style="margin-bottom:1em">Site <strong>{escape(site_id)}</strong>{f" — currently “{escape(cur)}”" if cur else " — no name set"}</p>
 {err_html}
 <form method="post" action="{ext_url('/master/site/apply')}" style="max-width:540px">
@@ -807,7 +843,126 @@ def render_site_name_page(
   <input type="text" name="name" id="sn-name" value="{escape(cur)}" autofocus required
          style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
   <p class="help">Shown across the price grid, exports and reconciliation reports.</p>
-  <button type="submit" style="margin-top:1em">Save name</button>
+  <button type="submit" name="do" value="rename" style="margin-top:1em">Save name</button>
+</form>
+{danger}
+"""
+
+
+def render_site_new_page(errors: list[str] | None = None, site_id: str = "", name: str = "") -> str:
+    """Add a site to the master: id + name. It appears as a column once
+    selected in the grid's site dropdown (edit mode), where its first prices
+    are typed straight into the cells."""
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?edit=1">← Back to the price grid</a></p>'
+    err_html = ""
+    if errors:
+        items = "".join(f"<li>{escape(e)}</li>" for e in errors)
+        err_html = f'<div class="err" style="margin-bottom:1em"><ul style="margin:0; padding-left:1.2em">{items}</ul></div>'
+    return f"""{back}
+<h1>Add a site</h1>
+{err_html}
+<form method="post" action="{ext_url('/master/site/create')}" style="max-width:540px">
+  <label for="ns-id">Site id (e.g. 812)</label>
+  <input type="text" name="site_id" id="ns-id" value="{escape(site_id)}" autofocus required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <label for="ns-name">Site name</label>
+  <input type="text" name="name" id="ns-name" value="{escape(name)}" required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">Created with the standard defaults (tenanted, England). After saving you land on the
+  site's column in edit mode — type its prices straight into the cells.</p>
+  <button type="submit" style="margin-top:1em">Add site</button>
+</form>
+"""
+
+
+# ---------------------------------------------------------------------------
+# /master/increase — universal (annual) price increase
+# ---------------------------------------------------------------------------
+
+def render_increase_page(errors: list[str] | None = None, pct: str = "", vf: str = "") -> str:
+    today_iso = date.today().isoformat()
+    err_html = ""
+    if errors:
+        items = "".join(f"<li>{escape(e)}</li>" for e in errors)
+        err_html = f'<div class="err" style="margin-bottom:1em"><ul style="margin:0; padding-left:1.2em">{items}</ul></div>'
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}">← Back to the price grid</a></p>'
+    return f"""{back}
+<h1>Annual price increase</h1>
+<p class="help" style="max-width:640px">Raises <strong>every current tenant price</strong> and the <strong>FB list price</strong>
+by the percentage below, across the whole master. The <strong>retro stays a fixed £/keg</strong> — so the net price
+(list − retro) rises with the list. Temporary supports and managed lines are left alone. Nothing is written until
+you confirm the preview.</p>
+{err_html}
+<form method="post" action="{ext_url('/master/increase/preview')}" style="max-width:540px">
+  <label for="inc-pct">Increase (%)</label>
+  <input type="number" step="any" name="pct" id="inc-pct" value="{escape(pct)}" autofocus required
+         placeholder="e.g. 3.5" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">A percentage — 3.5 means +3.5%. A negative number decreases prices.</p>
+  <label for="inc-vf">Effective from</label>
+  <input type="date" name="valid_from" id="inc-vf" value="{vf or today_iso}" required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <button type="submit" style="margin-top:1em">Preview increase</button>
+</form>
+"""
+
+
+def render_increase_preview_page(pct: float, vf: date, stats: dict, warnings: list[str]) -> str:
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master/increase")}">← Change the figures</a></p>'
+    ex_rows = ""
+    for e in stats.get("examples", []):
+        fb_bit = (
+            f'{_money(e["old_fb"])} → <strong>{_money(e["new_fb"])}</strong>'
+            if e.get("old_fb") is not None else "—"
+        )
+        ex_rows += (
+            f'<tr><td>{escape(e["site_id"])}</td>'
+            f'<td>{escape(e["product_desc"] or e["product_code"])}</td>'
+            f'<td class="r">{_money(e["old_tenant"])} → <strong>{_money(e["new_tenant"])}</strong></td>'
+            f'<td class="r">{fb_bit}</td>'
+            f'<td class="r">{_money(e["retro_gbp"]) if e["retro_gbp"] else "—"} (unchanged)</td></tr>'
+        )
+    examples = (
+        '<table style="max-width:820px"><thead><tr><th>Site</th><th>Product</th>'
+        '<th class="r">Tenant £</th><th class="r">FB list £</th><th class="r">Retro £/keg</th>'
+        f"</tr></thead><tbody>{ex_rows}</tbody></table>"
+        if ex_rows else ""
+    )
+    warn_html = "".join(
+        f'<div class="master-banner">⚠ {escape(w)}</div>' for w in warnings
+    )
+    skipped_bits = []
+    if stats.get("skipped_support"):
+        skipped_bits.append(f'{stats["skipped_support"]} supported/managed rule(s) left alone')
+    if stats.get("skipped_future"):
+        skipped_bits.append(f'{stats["skipped_future"]} future-dated rule(s) left alone')
+    if stats.get("skipped_no_price"):
+        skipped_bits.append(f'{stats["skipped_no_price"]} rule(s) without a tenant price skipped')
+    skipped = f'<p class="help">{escape(" · ".join(skipped_bits))}</p>' if skipped_bits else ""
+    hidden = _hidden({
+        "pct": repr(pct), "valid_from": vf.isoformat(), "confirm": "1",
+        # idempotence fingerprint: apply refuses if the affected prices moved
+        # since this preview (incl. a double submit of Apply itself)
+        "state": stats.get("checksum", ""),
+    })
+    return f"""{back}
+<h1>Confirm: {pct:+g}% across the master</h1>
+{warn_html}
+<div class="result" style="max-width:640px">
+  <div class="summary-row"><span>Prices to rewrite</span><span><strong>{stats["n_rules"]}</strong></span></div>
+  <div class="summary-row"><span>Products</span><span>{stats["n_products"]}</span></div>
+  <div class="summary-row"><span>Sites</span><span>{stats["n_sites"]}</span></div>
+  <div class="summary-row"><span>Effective from</span><span>{vf.isoformat()}</span></div>
+  <div class="summary-row"><span>Retro</span><span>fixed £/keg — unchanged</span></div>
+</div>
+{skipped}
+<h2 style="margin-top:1.2em">Examples</h2>
+{examples}
+<form method="post" action="{ext_url('/master/increase/apply')}" style="margin-top:1em; max-width:540px">
+  {hidden}
+  <p class="help">Each current price is closed at the effective date and a successor created — history is kept.
+  This is the whole master: double-check the percentage.</p>
+  <button type="submit" style="background:#b00020"
+          onclick="this.disabled=true;this.textContent='Applying…';this.form.submit()">Apply {pct:+g}% to {stats["n_rules"]} prices</button>
 </form>
 """
 

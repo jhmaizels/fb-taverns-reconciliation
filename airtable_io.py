@@ -19,7 +19,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -318,6 +318,83 @@ def rename_site(site_id: str, name: str) -> str:
     _batch([{"id": rec_id, "fields": {"name": name}}], "update", T["Sites"])
     invalidate_master_cache()
     return rec_id
+
+
+def create_site(site_id: str, name: str) -> str:
+    """Create a Sites record (defaults matching the add-rule auto-create:
+    status=tenanted, country=england). Refuses an existing id. Returns rec id."""
+    site_id = (site_id or "").strip()
+    name = (name or "").strip()
+    if not site_id:
+        raise ValueError("site_id is required")
+    if not name:
+        raise ValueError("the site name must not be empty")
+    if site_id in _site_lookup():
+        raise ValueError(f"site {site_id!r} already exists")
+    created = _batch(
+        [{"fields": {"site_id": site_id, "name": name,
+                     "status": "tenanted", "country": "england"}}],
+        "create", T["Sites"],
+    )
+    invalidate_master_cache()
+    return created[0]["id"] if created else ""
+
+
+def delete_site(site_id: str) -> None:
+    """Delete a Sites record — ONLY when no pricing rule references it (typo
+    cleanup). A site with any rule history must keep its record; use
+    end_all_site_rules to take it off the master instead."""
+    site_id = (site_id or "").strip()
+    rec_id = _site_lookup().get(site_id)
+    if not rec_id:
+        raise ValueError(f"site {site_id!r} is not in the master")
+    # Authoritative check against live PricingRules (single projected sweep) —
+    # the caller's snapshot can be up to a minute stale.
+    for rec in _list_all(T["PricingRules"], fields=["site"]):
+        if rec_id in (rec["fields"].get("site") or []):
+            raise ValueError(
+                f"site {site_id!r} has pricing-rule history — it can't be deleted. "
+                "Use 'remove from master' to end its prices instead."
+            )
+    _do(
+        requests.delete, f"{DATA_URL}/{T['Sites']}",
+        params={"records[]": [rec_id]}, idempotent=False,
+    )
+    invalidate_master_cache()
+
+
+def end_all_site_rules(site_id: str, on: date, reason: str, source: str) -> int:
+    """End every OPEN pricing rule at a site (valid_to := on) — 'site leaves
+    the estate'. History is kept; the site drops off the pivot because it no
+    longer has current prices. Returns the number of rules ended."""
+    site_id = (site_id or "").strip()
+    rec_id = _site_lookup().get(site_id)
+    if not rec_id:
+        raise ValueError(f"site {site_id!r} is not in the master")
+    existing = _list_all(
+        T["PricingRules"], fields=["site", "valid_from", "valid_to", "reason", "source"]
+    )
+    to_close: list[dict] = []
+    for rec in existing:
+        f = rec["fields"]
+        if rec_id not in (f.get("site") or []):
+            continue
+        if f.get("valid_to"):
+            continue  # already ended
+        vf = _parse_date(f.get("valid_from"))
+        # valid_to must stay after valid_from: a rule starting on/after `on`
+        # ends the day after its own start (bills that day only).
+        vt = on if (vf is None or vf < on) else vf + timedelta(days=1)
+        old_reason = (f.get("reason") or "").strip()
+        new_reason = f"{reason}; {old_reason}" if old_reason else reason
+        to_close.append({
+            "id": rec["id"],
+            "fields": {"valid_to": vt.isoformat(), "reason": new_reason, "source": source},
+        })
+    if to_close:
+        _batch(to_close, "update", T["PricingRules"])
+        invalidate_master_cache()
+    return len(to_close)
 
 
 def publish_patched_snapshot(snap: MasterSnapshot) -> None:

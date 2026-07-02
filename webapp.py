@@ -68,6 +68,9 @@ from reconcile import (  # noqa: E402
 # so it stays off the cold-start / health-check readiness path.
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
+    create_site,
+    delete_site,
+    end_all_site_rules,
     load_master_snapshot,
     publish_patched_snapshot,
     refresh_master_cache_async,
@@ -100,9 +103,13 @@ from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_htm
 # form codec so the routes below stay thin.
 import master_pages  # noqa: E402
 from master_changes import (  # noqa: E402
+    INCREASE_HARD_LIMIT_PCT,
+    INCREASE_SANITY_BAND_PCT,
     MasterChange,
     apply_master_change,
+    build_universal_increase,
     patch_snapshot_for_change,
+    patch_snapshot_for_increase,
     preview_master_change,
     validate_master_change,
 )
@@ -1148,6 +1155,8 @@ async def master_site_apply(
     request: Request,
     principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
 ):
+    """Site settings ops: rename (default) · end_all (end every current price —
+    'site leaves the estate') · delete (record removal, only with NO history)."""
     if _is_cross_origin(request):
         raise HTTPException(status_code=403, detail="Cross-origin request rejected")
     form = await request.form()
@@ -1155,6 +1164,7 @@ async def master_site_apply(
     fsite = (form.get("fsite") or "").strip()
     fq = (form.get("fq") or "").strip()
     name = (form.get("name") or "").strip()
+    do = (form.get("do") or "rename").strip()
 
     try:
         snap = await run_in_threadpool(load_master_snapshot)
@@ -1173,6 +1183,66 @@ async def master_site_apply(
             status_code=400,
         )
 
+    from dataclasses import replace as _dc_replace
+    today = date.today()
+
+    if do == "end_all":
+        try:
+            n = await run_in_threadpool(
+                end_all_site_rules, site_id, today,
+                "site removed from master",
+                f"site-remove:{principal.email}",
+            )
+        except ValueError as exc:
+            return _rerender([str(exc)])
+        except Exception:
+            logger.exception("site end_all failed")
+            return _error_page(_GENERIC_ERR)
+        logger.info("site %s removed from master by %s (%d rules ended)", site_id, principal.email, n)
+        # patch: close this site's open rules in the cached snapshot
+        try:
+            rules = [
+                _dc_replace(
+                    r,
+                    valid_to=(
+                        today if (r.valid_from is None or r.valid_from < today)
+                        else r.valid_from + timedelta(days=1)
+                    ),
+                )
+                if (r.site_id == site_id and r.valid_to is None) else r
+                for r in snap.rules
+            ]
+            publish_patched_snapshot(_dc_replace(snap, rules=rules))
+        except Exception:
+            logger.exception("snapshot patch failed — grid catches up on refresh")
+        refresh_master_cache_async()
+        return RedirectResponse(
+            ext_url("/master") + "?" + urlencode([("edit", "1"), ("saved", "1")]),
+            status_code=303,
+        )
+
+    if do == "delete":
+        try:
+            await run_in_threadpool(delete_site, site_id)
+        except ValueError as exc:
+            return _rerender([str(exc)])
+        except Exception:
+            logger.exception("site delete failed")
+            return _error_page(_GENERIC_ERR)
+        logger.info("site %s deleted by %s", site_id, principal.email)
+        try:
+            sites = {k: v for k, v in snap.sites.items() if k != site_id}
+            site_ids = {k: v for k, v in snap.site_ids.items() if k != site_id}
+            publish_patched_snapshot(_dc_replace(snap, sites=sites, site_ids=site_ids))
+        except Exception:
+            logger.exception("snapshot patch failed — grid catches up on refresh")
+        refresh_master_cache_async()
+        return RedirectResponse(
+            ext_url("/master") + "?" + urlencode([("edit", "1"), ("saved", "1")]),
+            status_code=303,
+        )
+
+    # default: rename
     if not name:
         return _rerender(["the site name must not be empty"])
     try:
@@ -1186,7 +1256,6 @@ async def master_site_apply(
     # Same instant-grid pattern as the cell editor: patch the cached snapshot
     # (new name in the sites dict) and re-publish, then reconcile async.
     try:
-        from dataclasses import replace as _dc_replace
         sites = dict(snap.sites)
         sites[site_id] = {**sites[site_id], "name": name}
         publish_patched_snapshot(_dc_replace(snap, sites=sites))
@@ -1202,6 +1271,196 @@ async def master_site_apply(
     return RedirectResponse(
         ext_url("/master") + "?" + urlencode(back), status_code=303
     )
+
+
+@app.get("/master/site/new", response_class=HTMLResponse)
+def master_site_new(
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    body = master_pages.render_site_new_page()
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/site/create")
+async def master_site_create(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    site_id = (form.get("site_id") or "").strip()
+    name = (form.get("name") or "").strip()
+
+    def _rerender(errors: list[str]) -> HTMLResponse:
+        body = master_pages.render_site_new_page(errors=errors, site_id=site_id, name=name)
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=400,
+        )
+
+    if not site_id or not name:
+        return _rerender(["both the site id and the name are required"])
+    try:
+        rec_id = await run_in_threadpool(create_site, site_id, name)
+    except ValueError as exc:
+        return _rerender([str(exc)])
+    except Exception:
+        logger.exception("site create failed")
+        return _error_page(_GENERIC_ERR)
+    logger.info("site %s (%s) created by %s", site_id, name, principal.email)
+
+    # patch the cached snapshot so the new site is selectable immediately,
+    # then land on its (empty) column in edit mode ready for prices.
+    try:
+        from dataclasses import replace as _dc_replace
+        snap = await run_in_threadpool(load_master_snapshot)
+        if site_id not in snap.sites:
+            sites = dict(snap.sites)
+            sites[site_id] = {
+                "name": name, "status": "tenanted", "country": "england",
+                "notes": "", "_rec_id": rec_id,
+            }
+            site_ids = {**snap.site_ids, site_id: rec_id}
+            publish_patched_snapshot(_dc_replace(snap, sites=sites, site_ids=site_ids))
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+    return RedirectResponse(
+        ext_url("/master") + "?" + urlencode(
+            [("edit", "1"), ("site", site_id), ("saved", "1")]
+        ),
+        status_code=303,
+    )
+
+
+@app.get("/master/increase", response_class=HTMLResponse)
+def master_increase(
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    body = master_pages.render_increase_page()
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+def _parse_increase_form(form) -> tuple[float | None, date | None, list[str]]:
+    errors: list[str] = []
+    pct = None
+    try:
+        pct = float((form.get("pct") or "").strip())
+    except (TypeError, ValueError):
+        errors.append("enter the increase as a percentage, e.g. 3.5")
+    vf = _parse_date((form.get("valid_from") or "").strip())
+    if vf is None:
+        errors.append("enter the effective date")
+    if pct is not None:
+        if pct == 0:
+            errors.append("a 0% increase changes nothing")
+        elif abs(pct) > INCREASE_HARD_LIMIT_PCT:
+            errors.append(
+                f"{pct:+g}% is outside the ±{INCREASE_HARD_LIMIT_PCT:.0f}% hard limit — "
+                "check the figure (3.5 means +3.5%)"
+            )
+    return pct, vf, errors
+
+
+@app.post("/master/increase/preview", response_class=HTMLResponse)
+async def master_increase_preview(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Pure preview — WRITES NOTHING. Shows counts + examples, then the
+    confirm button carries pct+date to /master/increase/apply."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    pct, vf, errors = _parse_increase_form(form)
+    if errors:
+        body = master_pages.render_increase_page(
+            errors=errors, pct=str(form.get("pct") or ""), vf=str(form.get("valid_from") or "")
+        )
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=400,
+        )
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+        _rules, stats = build_universal_increase(snap, pct, vf, principal.email)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    warnings = []
+    lo, hi = INCREASE_SANITY_BAND_PCT
+    if not (lo <= pct <= hi):
+        warnings.append(
+            f"{pct:+g}% is outside the usual {lo:+.0f}%…{hi:+.0f}% band — double-check before confirming"
+        )
+    if stats["n_rules"] == 0:
+        warnings.append("no current prices match — nothing would change")
+    body = master_pages.render_increase_preview_page(pct, vf, stats, warnings)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/increase/apply", response_class=HTMLResponse)
+async def master_increase_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Apply the universal increase: recompute server-side from a fresh
+    snapshot (never trust echoed figures beyond pct+date), bulk-upsert with
+    the close-at-date pass, patch + republish the cached snapshot."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    pct, vf, errors = _parse_increase_form(form)
+    if errors or form.get("confirm") != "1":
+        return _error_page(master_pages.errors_html(errors or ["missing confirmation"]))
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+        new_rules, stats = build_universal_increase(snap, pct, vf, principal.email)
+        if not new_rules:
+            return _error_page("<p>No current prices match — nothing to apply.</p>")
+        # Idempotence guard: refuse if the affected prices are not the ones the
+        # operator previewed — catches a DOUBLE SUBMIT of Apply (the first run
+        # already moved every price, so a second would compound the increase)
+        # and any concurrent edit between preview and apply.
+        if (form.get("state") or "") != stats["checksum"]:
+            return _error_page(
+                "<p>The master's prices have changed since this preview — most "
+                "likely the increase was <strong>already applied</strong> (a double "
+                "submit), or someone edited a price in between.</p>"
+                "<p><strong>Nothing was written.</strong> Check the grid, and re-run "
+                "the preview if an increase is still needed.</p>"
+            )
+        created, updated, closed = await run_in_threadpool(
+            upsert_pricing_rules, new_rules, vf
+        )
+    except Exception:
+        logger.exception("universal increase apply failed")
+        return _error_page(_GENERIC_ERR)
+    logger.info(
+        "universal increase %+g%% by %s: %d created, %d updated, %d closed",
+        pct, principal.email, created, updated, closed,
+    )
+    try:
+        publish_patched_snapshot(patch_snapshot_for_increase(snap, new_rules, vf))
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+    grid = ext_url("/master")
+    return f"""{render_head(principal.email, principal.role)}
+<h1>Increase applied</h1>
+<div class="result" style="max-width:640px">
+  <div class="summary-row"><span>Increase</span><span><strong>{pct:+g}%</strong> effective {vf.isoformat()}</span></div>
+  <div class="summary-row"><span>Successor prices created</span><span>{created}</span></div>
+  <div class="summary-row"><span>Updated in place (same-day)</span><span>{updated}</span></div>
+  <div class="summary-row"><span>Prior prices closed</span><span>{closed}</span></div>
+  <div class="summary-row"><span>Retro</span><span>fixed £/keg — unchanged</span></div>
+</div>
+<p style="margin-top:1.5em">
+  <a class="button" href="{grid}">Back to price grid</a>
+  <a class="button" href="{grid}?view=list" style="background:#666">Detailed list</a>
+</p>
+{PAGE_FOOT}"""
 
 
 @app.post("/master/cell/apply")

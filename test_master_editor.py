@@ -1040,6 +1040,140 @@ def test_route_site_rename():
             assert r5.status_code == 403
 
 
+def test_build_universal_increase_math():
+    """The annual increase: tenant and FB list rise by pct; the retro stays a
+    FIXED £/keg (retro_pct is recomputed against the new list); supported/
+    managed, future-dated, ended and price-less rules are left alone."""
+    from master_changes import build_universal_increase
+    S1 = SITE_ID
+    def R(code, tenant, fb, retro_pct=0.0, status="tenanted", vf=date(2026, 1, 1), vt=None):
+        return Rule(site_id=S1, product_code=code, product_desc=code,
+                    tenant_price=tenant, fb_price=fb, retro_pct=retro_pct,
+                    valid_from=vf, valid_to=vt, status=status, reason="x", source="s")
+    rules = [
+        R("AAA", 200.0, 120.0, retro_pct=0.125),                  # included
+        R("BBB", 100.0, None),                                    # included, no fb
+        R("SUP", 90.0, 120.0, status="supported"),                # skipped: support
+        R("FUT", 100.0, 120.0, vf=date(2099, 1, 1)),              # skipped: future
+        R("END", 100.0, 120.0, vt=date(2026, 6, 1)),              # skipped: ended
+        R("NOP", None, 120.0),                                    # skipped: no tenant price
+    ]
+    snap = MasterSnapshot(
+        sites={S1: {"name": "T"}}, rules=rules, site_ids={S1: "r"},
+        product_ids={c: c for c in ("AAA", "BBB", "SUP", "FUT", "END", "NOP")},
+        rule_ids={}, banner_info={},
+    )
+    d = date(2026, 7, 3)
+    new_rules, stats = build_universal_increase(snap, 3.5, d, "me@x")
+    assert stats["n_rules"] == 2 and len(new_rules) == 2
+    assert stats["skipped_support"] == 1 and stats["skipped_future"] == 1
+    assert stats["skipped_no_price"] == 1
+    by_code = {r.product_code: r for r in new_rules}
+    a = by_code["AAA"]
+    assert a.tenant_price == 207.0                      # 200 * 1.035
+    assert a.fb_price == 124.2                          # 120 * 1.035
+    # retro £ preserved EXACTLY: was 0.125*120 = 15.00 -> 15.00 on the new list
+    assert abs(a.retro_pct * a.fb_price - 15.0) < 1e-9
+    assert a.valid_from == d and a.valid_to is None and a.status == "tenanted"
+    assert a.source == "increase:me@x"
+    b = by_code["BBB"]
+    assert b.tenant_price == 103.5 and b.fb_price is None
+
+
+def test_route_universal_increase_preview_apply():
+    """Preview writes NOTHING; apply closes the old rule and creates the
+    successor via the bulk upsert; the patched cache shows the new price."""
+    rec = _grid_rule("rec_old")           # tenant 180.0, vf 2026-01-01
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/increase/preview", data={
+                "pct": "5", "valid_from": date.today().isoformat(),
+            })
+            assert r.status_code == 200 and "Confirm: +5%" in r.text
+            assert "189.00" in r.text, "preview must show 180 -> 189"
+            assert not fa.calls, f"preview must write NOTHING, got {fa.calls}"
+            hidden = _extract_hidden(r.text)
+            assert hidden.get("state"), "preview must carry the idempotence fingerprint"
+
+            r2 = client.post("/master/increase/apply", data=hidden)
+            assert r2.status_code == 200 and "Increase applied" in r2.text
+            closes = [u for u in _updates(fa) if "valid_to" in u["fields"]]
+            assert [u["id"] for u in closes] == ["rec_old"]
+            created = _creates(fa)
+            assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 189.0
+            assert created[0]["fields"]["fb_price"] == 126.0
+            assert created[0]["fields"]["source"] == f"increase:{FakeAuthClient.EMAIL}"
+
+            # patched cache: the grid shows the new price immediately
+            r3 = client.get("/master")
+            assert "£189.00" in r3.text and "£180.00" not in r3.text
+
+            # DOUBLE SUBMIT: re-posting the same confirm must be refused with
+            # nothing further written — otherwise +5% would compound to +10.25%.
+            calls_before = len(fa.calls)
+            r3b = client.post("/master/increase/apply", data=hidden)
+            assert r3b.status_code == 400 and "already applied" in r3b.text
+            assert len(fa.calls) == calls_before, "double submit must write NOTHING"
+
+            # fat-finger guard: ±50% hard limit blocks at the form
+            r4 = client.post("/master/increase/preview", data={
+                "pct": "500", "valid_from": date.today().isoformat(),
+            })
+            assert r4.status_code == 400 and "hard limit" in r4.text
+        with FakeAuthClient("viewer") as client:
+            assert client.get("/master/increase").status_code == 403
+
+
+def test_route_site_create_end_all_delete():
+    """Add-site creates the record and lands on its empty column; end_all ends
+    every open rule at a site; delete refuses when history exists and succeeds
+    for a rule-less site."""
+    with FakeAirtable([_grid_rule("rec_old")]) as fa:
+        with FakeAuthClient("admin") as client:
+            # create a brand-new site
+            r = client.post("/master/site/create", data={
+                "site_id": "830", "name": "Manor House",
+            }, follow_redirects=False)
+            assert r.status_code == 303 and "site=830" in r.headers["location"]
+            creates = [
+                (t, recs) for op, t, recs in fa.calls
+                if op == "create" and t == airtable_io.T["Sites"]
+            ]
+            assert len(creates) == 1
+            assert creates[0][1][0]["fields"]["site_id"] == "830"
+            assert creates[0][1][0]["fields"]["name"] == "Manor House"
+            # the patched cache offers the new site in edit mode immediately
+            r1b = client.get("/master", params={"edit": "1"})
+            assert "Manor House" in r1b.text
+
+            # duplicate id refused
+            r2 = client.post("/master/site/create", data={
+                "site_id": SITE_ID, "name": "Dup",
+            }, follow_redirects=False)
+            assert r2.status_code == 400 and "already exists" in r2.text
+
+            # delete refused while pricing history exists
+            r3 = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "do": "delete",
+            }, follow_redirects=False)
+            assert r3.status_code == 400 and "history" in r3.text
+
+            # end_all closes the open rule
+            r4 = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "do": "end_all",
+            }, follow_redirects=False)
+            assert r4.status_code == 303
+            ends = [
+                u for u in _updates(fa)
+                if "valid_to" in u["fields"] and "reason" in u["fields"]
+            ]
+            assert [u["id"] for u in ends] == ["rec_old"]
+            assert "site removed from master" in ends[0]["fields"]["reason"]
+        with FakeAuthClient("viewer") as client:
+            assert client.get("/master/site/new").status_code == 403
+
+
 def test_route_apply_revalidates_tampered_hidden_inputs():
     """/master/apply must re-validate server-side: a tampered/stale hidden
     form (key collision for op=price_change) is refused with nothing written."""
@@ -1106,6 +1240,9 @@ TESTS = [
     test_route_preview_apply_roundtrip,
     test_route_cell_editor_amend_and_remove,
     test_route_site_rename,
+    test_build_universal_increase_math,
+    test_route_universal_increase_preview_apply,
+    test_route_site_create_end_all_delete,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,
 ]
