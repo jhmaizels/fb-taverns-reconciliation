@@ -344,36 +344,48 @@ def render_master_pivot(
     q_low = q.lower()
     today = date.today()
     winners = _pivot_winners(snap, today)
+    products = getattr(snap, "products", {}) or {}
 
-    # Columns = sites carrying ≥1 current price, ordered by name.
     def _site_name(sid: str) -> str:
         return (snap.sites.get(sid) or {}).get("name") or ""
 
-    site_ids = sorted(
-        {s for (s, _p) in winners}, key=lambda s: (_site_name(s).lower(), s)
-    )
+    # Columns = sites carrying ≥1 current rule, ascending by site id — the same
+    # inclusion + order as /export-master (master_export.py), i.e. the Excel's.
+    site_ids = sorted({s for (s, _p) in winners})
 
-    # Per-product left columns (Code/Name/Price/Retro/Net). FB list + retro are
-    # MEANT to be product-level, but a Rule stores them per (site, product), so
-    # they can differ across sites. Collect the DISTINCT values so we can show a
-    # single figure only when it's consistent and flag "varies" otherwise —
-    # never an arbitrary/order-dependent pick (the per-cell margins always use
-    # each cell's own rule). Deterministic iteration via sorted().
+    # Per-product left columns (Code / Name / Price / Retro P/Keg / Net price —
+    # the Excel's cols 0-4). Retro P/Keg is the PRODUCT-level fixed £ from the
+    # Products table, exactly as the export writes it. fb_price lives on rules
+    # (per site×product); collect the DISTINCT values so we show a single figure
+    # only when consistent and flag "varies" otherwise — never an arbitrary,
+    # order-dependent pick. Deterministic iteration via sorted().
     prod_agg: dict[str, dict] = {}
     for (s, p), w in sorted(winners.items()):
-        agg = prod_agg.setdefault(p, {"desc": "", "fbs": set(), "retros": set()})
+        agg = prod_agg.setdefault(p, {"desc": "", "fbs": set()})
         if not agg["desc"] and w.product_desc:
             agg["desc"] = w.product_desc
         if w.fb_price is not None:
             agg["fbs"].add(round(w.fb_price, 4))
-        agg["retros"].add(round(w.retro_pct or 0.0, 6))
+    # The Excel also lists products that carry a retro but no current tenant
+    # price anywhere (export: codes_active | codes_retro) — keep those rows.
+    for code, info in products.items():
+        if (info.get("retro_per_keg") or 0) > 0 and code not in prod_agg:
+            prod_agg[code] = {"desc": info.get("desc") or "", "fbs": set()}
+    for code, agg in prod_agg.items():
+        if not agg["desc"]:
+            agg["desc"] = (products.get(code) or {}).get("desc") or ""
 
     def _row_match(p: str) -> bool:
         if not q_low:
             return True
         return q_low in f"{p} {prod_agg.get(p, {}).get('desc', '')}".lower()
 
-    prod_codes = sorted(p for p in prod_agg if _row_match(p))
+    # Row order = the export's (and the cost file's): alphabetical by product
+    # NAME, case-insensitive, code as tiebreaker.
+    prod_codes = sorted(
+        (p for p in prod_agg if _row_match(p)),
+        key=lambda c: ((prod_agg[c]["desc"] or "").upper(), c),
+    )
 
     n_sites, n_prods = len(site_ids), len(prod_codes)
 
@@ -404,7 +416,7 @@ def render_master_pivot(
             f"{toolbar}<p class=\"help\">{escape(empty)}</p></div>"
         )
 
-    # ---- header row ----
+    # ---- header row (the Excel's: Code | Name | Price | Retro P/Keg | Net price | sites…) ----
     head_sites = "".join(
         f'<th class="num site" title="{escape(sid)} — {escape(_site_name(sid))}">'
         f'{escape(_site_name(sid) or sid)}<span class="sid">{escape(sid)}</span></th>'
@@ -412,35 +424,37 @@ def render_master_pivot(
     )
     thead = (
         '<thead><tr>'
-        '<th class="sticky-col prod">Product</th>'
-        '<th class="num">Price £</th><th class="num">Retro £/keg</th><th class="num">Net £</th>'
+        '<th class="sticky-col c1">Product Code</th>'
+        '<th class="sticky-col c2">Product Name</th>'
+        '<th class="num">Price</th><th class="num">Retro P/Keg</th><th class="num">Net price</th>'
         f'{head_sites}</tr></thead>'
     )
 
     # ---- body rows ----
     varies = '<span class="pivot-empty" title="differs across sites — see each cell">varies</span>'
 
-    def _left_cells(agg: dict) -> tuple[str, str, str]:
-        """Price/Retro-£/Net for the product columns. A single figure only when
-        it's consistent across the product's sites; 'varies' otherwise; '—' when
-        there's no FB list price to compute from."""
-        fbs, retros = agg["fbs"], agg["retros"]
+    def _left_cells(p: str, agg: dict) -> tuple[str, str, str]:
+        """Price / Retro P/Keg / Net price — the Excel's cols 2-4. Retro is the
+        product-level £/keg (Products.retro_per_keg), matching the export. Price
+        shows a single figure only when consistent across sites ('varies'
+        otherwise); Net = Price − Retro, as in the cost file."""
+        fbs = agg["fbs"]
         fb = next(iter(fbs)) if len(fbs) == 1 else None
-        retro = next(iter(retros)) if len(retros) == 1 else None
-        price_c = varies if len(fbs) > 1 else escape(_money(fb))  # _money(None) -> "—"
-        if len(fbs) > 1 or (len(retros) > 1 and fbs):
-            return price_c, varies, varies          # fb and/or retro differ
-        if fb is not None and retro is not None:
-            return price_c, escape(_money(fb * retro)), escape(_money(fb * (1.0 - retro)))
-        return price_c, "—", "—"                    # no FB list price to compute from
+        retro = (products.get(p) or {}).get("retro_per_keg") or 0.0
+        retro_c = escape(_money(retro)) if retro else "—"
+        if len(fbs) > 1:
+            return varies, retro_c, varies
+        if fb is None:
+            return "—", retro_c, "—"
+        return escape(_money(fb)), retro_c, escape(_money(fb - retro))
 
     body: list[str] = []
     for p in prod_codes:
         agg = prod_agg[p]
-        price_c, retro_c, net_c = _left_cells(agg)
-        prod_cell = (
-            f'<td class="sticky-col">{escape(agg["desc"] or p)}'
-            f' <span class="pcode">{escape(p)}</span></td>'
+        price_c, retro_c, net_c = _left_cells(p, agg)
+        prod_cells = (
+            f'<td class="sticky-col c1 pcode">{escape(p)}</td>'
+            f'<td class="sticky-col c2">{escape(agg["desc"] or "")}</td>'
         )
         pinfo = (
             f'<td class="num pinfo">{price_c}</td>'
@@ -448,7 +462,7 @@ def render_master_pivot(
             f'<td class="num pinfo">{net_c}</td>'
         )
         cells = "".join(_pivot_cell(winners.get((sid, p))) for sid in site_ids)
-        body.append(f"<tr>{prod_cell}{pinfo}{cells}</tr>")
+        body.append(f"<tr>{prod_cells}{pinfo}{cells}</tr>")
 
     table = (
         f'<div class="pivot-wrap"><table class="pivot" id="pivot-tbl">'

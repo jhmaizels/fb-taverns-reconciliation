@@ -296,9 +296,11 @@ HEAD_STYLE = """<!doctype html>
   table.pivot thead th { position: sticky; top: 0; z-index: 3; background: #eef2f7; text-align: right; vertical-align: bottom; font-weight: 600; }
   table.pivot thead th.site { max-width: 120px; white-space: normal; line-height: 1.15; }
   table.pivot thead th.site .sid { display: block; font-weight: 400; color: #789; font-size: 0.82em; }
-  table.pivot .sticky-col { position: sticky; left: 0; z-index: 2; background: #fff; box-shadow: 1px 0 0 #ddd; text-align: left; min-width: 190px; max-width: 260px; white-space: normal; }
+  table.pivot .sticky-col { position: sticky; z-index: 2; background: #fff; text-align: left; white-space: normal; }
+  table.pivot .sticky-col.c1 { left: 0; width: 110px; min-width: 110px; max-width: 110px; box-sizing: border-box; overflow-wrap: anywhere; }
+  table.pivot .sticky-col.c2 { left: 110px; min-width: 180px; max-width: 240px; box-shadow: 1px 0 0 #ddd; }
   table.pivot thead th.sticky-col { z-index: 5; background: #eef2f7; }
-  table.pivot .sticky-col .pcode { color: #789; font-size: 0.85em; }
+  table.pivot td.pcode, table.pivot .pcode { color: #567; font-size: 0.9em; font-variant-numeric: tabular-nums; }
   table.pivot td.num, table.pivot th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   table.pivot td.pinfo { color: #444; background: #fbfcfe; }
   table.pivot tbody tr:hover td { background: #f2f7ff; }

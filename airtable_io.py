@@ -245,6 +245,10 @@ class MasterSnapshot:
     # _list_all regardless of projection). Creation-time ONLY: in-place fixes
     # don't bump it. Powers the /master ?show=recent view (design §4.4).
     rule_created: dict = field(default_factory=dict)
+    # product_code -> {"desc", "retro_per_keg"} — the PRODUCT-level master data
+    # the Excel cost file carries (Retro P/Keg is a fixed £ per keg on the
+    # product row). Powers the /master pivot's left columns.
+    products: dict = field(default_factory=dict)
 
 
 # Module-level cache. Render `starter` is always-on, so it survives between
@@ -321,6 +325,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
 
     product_ids: dict[str, str] = {}
     products_by_id: dict[str, tuple] = {}
+    products: dict[str, dict] = {}
     for rec in product_recs:
         f = rec["fields"]
         code = f.get("product_code")
@@ -328,6 +333,10 @@ def _fetch_master_snapshot() -> MasterSnapshot:
             continue
         product_ids[code] = rec["id"]
         products_by_id[rec["id"]] = (code, f.get("description") or "")
+        products[code] = {
+            "desc": f.get("description") or "",
+            "retro_per_keg": float(f.get("retro_per_keg") or 0.0),
+        }
 
     rules: list[Rule] = []
     rule_ids: dict[str, str] = {}
@@ -370,7 +379,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
     return MasterSnapshot(
         sites=sites, rules=rules, site_ids=site_ids,
         product_ids=product_ids, rule_ids=rule_ids, banner_info=banner_info,
-        rule_created=rule_created,
+        rule_created=rule_created, products=products,
     )
 
 

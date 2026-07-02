@@ -579,11 +579,11 @@ def test_render_master_pivot_shape_and_winner():
                     valid_from=vf, valid_to=vt, status="tenanted",
                     reason="x", source="test")
     rules = [
-        # P1: CONSISTENT fb/retro across both sites -> left column shows the net.
+        # P1: consistent fb across both sites -> left columns show Price/Net.
         R(S1, P1, 200.0, fb=120.0, retro=0.125, vf=date(2026, 1, 1)),  # margin 95
         R(S1, P1, 999.0, fb=120.0, retro=0.125, vf=date.today() + timedelta(days=1)),  # future
         R(S2, P1, 180.0, fb=120.0, retro=0.125, vf=date(2026, 1, 1)),  # margin 75
-        # P2: fb DIFFERS across sites -> left column must say "varies", not pick one.
+        # P2: fb DIFFERS across sites -> Price/Net must say "varies", not pick one.
         R(S1, P2, 100.0, fb=120.0, retro=0.0, vf=date(2026, 1, 1), desc="Loss Keg"),  # margin -20
         R(S2, P2, 150.0, fb=100.0, retro=0.0, vf=date(2026, 1, 1), desc="Loss Keg"),  # margin  50
     ]
@@ -591,20 +591,32 @@ def test_render_master_pivot_shape_and_winner():
         sites={S1: {"name": "Alpha Arms"}, S2: {"name": "Beta Bar"}},
         rules=rules, site_ids={S1: "r1", S2: "r2"},
         product_ids={P1: "p1", P2: "p2"}, rule_ids={}, banner_info={},
+        # Product-level master data (the Excel's Retro P/Keg is a fixed £):
+        # P1 retro £15/keg; RONLY has a retro but no current rules -> still a row.
+        products={
+            P1: {"desc": "Keg", "retro_per_keg": 15.0},
+            P2: {"desc": "Loss Keg", "retro_per_keg": 0.0},
+            "RONLY": {"desc": "Zed Retro-Only Keg", "retro_per_keg": 7.5},
+        },
     )
     html = render_master_pivot(snap, {}, is_admin=True)
     assert 'class="pivot"' in html
     # both sites are columns, both products are rows
     assert "Alpha Arms" in html and "Beta Bar" in html
     assert P1 in html and P2 in html and "Loss Keg" in html
+    # Excel semantics: retro-only product still gets a row (export parity)
+    assert "RONLY" in html and "Zed Retro-Only Keg" in html
     # today's winner is £200, NOT the future £999
     assert "£200.00" in html and "£999.00" not in html
     # margin view present, and the loss cell (P2×S1) is flagged
     assert "cell-margin" in html and "cell-neg" in html
-    # P1 consistent: left-column net of the 0.125 retro on £120 = £105.00
-    assert "£105.00" in html
-    # P2 has different FB across sites: left columns must flag it, not pick one
+    # P1 left columns: Retro P/Keg = product-level £15.00; Net = 120 − 15 = £105.00
+    assert "£15.00" in html and "£105.00" in html
+    # P2 has different FB across sites: Price/Net must flag it, not pick one
     assert "varies" in html
+    # Excel column headers + row order by product NAME (Keg < Loss Keg < Zed…)
+    assert "Product Code" in html and "Retro P/Keg" in html and "Net price" in html
+    assert html.index(">Keg<") < html.index("Loss Keg") < html.index("Zed Retro-Only Keg")
 
 
 def test_master_banner_escapes_source_filename():
