@@ -93,10 +93,31 @@ def _frac_str(v: float | None) -> str:
 
 
 def _retro_disp(v: float | None) -> str:
-    """Grid display only: fraction shown as a % (0.125 -> 12.5%)."""
+    """Fraction shown as a % (0.125 -> 12.5%). Kept for the retro-fraction hint;
+    the grid/forms show the £/keg figure via _retro_gbp instead."""
     if not v:
         return ""
     return f"{v * 100:.8g}%"
+
+
+def retro_gbp(rule) -> float | None:
+    """The retro as £ per keg — the figure the Excel carries (col 3) and the
+    team thinks in. Stored on the Rule as a fraction of the FB list price
+    (retro_pct = retro_per_keg / fb_price), so £ = retro_pct × fb_price."""
+    if not rule.retro_pct or rule.fb_price is None:
+        return None
+    return rule.retro_pct * rule.fb_price
+
+
+def net_price(rule) -> float | None:
+    """FB net-net price per keg = list price − retro (Excel col 4)."""
+    if rule.fb_price is None:
+        return None
+    return rule.fb_price * (1.0 - (rule.retro_pct or 0.0))
+
+
+def _money_g(v: float | None) -> str:
+    return "—" if v is None else f"£{v:,.2f}"
 
 
 def _date_str(d: date | None, empty: str = "") -> str:
@@ -114,9 +135,9 @@ def _margin_cell(rule) -> str:
     colour = "#b00020" if m.net_gbp < 0 else ("#7a6a00" if (m.pct is not None and m.pct < 10) else "#1f7a1f")
     parts = []
     if m.gross_gbp is not None and rule.retro_pct:
-        parts.append(f"pre-retro £{m.gross_gbp:,.2f}")
+        parts.append(f"vs list £{m.gross_gbp:,.2f}")
     if m.net_cost is not None:
-        parts.append(f"net cost £{m.net_cost:,.2f}")
+        parts.append(f"net price £{m.net_cost:,.2f}")
     title = " · ".join(parts)
     return (
         f'<td class="r" title="{escape(title)}">'
@@ -216,14 +237,33 @@ def parse_master_change_form(form) -> tuple[MasterChange | None, list[str]]:
     def _flag(name: str) -> bool:
         return _get(name).lower() in ("1", "on", "true", "yes")
 
+    tenant_price = _float("tenant_price")
+    fb_price = _float("fb_price")
+
+    # Retro: the edit/add forms collect a fixed £/keg figure (retro_gbp — the
+    # Excel's "Retro P/Keg"); the confirm page's hidden fields carry the exact
+    # stored fraction (retro_pct) so confirm→apply is bit-exact. Prefer the
+    # fraction when present; otherwise convert £ → fraction of the FB list price.
+    retro_pct = _float("retro_pct")
+    if retro_pct is None:
+        retro_gbp_in = _float("retro_gbp")
+        if retro_gbp_in is not None:
+            if fb_price and fb_price > 0:
+                retro_pct = retro_gbp_in / fb_price
+            else:
+                errors.append(
+                    "retro (£/keg) needs the FB list price to store it — enter the "
+                    "FB list price too, or leave retro blank"
+                )
+
     change = MasterChange(
         op=op,  # type: ignore[arg-type]
         site_id=_get("site_id_new") or _get("site_id"),
         product_code=_get("product_code_new") or _get("product_code"),
         product_desc=_get("product_desc") or None,
-        tenant_price=_float("tenant_price"),
-        fb_price=_float("fb_price"),
-        retro_pct=_float("retro_pct"),
+        tenant_price=tenant_price,
+        fb_price=fb_price,
+        retro_pct=retro_pct,
         status=_get("status") or "tenanted",
         valid_from=_date_field("valid_from"),
         valid_to=_date_field("valid_to"),
@@ -369,9 +409,10 @@ def render_master_grid(
             f'<tr class="{"ended" if ended else ""}">'
             f"<td>{escape(r.site_id)} {escape(site_name)}</td>"
             f"<td>{escape(r.product_code)} <span style=\"color:#666\">{escape(r.product_desc or '')}</span></td>"
-            f'<td class="r">{_money(r.tenant_price)}</td>'
             f'<td class="r">{_money(r.fb_price)}</td>'
-            f'<td class="r">{_retro_disp(r.retro_pct)}</td>'
+            f'<td class="r">{_money_g(retro_gbp(r))}</td>'
+            f'<td class="r">{_money_g(net_price(r))}</td>'
+            f'<td class="r">{_money(r.tenant_price)}</td>'
             f"{_margin_cell(r)}"
             f"<td>{_date_str(r.valid_from, 'open')}</td>"
             f"<td>{_date_str(r.valid_to, '—')}</td>"
@@ -382,8 +423,11 @@ def render_master_grid(
     action_head = "<th>Actions</th>" if is_admin else ""
     table = (
         "<table><thead><tr><th>Site</th><th>Product</th>"
-        '<th class="r">Tenant £</th><th class="r">FB £</th><th class="r">Retro %</th>'
-        '<th class="r" title="FB margin per keg (net of retro) and gross-margin % of the tenant price">Margin</th>'
+        '<th class="r" title="FB list price per keg">Price £</th>'
+        '<th class="r" title="Retro rebate per keg (fixed £)">Retro £/keg</th>'
+        '<th class="r" title="Net price = list − retro (Excel col 4)">Net price £</th>'
+        '<th class="r">Tenant £</th>'
+        '<th class="r" title="FB margin per keg = tenant − net price, and % of the tenant price">Margin</th>'
         f"<th>Valid from</th><th>Valid to</th><th>Status</th><th>Source</th>{action_head}"
         "</tr></thead><tbody>"
         + "".join(body_rows)
@@ -496,8 +540,8 @@ Exports and reconciliations always read fresh.</p>
 
 def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
     site_name = (snap.sites.get(rule.site_id) or {}).get("name", "")
-    retro = _frac_str(rule.retro_pct)
-    retro_line = f"{retro} (≈{_retro_disp(rule.retro_pct)})" if retro else "—"
+    _rg = retro_gbp(rule)
+    retro_line = _money_g(_rg) if _rg is not None else "—"
     m = margin_of(rule)
     if m.net_gbp is None:
         margin_line = "—"
@@ -510,10 +554,11 @@ def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
         ("Rule key", f"<code>{escape(rule_key_of(rule))}</code>"),
         ("Site", escape(f"{rule.site_id} {site_name}".strip())),
         ("Product", escape(f"{rule.product_code} {rule.product_desc or ''}".strip())),
-        ("Tenant price", escape(_money(rule.tenant_price))),
         ("FB (list) price", escape(_money(rule.fb_price))),
-        ("Retro (fraction of FB list)", escape(retro_line)),
-        ("Margin (net of retro)", escape(margin_line)),
+        ("Retro (£/keg)", escape(retro_line)),
+        ("Net price (list − retro)", escape(_money_g(net_price(rule)))),
+        ("Tenant price", escape(_money(rule.tenant_price))),
+        ("Margin (on net price)", escape(margin_line)),
         ("Valid from", escape(_date_str(rule.valid_from, "open (no start date)"))),
         ("Valid to", escape(_date_str(rule.valid_to, "open — on the master"))),
         ("Status", escape(rule.status or "tenanted")),
@@ -539,7 +584,8 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
     }
     tenant_val = "" if rule.tenant_price is None else f"{rule.tenant_price:.2f}"
     fb_val = "" if rule.fb_price is None else f"{rule.fb_price:.2f}"
-    retro_val = _frac_str(rule.retro_pct)
+    _rg = retro_gbp(rule)
+    retro_val = "" if _rg is None else f"{_rg:.2f}"
     today_iso = date.today().isoformat()
     cur_status = rule.status if rule.status in VALID_STATUSES else "tenanted"
     preview_url = ext_url("/master/preview")
@@ -559,9 +605,9 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
   <input type="number" step="0.01" min="0" name="tenant_price" id="pc-tp" value="{escape(tenant_val)}" required style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
   <label for="pc-fb">FB list price (£, optional)</label>
   <input type="number" step="0.01" min="0" name="fb_price" id="pc-fb" value="{escape(fb_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <label for="pc-retro">Retro (fraction of FB list, e.g. 0.125 — optional)</label>
-  <input type="number" step="any" min="0" name="retro_pct" id="pc-retro" value="{escape(retro_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <p class="help">A <em>fraction</em>, not a percentage — never rounded. Blank = no retro on the new rule.</p>
+  <label for="pc-retro">Retro (£ per keg — optional)</label>
+  <input type="number" step="0.01" min="0" name="retro_gbp" id="pc-retro" value="{escape(retro_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
+  <p class="help">The fixed £ rebate per keg (the Excel's "Retro P/Keg"). Net price = FB list − retro. Blank = no retro on the new rule.</p>
   <label for="pc-status">Status</label>
   {_status_select(cur_status)}
   <label for="pc-vf" style="margin-top:1em">Effective from</label>
@@ -586,9 +632,9 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
   <input type="number" step="0.01" min="0" name="tenant_price" id="fx-tp" value="{escape(tenant_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
   <label for="fx-fb">Corrected FB list price (£, optional)</label>
   <input type="number" step="0.01" min="0" name="fb_price" id="fx-fb" value="{escape(fb_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <label for="fx-retro">Corrected retro (fraction — leave blank to keep current{f", currently {escape(retro_val)}" if retro_val else ""})</label>
-  <input type="number" step="any" min="0" name="retro_pct" id="fx-retro" value="" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <p class="help">Blank keeps the stored retro. (Entering 0 cannot clear a stored retro — the write path skips zeros.)</p>
+  <label for="fx-retro">Corrected retro (£ per keg — leave blank to keep current{f", currently £{escape(retro_val)}" if retro_val else ""})</label>
+  <input type="number" step="0.01" min="0" name="retro_gbp" id="fx-retro" value="" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
+  <p class="help">The fixed £ rebate per keg. Blank keeps the stored retro. (Entering 0 cannot clear a stored retro — the write path skips zeros.)</p>
   <label for="fx-status">Status</label>
   {_status_select(cur_status)}
   <label for="fx-reason" style="margin-top:1em">Reason (required)</label>
@@ -684,8 +730,8 @@ use the tenant-support form on the <a href="{ext_url('/lwc')}">LWC page</a> inst
   <input type="number" step="0.01" min="0" name="tenant_price" id="ar-tp" required style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
   <label for="ar-fb">FB list price (£, optional)</label>
   <input type="number" step="0.01" min="0" name="fb_price" id="ar-fb" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <label for="ar-retro">Retro (fraction of FB list, e.g. 0.125 — optional)</label>
-  <input type="number" step="any" min="0" name="retro_pct" id="ar-retro" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
+  <label for="ar-retro">Retro (£ per keg — optional)</label>
+  <input type="number" step="0.01" min="0" name="retro_gbp" id="ar-retro" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
   <label for="ar-status">Status</label>
   {_status_select("tenanted")}
   <label for="ar-vf" style="margin-top:1em">Valid from</label>
@@ -704,6 +750,15 @@ use the tenant-support form on the <a href="{ext_url('/lwc')}">LWC page</a> inst
 def _preview_detail_rows(preview: ChangePreview) -> str:
     rows: list[str] = []
 
+    def _retro_money(d: dict) -> str:
+        """Retro as £/keg (fraction × FB list). Falls back to the fraction if the
+        FB list price is absent so the figure is never silently dropped."""
+        r = d.get("retro_pct")
+        if not r:
+            return "—"
+        fb = d.get("fb_price")
+        return f"£{r * fb:,.2f}" if fb else _frac_str(r)
+
     def _fields_desc(d: dict) -> str:
         bits = []
         if d.get("tenant_price") is not None:
@@ -711,7 +766,7 @@ def _preview_detail_rows(preview: ChangePreview) -> str:
         if d.get("fb_price") is not None:
             bits.append(f"FB {_money(d['fb_price'])}")
         if d.get("retro_pct"):
-            bits.append(f"retro {_frac_str(d['retro_pct'])}")
+            bits.append(f"retro {_retro_money(d)}/keg")
         if d.get("status"):
             bits.append(str(d["status"]))
         return escape(" · ".join(bits))
@@ -737,7 +792,7 @@ def _preview_detail_rows(preview: ChangePreview) -> str:
                 if k in ("tenant_price", "fb_price"):
                     diffs.append(f"{k}: {_money(old.get(k))} → {_money(new.get(k))}")
                 elif k == "retro_pct":
-                    diffs.append(f"{k}: {_frac_str(old.get(k)) or '—'} → {_frac_str(new.get(k)) or '—'}")
+                    diffs.append(f"retro: {_retro_money(old)} → {_retro_money(new)}")
                 else:
                     diffs.append(f"{k}: {old.get(k) or '—'} → {new.get(k) or '—'}")
         key = (old.get("rule_key") or new.get("rule_key") or "")

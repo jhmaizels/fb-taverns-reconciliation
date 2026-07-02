@@ -328,15 +328,22 @@ def validate_master_change(
             )
     if change.retro_pct is not None:
         if change.retro_pct < 0:
-            errors.append(f"retro_pct must not be negative (got {change.retro_pct})")
+            errors.append("retro must not be negative")
         elif change.retro_pct >= 1:
-            # A fraction >= 1 is a >=100% rebate — never valid, and almost always a
-            # percentage typed where a fraction belongs (12.5 vs 0.125), which would
-            # inflate retro_per_keg ~100x on every reconciliation. Block it.
-            errors.append(
-                f"retro_pct {change.retro_pct} is 1 or more (>=100%) — it is stored as a "
-                "FRACTION of fb_price (e.g. 0.125 for 12.5%). Enter the fraction, not the percentage."
-            )
+            # retro >= the full FB list price: a >=100% rebate is never valid and
+            # would make the net price zero or negative. Almost always a mistyped
+            # figure. Block it.
+            if change.fb_price:
+                errors.append(
+                    f"retro £{change.retro_pct * change.fb_price:.2f}/keg is at or above the "
+                    f"FB list price £{change.fb_price:.2f} — the net price would be zero or "
+                    "negative. Check the retro figure."
+                )
+            else:
+                errors.append(
+                    "retro is at or above the FB list price (net price would be zero or "
+                    "negative) — check the retro figure."
+                )
 
     # Invariant 3: effective date required for the dated ops; intervals never
     # inverted/empty (dates themselves are parsed at the form layer).
@@ -364,10 +371,13 @@ def validate_master_change(
                     f"this also changes status {target.status!r} → {change.status!r}"
                 )
             if (target.retro_pct or 0) > 0 and change.retro_pct == 0.0:
+                _keep = (
+                    f"£{target.retro_pct * target.fb_price:.2f}/keg"
+                    if target.fb_price else "the current retro"
+                )
                 warnings.append(
-                    "retro_pct=0 cannot clear the existing retro (the write path skips "
-                    "zero values) — leave it blank to keep "
-                    f"{target.retro_pct:.10f}"
+                    "a retro of £0 cannot clear the existing retro (the write path skips "
+                    f"zero values) — leave it blank to keep {_keep}"
                 )
             if change.tenant_price is None and change.fb_price is None \
                     and change.retro_pct is None and change.status == target.status:

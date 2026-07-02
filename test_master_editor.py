@@ -550,8 +550,9 @@ def test_compute_margin_math():
 
 
 def test_retro_pct_ge_one_is_blocked():
-    # A percentage typed where a fraction belongs (12.5 vs 0.125) would inflate
-    # retro_per_keg ~100x — block it rather than warn-through.
+    # retro >= the full FB list price (fraction >= 1) would make the net price
+    # zero/negative — block it rather than warn-through. (The £ form converts to
+    # a fraction before this runs, so this guards a mistyped/huge figure.)
     snap = _snap([_rule(vf=date(2026, 1, 1))])
     change = MasterChange(
         op="price_change", site_id=SITE_ID, product_code=PROD_CODE,
@@ -559,11 +560,44 @@ def test_retro_pct_ge_one_is_blocked():
         valid_from=date(2026, 7, 2), reason="typo test",
     )
     errors, _ = validate_master_change(change, snap)
-    assert any("100%" in e or ">=100%" in e or "1 or more" in e for e in errors), errors
+    assert any(
+        "at or above the FB list price" in e or "net price would be zero" in e
+        for e in errors
+    ), errors
     # a proper fraction is fine
     change2 = replace(change, retro_pct=0.125)
     errors2, _ = validate_master_change(change2, snap)
     assert not any("retro" in e.lower() for e in errors2), errors2
+
+
+def test_retro_gbp_form_converts_to_fraction():
+    # The edit/add forms collect retro as £/keg (retro_gbp); the codec stores it
+    # as a fraction of the FB list price. £22.50 on a £180 list -> 0.125.
+    from master_pages import parse_master_change_form
+    base = {
+        "op": "price_change", "site_id": SITE_ID, "product_code": PROD_CODE,
+        "tenant_price": "200", "fb_price": "180", "retro_gbp": "22.50",
+        "status": "tenanted", "valid_from": "2026-07-02", "reason": "retro £ test",
+    }
+    change, errs = parse_master_change_form(base)
+    assert not errs, errs
+    assert change.retro_pct is not None and abs(change.retro_pct - 0.125) < 1e-12
+
+    # The confirm→apply path carries the exact fraction (retro_pct hidden field);
+    # it must win over any stale £ field so the round-trip stays bit-exact.
+    both = {**base, "retro_pct": "0.1"}
+    change2, _ = parse_master_change_form(both)
+    assert change2.retro_pct == 0.1
+
+    # £ retro with no list price to divide by -> a loud error, never a silent drop.
+    no_fb = {k: v for k, v in base.items() if k != "fb_price"}
+    change3, errs3 = parse_master_change_form(no_fb)
+    assert any("FB list price" in e for e in errs3), errs3
+
+    # Blank retro -> None (the "keep existing" / "no retro" path), no error.
+    blank = {**base, "retro_gbp": ""}
+    change4, errs4 = parse_master_change_form(blank)
+    assert change4.retro_pct is None and not errs4
 
 
 def test_preview_winner_overlapping_support_wins_today():
@@ -813,6 +847,7 @@ TESTS = [
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
     test_compute_margin_math,
     test_retro_pct_ge_one_is_blocked,
+    test_retro_gbp_form_converts_to_fraction,
     test_preview_winner_overlapping_support_wins_today,
     test_preview_end_rule_delist_and_takeover,
     test_change_rule_key_normalises_codes,
