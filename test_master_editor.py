@@ -1174,6 +1174,49 @@ def test_route_site_create_end_all_delete():
             assert client.get("/master/site/new").status_code == 403
 
 
+def test_route_upload_master_updates_grid_immediately():
+    """/upload-master (whole-file replace): the prior rule is closed at the
+    effective date, the file's prices land, AND the very next /master read
+    shows them — served from the PATCHED cache, not a post-invalidate inline
+    sweep (the hub-proxy-timeout class)."""
+    from io import BytesIO
+    from openpyxl import Workbook
+
+    # Cost file in the exact parse_fb_cost_file shape: row1 blank, row2
+    # headers with per-site columns from col 5, data from row3.
+    wb = Workbook()
+    ws = wb.active
+    ws.append([None] * 6)
+    ws.append(["Product Code", "Product Name", "Price", "Retro P/Keg", "Net price",
+               f"Test Tavern {SITE_ID}"])
+    ws.append([PROD_CODE, "Test Keg", 130.0, 13.0, 117.0, 205.0])
+    buf = BytesIO()
+    wb.save(buf)
+
+    with FakeAirtable([_grid_rule("rec_old")]) as fa:   # current price £180
+        with FakeAuthClient("admin") as client:
+            r = client.post(
+                "/upload-master",
+                data={"valid_from": date.today().isoformat(), "reason": "jul list"},
+                files={"file": ("cost_jul.xlsx", buf.getvalue(),
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+            assert r.status_code == 200, r.text[:400]
+            assert "Master uploaded" in r.text and "View price grid" in r.text
+            closes = [u for u in _updates(fa) if "valid_to" in u["fields"]]
+            assert any(u["id"] == "rec_old" for u in closes), "old rule must be closed"
+            created = _creates(fa)
+            tenants = [c["fields"].get("tenant_price") for c in created
+                       if c["fields"].get("tenant_price") is not None]
+            assert tenants == [205.0]
+
+            # The point: the grid ALREADY shows the file's prices (patched cache).
+            r2 = client.get("/master")
+            assert "£205.00" in r2.text and "£180.00" not in r2.text
+            # product-level columns reflect the file's Price/Retro/Net too
+            assert "£130.00" in r2.text and "£13.00" in r2.text and "£117.00" in r2.text
+
+
 def test_route_apply_revalidates_tampered_hidden_inputs():
     """/master/apply must re-validate server-side: a tampered/stale hidden
     form (key collision for op=price_change) is refused with nothing written."""
@@ -1243,6 +1286,7 @@ TESTS = [
     test_build_universal_increase_math,
     test_route_universal_increase_preview_apply,
     test_route_site_create_end_all_delete,
+    test_route_upload_master_updates_grid_immediately,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,
 ]

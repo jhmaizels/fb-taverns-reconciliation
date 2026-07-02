@@ -856,12 +856,13 @@ def _date_iso(d: date | None) -> str:
     return d.isoformat() if d else "open"
 
 
-def patch_snapshot_for_increase(
+def patch_snapshot_for_bulk_upsert(
     snap: MasterSnapshot, new_rules: list[Rule], effective: date
 ) -> MasterSnapshot:
     """The in-memory mirror of applying ``new_rules`` via
     upsert_pricing_rules(close_keys_at_date=effective) — same shape as
-    patch_snapshot_for_change but for the bulk annual increase."""
+    patch_snapshot_for_change but for bulk writes (the annual increase and the
+    /upload-master whole-file replace both ride this)."""
     from dataclasses import replace as _dc_replace
 
     touched = {(r.site_id, r.product_code) for r in new_rules}

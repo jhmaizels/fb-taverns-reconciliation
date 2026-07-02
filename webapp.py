@@ -109,7 +109,7 @@ from master_changes import (  # noqa: E402
     apply_master_change,
     build_universal_increase,
     patch_snapshot_for_change,
-    patch_snapshot_for_increase,
+    patch_snapshot_for_bulk_upsert,
     preview_master_change,
     validate_master_change,
 )
@@ -848,6 +848,15 @@ def upload_master(
         product_count = len(products)
         retros_with_value = sum(1 for p in products.values() if (p.get("retro_per_keg") or 0) > 0)
 
+        # Snapshot BEFORE the write (normally cache-warm) so the grid can be
+        # patched + re-published afterwards — a plain invalidate would leave
+        # the operator's next /master click doing the ~30s inline sweep that
+        # times out the hub proxy.
+        try:
+            snap_before = load_master_snapshot()
+        except Exception:
+            snap_before = None
+
         lookups: dict = {}
         rules_created, rules_updated, rules_closed = upsert_pricing_rules(
             rules, close_keys_at_date=vf, lookups_out=lookups
@@ -866,6 +875,34 @@ def upload_master(
             except OSError:
                 pass
 
+    # Instant grid: mirror the whole-file upsert onto the cached snapshot and
+    # re-publish, then reconcile from Airtable in the background.
+    try:
+        if snap_before is not None:
+            from dataclasses import replace as _dc_replace
+            patched = patch_snapshot_for_bulk_upsert(snap_before, rules, vf)
+            new_sites = dict(patched.sites)
+            for sid, sname in (sites or {}).items():
+                cur = new_sites.get(sid)
+                if cur is None:
+                    new_sites[sid] = {"name": sname or "", "status": "tenanted",
+                                      "country": "england", "notes": "",
+                                      "_rec_id": "pending-refresh"}
+                elif sname and not cur.get("name"):
+                    new_sites[sid] = {**cur, "name": sname}
+            new_products = dict(getattr(patched, "products", {}) or {})
+            for code, info in (products or {}).items():
+                new_products[code] = {
+                    "desc": info.get("name") or (new_products.get(code) or {}).get("desc") or "",
+                    "retro_per_keg": float(info.get("retro_per_keg") or 0.0),
+                }
+            publish_patched_snapshot(
+                _dc_replace(patched, sites=new_sites, products=new_products)
+            )
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+
     return f"""{render_head(principal.email, principal.role)}
 <h1>Master uploaded</h1>
 <p class="sub">{escape(original_name)} &middot; effective from {vf.isoformat()}</p>
@@ -881,7 +918,8 @@ def upload_master(
   {f'<div class="summary-row"><span>Reason</span><span>{escape(reason)}</span></div>' if reason else ""}
 </div>
 <p style="margin-top:1.5em">
-  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
+  <a class="button" href="{ext_url('/master')}">View price grid</a>
+  <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank" style="background:#666">Open Airtable</a>
   <a class="button" href="{ext_url('/')}" style="background:#666">Back to home</a>
 </p>
 {PAGE_FOOT}"""
@@ -1442,7 +1480,7 @@ async def master_increase_apply(
         pct, principal.email, created, updated, closed,
     )
     try:
-        publish_patched_snapshot(patch_snapshot_for_increase(snap, new_rules, vf))
+        publish_patched_snapshot(patch_snapshot_for_bulk_upsert(snap, new_rules, vf))
     except Exception:
         logger.exception("snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
