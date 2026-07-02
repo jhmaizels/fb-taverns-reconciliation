@@ -116,10 +116,6 @@ def net_price(rule) -> float | None:
     return rule.fb_price * (1.0 - (rule.retro_pct or 0.0))
 
 
-def _money_g(v: float | None) -> str:
-    return "—" if v is None else f"£{v:,.2f}"
-
-
 def _date_str(d: date | None, empty: str = "") -> str:
     return d.isoformat() if d else empty
 
@@ -296,7 +292,192 @@ def change_to_hidden_fields(change: MasterChange) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# /master — the grid (§4.1)
+# /master — the Excel-style pivot (products x sites), the default view
+# ---------------------------------------------------------------------------
+
+def _pivot_winners(snap: MasterSnapshot, on: date) -> dict[tuple, Rule]:
+    """Current winning rule per (site_id, product_code) on ``on`` — the newest
+    valid_from among rules whose half-open window contains ``on``. This is the
+    SAME selection the reconciler and the list grid use, so the pivot shows the
+    price that would actually bill today."""
+    per_key: dict[tuple, list[Rule]] = {}
+    for r in snap.rules:
+        if _contains(r.valid_from, r.valid_to, on):
+            per_key.setdefault((r.site_id, r.product_code), []).append(r)
+    winners: dict[tuple, Rule] = {}
+    for k, lst in per_key.items():
+        lst.sort(key=lambda r: r.valid_from or date.min, reverse=True)
+        winners[k] = lst[0]
+    return winners
+
+
+def _pivot_cell(winner: Rule | None) -> str:
+    """One site×product cell. Renders BOTH the tenant price and the £ margin
+    (with % subline); the toggle swaps which is visible via a table class, so
+    no round-trip. Blank when the product isn't priced at that site."""
+    if winner is None or winner.tenant_price is None:
+        return '<td class="num"><span class="pivot-empty">·</span></td>'
+    price = f'<span class="cell-price">{escape(_money(winner.tenant_price))}</span>'
+    m = margin_of(winner)
+    if m.net_gbp is None:
+        margin = '<span class="cell-margin pivot-empty">n/a</span>'
+    else:
+        cls = "cell-neg" if m.net_gbp < 0 else (
+            "cell-warn" if (m.pct is not None and m.pct < 10) else "cell-pos"
+        )
+        pct = (
+            f'<span class="pct">{m.pct:.1f}%</span>' if m.pct is not None
+            else '<span class="pct">n/a</span>'
+        )
+        margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
+    return f'<td class="num">{price}{margin}</td>'
+
+
+def render_master_pivot(
+    snap: MasterSnapshot, params: dict, is_admin: bool, banner_html: str = ""
+) -> str:
+    """Excel-style master: products down the rows, sites across the columns.
+    Each cell = the CURRENT (today-winning) tenant price; the toggle flips every
+    cell to its £ margin (tenant − net-of-retro FB cost) with the % underneath.
+    Read-only — history and per-rule edits live on the list view (?view=list)."""
+    q = (params.get("q") or "").strip()
+    q_low = q.lower()
+    today = date.today()
+    winners = _pivot_winners(snap, today)
+
+    # Columns = sites carrying ≥1 current price, ordered by name.
+    def _site_name(sid: str) -> str:
+        return (snap.sites.get(sid) or {}).get("name") or ""
+
+    site_ids = sorted(
+        {s for (s, _p) in winners}, key=lambda s: (_site_name(s).lower(), s)
+    )
+
+    # Per-product left columns (Code/Name/Price/Retro/Net). FB list + retro are
+    # MEANT to be product-level, but a Rule stores them per (site, product), so
+    # they can differ across sites. Collect the DISTINCT values so we can show a
+    # single figure only when it's consistent and flag "varies" otherwise —
+    # never an arbitrary/order-dependent pick (the per-cell margins always use
+    # each cell's own rule). Deterministic iteration via sorted().
+    prod_agg: dict[str, dict] = {}
+    for (s, p), w in sorted(winners.items()):
+        agg = prod_agg.setdefault(p, {"desc": "", "fbs": set(), "retros": set()})
+        if not agg["desc"] and w.product_desc:
+            agg["desc"] = w.product_desc
+        if w.fb_price is not None:
+            agg["fbs"].add(round(w.fb_price, 4))
+        agg["retros"].add(round(w.retro_pct or 0.0, 6))
+
+    def _row_match(p: str) -> bool:
+        if not q_low:
+            return True
+        return q_low in f"{p} {prod_agg.get(p, {}).get('desc', '')}".lower()
+
+    prod_codes = sorted(p for p in prod_agg if _row_match(p))
+
+    n_sites, n_prods = len(site_ids), len(prod_codes)
+
+    # ---- toolbar (toggle + product search + link to the list/history view) ----
+    q_attr = escape(q)
+    clear = (
+        f' <a href="{ext_url("/master")}" style="font-size:0.85em">clear</a>' if q else ""
+    )
+    toolbar = f"""
+<div class="pivot-toolbar">
+  <button type="button" id="pivot-toggle" class="toggle">Show margins</button>
+  <form method="get" action="{ext_url('/master')}">
+    <input type="search" name="q" value="{q_attr}" placeholder="Filter products…">
+    <button type="submit">Search</button>{clear}
+  </form>
+  <span class="grow"></span>
+  <span class="help" style="margin:0">{n_prods} products × {n_sites} sites · prices current as of {today.isoformat()}</span>
+  <a href="{ext_url('/master')}?view=list">Detailed list / history →</a>
+</div>"""
+
+    if not prod_codes or not site_ids:
+        empty = (
+            "No products match this filter." if q else
+            "No current prices in the master yet."
+        )
+        return (
+            f'<div class="pivot-wide"><h1>Pricing master</h1>{banner_html}'
+            f"{toolbar}<p class=\"help\">{escape(empty)}</p></div>"
+        )
+
+    # ---- header row ----
+    head_sites = "".join(
+        f'<th class="num site" title="{escape(sid)} — {escape(_site_name(sid))}">'
+        f'{escape(_site_name(sid) or sid)}<span class="sid">{escape(sid)}</span></th>'
+        for sid in site_ids
+    )
+    thead = (
+        '<thead><tr>'
+        '<th class="sticky-col prod">Product</th>'
+        '<th class="num">Price £</th><th class="num">Retro £/keg</th><th class="num">Net £</th>'
+        f'{head_sites}</tr></thead>'
+    )
+
+    # ---- body rows ----
+    varies = '<span class="pivot-empty" title="differs across sites — see each cell">varies</span>'
+
+    def _left_cells(agg: dict) -> tuple[str, str, str]:
+        """Price/Retro-£/Net for the product columns. A single figure only when
+        it's consistent across the product's sites; 'varies' otherwise; '—' when
+        there's no FB list price to compute from."""
+        fbs, retros = agg["fbs"], agg["retros"]
+        fb = next(iter(fbs)) if len(fbs) == 1 else None
+        retro = next(iter(retros)) if len(retros) == 1 else None
+        price_c = varies if len(fbs) > 1 else escape(_money(fb))  # _money(None) -> "—"
+        if len(fbs) > 1 or (len(retros) > 1 and fbs):
+            return price_c, varies, varies          # fb and/or retro differ
+        if fb is not None and retro is not None:
+            return price_c, escape(_money(fb * retro)), escape(_money(fb * (1.0 - retro)))
+        return price_c, "—", "—"                    # no FB list price to compute from
+
+    body: list[str] = []
+    for p in prod_codes:
+        agg = prod_agg[p]
+        price_c, retro_c, net_c = _left_cells(agg)
+        prod_cell = (
+            f'<td class="sticky-col">{escape(agg["desc"] or p)}'
+            f' <span class="pcode">{escape(p)}</span></td>'
+        )
+        pinfo = (
+            f'<td class="num pinfo">{price_c}</td>'
+            f'<td class="num pinfo">{retro_c}</td>'
+            f'<td class="num pinfo">{net_c}</td>'
+        )
+        cells = "".join(_pivot_cell(winners.get((sid, p))) for sid in site_ids)
+        body.append(f"<tr>{prod_cell}{pinfo}{cells}</tr>")
+
+    table = (
+        f'<div class="pivot-wrap"><table class="pivot" id="pivot-tbl">'
+        f'{thead}<tbody>{"".join(body)}</tbody></table></div>'
+    )
+
+    legend = (
+        '<p class="help" style="margin-top:0">Margin view: '
+        '<span class="cell-pos">green</span> ≥10% · '
+        '<span class="cell-warn">amber</span> &lt;10% · '
+        '<span class="cell-neg">red</span> loss (selling under the net-of-retro FB cost). '
+        'Blank cell = product not priced at that site.</p>'
+    )
+
+    toggle_js = (
+        "<script>(function(){var t=document.getElementById('pivot-tbl'),"
+        "b=document.getElementById('pivot-toggle');if(!t||!b)return;"
+        "b.addEventListener('click',function(){var on=t.classList.toggle('show-margin');"
+        "b.textContent=on?'Show prices':'Show margins';});})();</script>"
+    )
+
+    return (
+        f'<div class="pivot-wide"><h1>Pricing master</h1>{banner_html}'
+        f'{toolbar}{table}{legend}{toggle_js}</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# /master?view=list — the detailed rule grid (§4.1)
 # ---------------------------------------------------------------------------
 
 def render_master_grid(
@@ -410,8 +591,8 @@ def render_master_grid(
             f"<td>{escape(r.site_id)} {escape(site_name)}</td>"
             f"<td>{escape(r.product_code)} <span style=\"color:#666\">{escape(r.product_desc or '')}</span></td>"
             f'<td class="r">{_money(r.fb_price)}</td>'
-            f'<td class="r">{_money_g(retro_gbp(r))}</td>'
-            f'<td class="r">{_money_g(net_price(r))}</td>'
+            f'<td class="r">{_money(retro_gbp(r))}</td>'
+            f'<td class="r">{_money(net_price(r))}</td>'
             f'<td class="r">{_money(r.tenant_price)}</td>'
             f"{_margin_cell(r)}"
             f"<td>{_date_str(r.valid_from, 'open')}</td>"
@@ -541,7 +722,7 @@ Exports and reconciliations always read fresh.</p>
 def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
     site_name = (snap.sites.get(rule.site_id) or {}).get("name", "")
     _rg = retro_gbp(rule)
-    retro_line = _money_g(_rg) if _rg is not None else "—"
+    retro_line = _money(_rg) if _rg is not None else "—"
     m = margin_of(rule)
     if m.net_gbp is None:
         margin_line = "—"
@@ -556,7 +737,7 @@ def _rule_current_block(snap: MasterSnapshot, rule: Rule) -> str:
         ("Product", escape(f"{rule.product_code} {rule.product_desc or ''}".strip())),
         ("FB (list) price", escape(_money(rule.fb_price))),
         ("Retro (£/keg)", escape(retro_line)),
-        ("Net price (list − retro)", escape(_money_g(net_price(rule)))),
+        ("Net price (list − retro)", escape(_money(net_price(rule)))),
         ("Tenant price", escape(_money(rule.tenant_price))),
         ("Margin (on net price)", escape(margin_line)),
         ("Valid from", escape(_date_str(rule.valid_from, "open (no start date)"))),
@@ -642,7 +823,7 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
   <button type="submit" style="margin-top:1em">Preview fix</button>
 </form>"""
 
-    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}">← Back to master</a></p>'
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?view=list">← Back to master (list)</a></p>'
     return f"""{back}
 <h1>Edit rule</h1>
 <h2 style="margin-top:0.6em">Current values</h2>
@@ -670,7 +851,7 @@ def render_end_page(snap: MasterSnapshot, rule: Rule) -> str:
         "valid_from": _date_str(rule.valid_from),
     }
     today_iso = date.today().isoformat()
-    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}">← Back to master</a></p>'
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?view=list">← Back to master (list)</a></p>'
     return f"""{back}
 <h1>End rule</h1>
 <h2 style="margin-top:0.6em">Current values</h2>
@@ -705,7 +886,7 @@ def render_add_page(snap: MasterSnapshot) -> str:
         f'<option value="{escape(code)}">{escape(code)} — {escape(descs.get(code) or "")}</option>'
         for code in sorted(descs)
     ]
-    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}">← Back to master</a></p>'
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?view=list">← Back to master (list)</a></p>'
     return f"""{back}
 <h1>Add a rule</h1>
 <p class="help">A new (site, product) pricing rule. For a <em>temporary</em> price that layers over the standard rule,
@@ -839,7 +1020,7 @@ def _preview_margin_row(preview: ChangePreview) -> str:
 
 def render_preview_page(change: MasterChange, preview: ChangePreview) -> str:
     op_label = OP_LABELS.get(preview.op, preview.op)
-    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}">← Back to master</a></p>'
+    back = f'<p class="sub" style="margin-top:0"><a href="{ext_url("/master")}?view=list">← Back to master (list)</a></p>'
     head = f"""{back}
 <h1>Confirm change</h1>
 <p class="sub">{escape(op_label)} — review below. <strong>Nothing has been written yet.</strong></p>"""
@@ -894,7 +1075,7 @@ def render_result_page(
 <p class="help" style="margin-top:1em">The master list is served from a cached snapshot — this change may take up to a
 minute to appear there (a background refresh has been kicked off). Exports and new reconciliations pick it up immediately.</p>
 <p style="margin-top:1.5em">
-  <a class="button" href="{ext_url('/master')}">Back to master</a>
+  <a class="button" href="{ext_url('/master')}?view=list">Back to master (list)</a>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank" style="background:#666">Open Airtable</a>
 </p>
 """

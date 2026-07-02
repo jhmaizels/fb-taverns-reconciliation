@@ -282,6 +282,35 @@ HEAD_STYLE = """<!doctype html>
   tr.ended td { color: #999; }
   .help { font-size: 0.85em; color: #555; margin: -0.4em 0 1em; line-height: 1.4; }
   .help strong { color: #2c5aa0; }
+  /* --- pricing-master pivot: products (rows) x sites (cols), Excel-style --- */
+  .pivot-wide { width: 96vw; max-width: 96vw; position: relative; left: 50%; transform: translateX(-50%); }
+  .pivot-toolbar { display: flex; align-items: center; gap: 0.7em; flex-wrap: wrap; margin: 0.6em 0; }
+  .pivot-toolbar .grow { flex: 1 1 auto; }
+  .pivot-toolbar form { background: none; border: 0; padding: 0; margin: 0; max-width: none; display: flex; gap: 0.5em; align-items: center; }
+  .pivot-toolbar input[type=search] { width: 260px; padding: 0.45em 0.6em; margin: 0; box-sizing: border-box; }
+  button.toggle { background: #33691e; }
+  button.toggle:hover { background: #274f16; }
+  .pivot-wrap { overflow: auto; max-height: 78vh; border: 1px solid #ddd; border-radius: 6px; margin: 0.4em 0 1em; }
+  table.pivot { border-collapse: separate; border-spacing: 0; width: auto; min-width: 100%; font-size: 0.84em; margin: 0; }
+  table.pivot th, table.pivot td { border-bottom: 1px solid #ececec; border-right: 1px solid #ececec; padding: 0.35em 0.6em; background: #fff; vertical-align: top; }
+  table.pivot thead th { position: sticky; top: 0; z-index: 3; background: #eef2f7; text-align: right; vertical-align: bottom; font-weight: 600; }
+  table.pivot thead th.site { max-width: 120px; white-space: normal; line-height: 1.15; }
+  table.pivot thead th.site .sid { display: block; font-weight: 400; color: #789; font-size: 0.82em; }
+  table.pivot .sticky-col { position: sticky; left: 0; z-index: 2; background: #fff; box-shadow: 1px 0 0 #ddd; text-align: left; min-width: 190px; max-width: 260px; white-space: normal; }
+  table.pivot thead th.sticky-col { z-index: 5; background: #eef2f7; }
+  table.pivot .sticky-col .pcode { color: #789; font-size: 0.85em; }
+  table.pivot td.num, table.pivot th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.pivot td.pinfo { color: #444; background: #fbfcfe; }
+  table.pivot tbody tr:hover td { background: #f2f7ff; }
+  table.pivot tbody tr:hover td.sticky-col { background: #f2f7ff; }
+  table.pivot .cell-margin { display: none; }
+  table.pivot.show-margin .cell-price { display: none; }
+  table.pivot.show-margin .cell-margin { display: block; }
+  .cell-margin .pct { display: block; font-size: 0.82em; color: #777; font-weight: 400; }
+  .cell-neg { color: #b00020; }
+  .cell-warn { color: #8a6500; }
+  .cell-pos { color: #1f7a1f; }
+  .pivot-empty { color: #cbd2da; }
 </style>
 </head><body>
 """
@@ -465,14 +494,16 @@ def _master_banner_html(info: dict | None = None) -> str:
 
 def _render_master_banner(info: dict) -> str:
     sources = info.get("sources") or []
-    src_text = sources[0] if sources else "<em>none uploaded yet</em>"
+    # sources[0] is an uploaded FILENAME (Rule.source) — attacker-influenceable,
+    # so escape it. The <em>/<span> literals below are trusted markup we build.
+    src_text = escape(sources[0]) if sources else "<em>none uploaded yet</em>"
     if len(sources) > 1:
         src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
-    vf = info.get("latest_valid_from") or "—"
-    uploaded_at = info.get("latest_uploaded_at") or ""
+    vf = escape(str(info.get("latest_valid_from") or "—"))
+    uploaded_at = str(info.get("latest_uploaded_at") or "")
     # Render upload date as just YYYY-MM-DD HH:MM
     if uploaded_at:
-        uploaded_at = uploaded_at.replace("T", " ")[:16]
+        uploaded_at = escape(uploaded_at.replace("T", " ")[:16])
     rules = info.get("active_rule_count", 0)
     retros = info.get("products_with_retro", 0)
     upload_chip = (
@@ -969,16 +1000,21 @@ def master_grid(
     request: Request,
     principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
 ):
-    """Searchable rule grid over the CACHED master snapshot (never a fresh
-    Airtable sweep — §3.4). Filters/view/pagination via GET params."""
+    """The master over the CACHED snapshot (never a fresh Airtable sweep — §3.4).
+    Default view is the Excel-style pivot (products × sites); ?view=list is the
+    detailed per-rule grid with history/filters/pagination."""
     try:
+        params = dict(request.query_params)
         snap = load_master_snapshot()
-        body = master_pages.render_master_grid(
-            snap,
-            dict(request.query_params),
-            is_admin=principal.is_admin,
-            banner_html=_master_banner_html(snap.banner_info),
-        )
+        banner = _master_banner_html(snap.banner_info)
+        if params.get("view") == "list":
+            body = master_pages.render_master_grid(
+                snap, params, is_admin=principal.is_admin, banner_html=banner
+            )
+        else:
+            body = master_pages.render_master_pivot(
+                snap, params, is_admin=principal.is_admin, banner_html=banner
+            )
     except Exception:
         logger.exception("request failed")
         return _error_page(_GENERIC_ERR)
@@ -1130,10 +1166,11 @@ def _tennents_master_banner_html() -> str:
     except Exception:
         return ""
     sources = info.get("sources") or []
-    src_text = sources[0] if sources else "<em>none uploaded yet</em>"
+    # sources[0] = uploaded filename (attacker-influenceable) — escape it.
+    src_text = escape(sources[0]) if sources else "<em>none uploaded yet</em>"
     if len(sources) > 1:
         src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
-    uploaded_at = (info.get("latest_uploaded_at") or "").replace("T", " ")[:16]
+    uploaded_at = escape((str(info.get("latest_uploaded_at") or "")).replace("T", " ")[:16])
     upload_chip = (
         f' <span class="sep">·</span> uploaded <strong>{uploaded_at}</strong>'
         if uploaded_at else ""

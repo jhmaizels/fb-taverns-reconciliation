@@ -570,6 +570,57 @@ def test_retro_pct_ge_one_is_blocked():
     assert not any("retro" in e.lower() for e in errors2), errors2
 
 
+def test_render_master_pivot_shape_and_winner():
+    from master_pages import render_master_pivot
+    S1, S2, P1, P2 = "001", "002", "AAA", "BBB"
+    def R(site, code, tenant, fb=120.0, retro=0.0, vf=None, vt=None, desc="Keg"):
+        return Rule(site_id=site, product_code=code, product_desc=desc,
+                    tenant_price=tenant, fb_price=fb, retro_pct=retro,
+                    valid_from=vf, valid_to=vt, status="tenanted",
+                    reason="x", source="test")
+    rules = [
+        # P1: CONSISTENT fb/retro across both sites -> left column shows the net.
+        R(S1, P1, 200.0, fb=120.0, retro=0.125, vf=date(2026, 1, 1)),  # margin 95
+        R(S1, P1, 999.0, fb=120.0, retro=0.125, vf=date.today() + timedelta(days=1)),  # future
+        R(S2, P1, 180.0, fb=120.0, retro=0.125, vf=date(2026, 1, 1)),  # margin 75
+        # P2: fb DIFFERS across sites -> left column must say "varies", not pick one.
+        R(S1, P2, 100.0, fb=120.0, retro=0.0, vf=date(2026, 1, 1), desc="Loss Keg"),  # margin -20
+        R(S2, P2, 150.0, fb=100.0, retro=0.0, vf=date(2026, 1, 1), desc="Loss Keg"),  # margin  50
+    ]
+    snap = MasterSnapshot(
+        sites={S1: {"name": "Alpha Arms"}, S2: {"name": "Beta Bar"}},
+        rules=rules, site_ids={S1: "r1", S2: "r2"},
+        product_ids={P1: "p1", P2: "p2"}, rule_ids={}, banner_info={},
+    )
+    html = render_master_pivot(snap, {}, is_admin=True)
+    assert 'class="pivot"' in html
+    # both sites are columns, both products are rows
+    assert "Alpha Arms" in html and "Beta Bar" in html
+    assert P1 in html and P2 in html and "Loss Keg" in html
+    # today's winner is £200, NOT the future £999
+    assert "£200.00" in html and "£999.00" not in html
+    # margin view present, and the loss cell (P2×S1) is flagged
+    assert "cell-margin" in html and "cell-neg" in html
+    # P1 consistent: left-column net of the 0.125 retro on £120 = £105.00
+    assert "£105.00" in html
+    # P2 has different FB across sites: left columns must flag it, not pick one
+    assert "varies" in html
+
+
+def test_master_banner_escapes_source_filename():
+    # The master banner shows the uploaded FILENAME (Rule.source) — an
+    # attacker-influenceable value. It must be HTML-escaped, not injected.
+    import webapp
+    html = webapp._render_master_banner({
+        "sources": ["<script>alert(1)</script>evil.xlsx"],
+        "latest_valid_from": "<img src=x onerror=alert(1)>",
+        "latest_uploaded_at": "2026-07-02T10:00",
+        "active_rule_count": 3, "products_with_retro": 1,
+    })
+    assert "<script>" not in html and "&lt;script&gt;" in html
+    assert "<img src=x" not in html
+
+
 def test_retro_gbp_form_converts_to_fraction():
     # The edit/add forms collect retro as £/keg (retro_gbp); the codec stores it
     # as a fraction of the FB list price. £22.50 on a £180 list -> 0.125.
@@ -731,14 +782,22 @@ def test_route_grid_viewer_ok_edit_admin_only():
     admin sees the links and the edit page renders both forms."""
     with FakeAirtable([_grid_rule()]):
         with FakeAuthClient("viewer") as client:
+            # Default /master = the Excel-style pivot (read-only, no edit links).
             r = client.get("/master")
             assert r.status_code == 200, r.text[:300]
             assert PROD_CODE in r.text
-            assert "/master/edit" not in r.text, "edit links must be hidden from viewers"
+            assert 'class="pivot"' in r.text, "default /master must be the pivot view"
+            # The detailed list view hides edit links from viewers too.
+            rl = client.get("/master", params={"view": "list"})
+            assert rl.status_code == 200 and PROD_CODE in rl.text
+            assert "/master/edit" not in rl.text, "edit links must be hidden from viewers"
             r2 = client.get("/master/edit", params={"rule_key": _key("2026-01-01")})
             assert r2.status_code == 403, f"viewer must get 403 on /master/edit, got {r2.status_code}"
         with FakeAuthClient("admin") as client:
-            r3 = client.get("/master")
+            # Pivot is read-only for everyone in Phase 1; edit links live on the list.
+            rp = client.get("/master")
+            assert rp.status_code == 200 and 'class="pivot"' in rp.text
+            r3 = client.get("/master", params={"view": "list"})
             assert r3.status_code == 200 and "/master/edit" in r3.text
             r4 = client.get("/master/edit", params={"rule_key": _key("2026-01-01")})
             assert r4.status_code == 200
@@ -846,6 +905,8 @@ TESTS = [
     test_preview_close_pass_skips_bounded_support_and_future_rule,
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
     test_compute_margin_math,
+    test_render_master_pivot_shape_and_winner,
+    test_master_banner_escapes_source_filename,
     test_retro_pct_ge_one_is_blocked,
     test_retro_gbp_form_converts_to_fraction,
     test_preview_winner_overlapping_support_wins_today,
