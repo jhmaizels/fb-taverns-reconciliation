@@ -1081,14 +1081,16 @@ def master_grid(
     try:
         params = dict(request.query_params)
         snap = load_master_snapshot()
-        banner = _master_banner_html(snap.banner_info)
         if params.get("view") == "list":
+            # The upload-provenance banner stays on the detailed list only —
+            # the grid is the source of truth now, so it's noise there.
+            banner = _master_banner_html(snap.banner_info)
             body = master_pages.render_master_grid(
                 snap, params, is_admin=principal.is_admin, banner_html=banner
             )
         else:
             body = master_pages.render_master_pivot(
-                snap, params, is_admin=principal.is_admin, banner_html=banner
+                snap, params, is_admin=principal.is_admin
             )
     except Exception:
         logger.exception("request failed")

@@ -620,6 +620,8 @@ def test_render_master_pivot_shape_and_winner():
     assert html.index(">Keg<") < html.index("Loss Keg") < html.index("Zed Retro-Only Keg")
     # read-only by default: no edit affordances without ?edit=1
     assert 'class="cellf"' not in html and "cell-input" not in html
+    # back-to-LWC link present; upload-provenance banner is NOT rendered here
+    assert "Back to LWC" in html
 
 
 def test_render_master_pivot_cask_section_and_edit_mode():
@@ -860,6 +862,9 @@ def test_route_grid_viewer_ok_edit_admin_only():
             assert r.status_code == 200, r.text[:300]
             assert PROD_CODE in r.text
             assert 'class="pivot"' in r.text, "default /master must be the pivot view"
+            # upload-provenance banner removed from the pivot (list view keeps it)
+            assert "Current master:" not in r.text
+            assert "Back to LWC" in r.text
             # The detailed list view hides edit links from viewers too.
             rl = client.get("/master", params={"view": "list"})
             assert rl.status_code == 200 and PROD_CODE in rl.text

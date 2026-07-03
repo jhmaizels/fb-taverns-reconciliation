@@ -493,8 +493,12 @@ def render_master_pivot(
             "No products match this filter." if q else
             "No current prices in the master yet."
         )
+        lwc_back = (
+            f'<p class="sub" style="margin-top:0; margin-bottom:0.4em">'
+            f'<a href="{ext_url("/lwc")}">← Back to LWC</a></p>'
+        )
         return (
-            f'<div class="pivot-wide"><h1>Pricing master</h1>{banner_html}{saved_banner}'
+            f'<div class="pivot-wide">{lwc_back}<h1>Pricing master</h1>{banner_html}{saved_banner}'
             f"{toolbar}<p class=\"help\">{escape(empty)}</p></div>"
         )
 
@@ -669,8 +673,12 @@ def render_master_pivot(
     # Single-site view stays compact inside the normal page column ("don't
     # spread across the page") — the full estate keeps the wide breakout.
     wrap_cls = "pivot-wide" if len(site_ids) > 1 else "pivot-single"
+    lwc_back = (
+        f'<p class="sub" style="margin-top:0; margin-bottom:0.4em">'
+        f'<a href="{ext_url("/lwc")}">← Back to LWC</a></p>'
+    )
     return (
-        f'<div class="{wrap_cls}"><h1>Pricing master</h1>{banner_html}{saved_banner}'
+        f'<div class="{wrap_cls}">{lwc_back}<h1>Pricing master</h1>{banner_html}{saved_banner}'
         f'{toolbar}{edit_help}{table}{legend}{toggle_js}</div>'
     )
 
