@@ -604,18 +604,43 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
 
 @app.get("/lwc", response_class=HTMLResponse)
 def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
-    # Default "Effective from" to today minus 14 days. Master uploads are
-    # almost always corrections to the current master — this default makes
-    # the new master cover the most recent weekly LWC files (which span
-    # the past ~7 days) without any manual date entry. Override with an
-    # earlier date for full retroactive replacement, or a later one for
-    # genuine future-dated changes.
-    today_iso = (date.today() - timedelta(days=14)).isoformat()
+    # The ONLINE price file is the master (operator direction 2026-07-03):
+    # the Excel-upload path is retired from this page — /upload-master stays
+    # routable for a bulk re-import emergency, but day-to-day everything is
+    # edited in the grid and reconciliations check against it directly.
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
-<p class="sub">Upload a supplier file to reconcile. Or update the pricing master.</p>
-{_master_banner_html()}
+
+<h2 style="margin-top:1em">Pricing master</h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0">The <strong>online price file</strong> is the master. Open it to browse prices and
+  margins, and (admins) edit directly in the grid — prices, products, sites, the annual increase. Every change
+  takes effect from the day it's made, with history kept underneath, and reconciliations check supplier files
+  against it.</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/master')}" style="margin-top:0">Open price file</a></p>
+</div>
+
+<div class="grid2" style="margin-top:1em">
+  <form action="{ext_url('/export-master')}" method="get">
+    <h3>Download to Excel</h3>
+    <p class="sub">A fresh <code>master.xlsx</code> generated from the price file <em>as it stands right now</em> —
+    every grid edit included, in the familiar cost-file layout.</p>
+    <button type="submit">Download master.xlsx</button>
+  </form>
+  <form action="{ext_url('/add-support')}" method="post">
+    <h3>Tenant support</h3>
+    <p class="sub">A temporary support price for one site &amp; product. Reconciliations during the support window flag the mismatch but tag it with the support context, so you can see why LWC is charging the standard price.</p>
+    <label for="support-text">Describe the support in plain English</label>
+    <textarea name="text" id="support-text" required
+      placeholder="e.g. Bell 804, reducing price of Moretti 22g to £200 for six weeks starting from today"></textarea>
+    <p class="help">Include site, product, new price, when it starts, and how long it runs.<br>
+    &bull; <em>"Castle Gate 820, Coors 11G to £150 from 1 May for 8 weeks"</em><br>
+    &bull; <em>"Bay Horse 816, Madri 50L at £180 from today until end of June"</em><br>
+    &bull; <em>"Lady Jane 805, Carling 22G dropped to £155 from 15 May for one month"</em></p>
+    <button type="submit">Add support</button>
+  </form>
+</div>
 
 <h2>Reconcile a supplier file</h2>
 <div class="grid2">
@@ -636,48 +661,6 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
     <button type="submit">Upload &amp; reconcile</button>
   </form>
 </div>
-
-<h2>Pricing master</h2>
-<div class="result" style="max-width: none">
-  <p style="margin-top:0">The <strong>FB Taverns Cost Price File</strong> Excel is the master. Update it on the left for everyday changes (RPI, new tenants, corrections). Use the right-hand form for <em>temporary</em> tenant support that overrides the master price for a window — when reconciliations land in that window, mismatches get tagged with the support context.</p>
-</div>
-
-<p style="margin-top:1em"><a href="{ext_url('/master')}" class="card-link" style="max-width:none">
-  <span class="card-cta">Browse &amp; edit rules →</span>
-  <span style="color:#555"> — search the pricing master; change a price from a date, fix a mistake in place, or end (delist) a rule, each with a preview before anything is written.</span>
-</a></p>
-
-<div class="grid2" style="margin-top:1em">
-  <form action="{ext_url('/upload-master')}" method="post" enctype="multipart/form-data">
-    <h3>Download current master</h3>
-    <p class="sub">The version currently in force. <a href="{ext_url('/export-master')}">Download master.xlsx</a> (signed-in team members only).</p>
-    <h3 class="second-h3">Upload new master version</h3>
-    <p class="sub">Replaces the current master. Existing rules with the same site &amp; product are closed at the effective date and replaced with the new prices.</p>
-    <label for="vf">Effective from</label>
-    <input type="date" name="valid_from" id="vf" value="{today_iso}" required>
-    <p class="help">Defaults to <strong>today − 14 days</strong> — covers the latest LWC weekly file so a fresh upload immediately flows through. Sales <em>before</em> this date still reconcile against the previous master.<br>
-    &bull; <strong>Most uploads:</strong> leave the default. The new master picks up the most recent week's invoices.<br>
-    &bull; <strong>Fully retroactive correction</strong> (replace the prior master entirely): set this to whatever date the prior master started — typically the 1st of a month.<br>
-    &bull; <strong>Future-dated change</strong> (RPI agreed for a date that hasn't happened yet): set this to that date.</p>
-    <label for="m-file">Master file (.xlsx)</label>
-    <input type="file" name="file" id="m-file" accept=".xlsx" required>
-    <button type="submit">Upload new version</button>
-  </form>
-  <form action="{ext_url('/add-support')}" method="post">
-    <h3>Tenant support</h3>
-    <p class="sub">A temporary support price for one site &amp; product. Reconciliations during the support window flag the mismatch but tag it with the support context, so you can see why LWC is charging the standard price.</p>
-    <label for="support-text">Describe the support in plain English</label>
-    <textarea name="text" id="support-text" required
-      placeholder="e.g. Bell 804, reducing price of Moretti 22g to £200 for six weeks starting from today"></textarea>
-    <p class="help">Include site, product, new price, when it starts, and how long it runs.<br>
-    &bull; <em>"Castle Gate 820, Coors 11G to £150 from 1 May for 8 weeks"</em><br>
-    &bull; <em>"Bay Horse 816, Madri 50L at £180 from today until end of June"</em><br>
-    &bull; <em>"Lady Jane 805, Carling 22G dropped to £155 from 15 May for one month"</em></p>
-    <button type="submit">Add support</button>
-  </form>
-</div>
-
-<p style="margin-top:2em"><a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable base</a></p>
 {PAGE_FOOT}"""
 
 
