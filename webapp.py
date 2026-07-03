@@ -576,8 +576,15 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
     ten_count = ten_info.get("agreement_count", 0)
     ten_customers = ten_info.get("customer_count", 0)
 
+    # Proxied under the hub: "/" is the Team Hub portal (same origin), the
+    # same target as the header logo. Standalone (no base path) there is no
+    # hub to return to, so no link.
+    hub_link = (
+        '<p class="sub" style="margin-top:0"><a href="/">← Back to Team Hub</a></p>'
+        if EXTERNAL_BASE_PATH else ""
+    )
     return f"""{render_head(principal.email, principal.role)}
-<h1>FB Taverns Reconciliation</h1>
+{hub_link}<h1>FB Taverns Reconciliation</h1>
 <p class="sub">Pick the supplier estate to reconcile against. Each has its own master and reconciliation flow.</p>
 <div class="grid2">
   <a href="{ext_url('/lwc')}" class="card-link">
