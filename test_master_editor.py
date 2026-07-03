@@ -1212,6 +1212,35 @@ def test_route_product_settings_rename_end_all_delete():
             r3 = client.get("/master")
             assert "Renamed Keg" in r3.text and "PKEG2" in r3.text
 
+    with FakeAirtable([_grid_rule("rec_old")]) as fa_fb:
+        with FakeAuthClient("admin") as client:
+            # product-level FB list + retro edit: Products PATCH carries the
+            # retro; every current price re-dated from today with the new
+            # figures, tenant UNCHANGED (only the cost side moves).
+            r = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save",
+                "new_code": PROD_CODE, "new_desc": "Test Keg",
+                "new_fb": "130.00", "new_retro": "13.00",
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            prod_ups = [
+                recs for op, t, recs in fa_fb.calls
+                if op == "update" and t == airtable_io.T["Products"]
+            ]
+            assert prod_ups and prod_ups[0][0]["fields"]["retro_per_keg"] == 13.0
+            created = _creates(fa_fb)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["tenant_price"] == 180.0, "tenant price must NOT change"
+            assert f["fb_price"] == 130.0
+            assert abs(f["retro_pct"] - 13.0 / 130.0) < 1e-9
+            closes = [u for u in _updates(fa_fb)
+                      if u["fields"].get("valid_to") and "rule_key" not in u["fields"]]
+            assert any(u["id"] == "rec_old" for u in closes), "old rule closed at today"
+            # patched cache: net price 130-13=£117.00 visible immediately
+            r2 = client.get("/master")
+            assert "£117.00" in r2.text and "£130.00" in r2.text
+
     # Fresh fakes per op below — the recording fakes don't mutate their
     # tables, so each op runs against the original PKEG1 state (as Airtable
     # would hold it before that op).

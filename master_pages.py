@@ -946,6 +946,19 @@ def render_product_page(
             '(already off the master) but keeps its history, so it can\'t be deleted.</p>'
         )
 
+    # Product-level pricing prefills: FB list from the current open rules
+    # (single figure only when consistent), retro £/keg from the Products table.
+    fbs = {
+        round(r.fb_price, 4) for r in open_rules if r.fb_price is not None
+    }
+    fb_val = f"{next(iter(fbs)):.2f}" if len(fbs) == 1 else ""
+    fb_hint = (
+        " Currently differs across sites — saving a figure here makes it uniform."
+        if len(fbs) > 1 else ""
+    )
+    retro_cur = ((getattr(snap, "products", {}) or {}).get(product_code) or {}).get("retro_per_keg") or 0.0
+    retro_val = f"{retro_cur:.2f}" if retro_cur else ""
+
     return f"""{back}
 <h1>Product settings</h1>
 <p class="sub" style="margin-bottom:1em"><strong>{escape(cur_desc or product_code)}</strong> <span style="color:#789">{escape(product_code)}</span></p>
@@ -961,6 +974,16 @@ def render_product_page(
   <label for="pp-name">Product name</label>
   <input type="text" name="new_desc" id="pp-name" value="{escape(cur_desc)}" required
          style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <label for="pp-fb">FB list price (£ per keg)</label>
+  <input type="number" step="0.01" min="0" name="new_fb" id="pp-fb" value="{escape(fb_val)}"
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">The Excel's "Price" column.{escape(fb_hint)} Changing it re-dates every current price for this
+  product from today with the new list figure — tenant prices stay as they are, so margins move.</p>
+  <label for="pp-retro">Retro P/Keg (£)</label>
+  <input type="number" step="0.01" min="0" name="new_retro" id="pp-retro" value="{escape(retro_val)}"
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">The fixed £ rebate per keg. Used by the retro reconciliation and the Net price column.
+  Blank or 0 = no retro.</p>
   <button type="submit" name="do" value="save" style="margin-top:1em">Save</button>
 </form>
 {danger}

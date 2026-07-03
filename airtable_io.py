@@ -397,8 +397,11 @@ def end_all_site_rules(site_id: str, on: date, reason: str, source: str) -> int:
     return len(to_close)
 
 
-def update_product(code: str, new_code: str, new_desc: str) -> int:
-    """Rename a product's code and/or description (Products PATCH).
+def update_product(
+    code: str, new_code: str, new_desc: str, retro_per_keg: float | None = None
+) -> int:
+    """Rename a product's code and/or description, optionally setting the
+    product-level Retro P/Keg (Products PATCH).
 
     A CODE change must also rewrite the stored ``rule_key`` on every linked
     PricingRules record: the key embeds the code as text
@@ -422,10 +425,11 @@ def update_product(code: str, new_code: str, new_desc: str) -> int:
         raise ValueError(f"product {code!r} is not in the master")
     if new_code != code and new_code in lookup:
         raise ValueError(f"product code {new_code!r} is already taken")
-    _batch(
-        [{"id": rec_id, "fields": {"product_code": new_code, "description": new_desc}}],
-        "update", T["Products"],
-    )
+    fields: dict = {"product_code": new_code, "description": new_desc}
+    if retro_per_keg is not None:
+        fields["retro_per_keg"] = float(retro_per_keg)
+        fields["retro_eligible"] = float(retro_per_keg) > 0
+    _batch([{"id": rec_id, "fields": fields}], "update", T["Products"])
     rewritten = 0
     if new_code != code:
         to_fix: list[dict] = []

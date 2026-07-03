@@ -1496,12 +1496,52 @@ async def master_product_apply(
         refresh_master_cache_async()
         return _back()
 
-    # default: save (code and/or name)
+    # default: save (code / name / product-level FB list price / retro)
     if not new_code or not new_desc:
         return _rerender(["both the product code and the name are required"])
+
+    def _opt_float(name: str) -> float | None:
+        s = (form.get(name) or "").strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    new_fb = _opt_float("new_fb")
+    new_retro = _opt_float("new_retro")
+    open_rules = [
+        r for r in snap.rules
+        if r.product_code == product_code and r.valid_to is None
+    ]
+    cur_fbs = {round(r.fb_price, 4) for r in open_rules if r.fb_price is not None}
+    cur_fb = next(iter(cur_fbs)) if len(cur_fbs) == 1 else None
+    cur_retro = (
+        (getattr(snap, "products", {}) or {}).get(product_code) or {}
+    ).get("retro_per_keg") or 0.0
+
+    fb_changed = new_fb is not None and (
+        cur_fb is None or abs(new_fb - cur_fb) > 0.005 or len(cur_fbs) > 1
+    )
+    # Retro: blank means "keep"; 0 means "no retro".
+    retro_final = new_retro if new_retro is not None else cur_retro
+    retro_changed = new_retro is not None and abs(new_retro - cur_retro) > 0.005
+    if new_fb is not None and new_fb <= 0:
+        return _rerender(["the FB list price must be positive"])
+    if new_retro is not None and new_retro < 0:
+        return _rerender(["the retro must not be negative"])
+    fb_for_net = new_fb if new_fb is not None else cur_fb
+    if fb_for_net is not None and retro_final >= fb_for_net > 0:
+        return _rerender([
+            f"retro £{retro_final:.2f}/keg is at or above the FB list price "
+            f"£{fb_for_net:.2f} — the net price would be zero or negative"
+        ])
+
     try:
         rewritten = await run_in_threadpool(
-            update_product, product_code, new_code, new_desc
+            update_product, product_code, new_code, new_desc,
+            retro_final if retro_changed else None,
         )
     except ValueError as exc:
         return _rerender([str(exc)])
@@ -1510,10 +1550,37 @@ async def master_product_apply(
         return _error_page(_GENERIC_ERR)
     logger.info("product %s -> %s (%s) by %s; %d rule keys rewritten",
                 product_code, new_code, new_desc, principal.email, rewritten)
+
+    # FB list / retro change: re-date every current tenanted price for this
+    # product from today with the new figures — tenant prices unchanged, so
+    # only the cost side (and therefore margins) moves. History kept.
+    successors: list = []
+    if fb_changed or retro_changed:
+        for r in open_rules:
+            if (r.status or "tenanted") != "tenanted":
+                continue
+            if r.valid_from is not None and r.valid_from > today:
+                continue
+            fb = new_fb if new_fb is not None else r.fb_price
+            retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
+            successors.append(Rule(
+                site_id=r.site_id, product_code=new_code, product_desc=new_desc,
+                tenant_price=r.tenant_price, fb_price=fb, retro_pct=retro_pct,
+                valid_from=today, valid_to=None, status="tenanted",
+                reason=f"product edit: list/retro updated (was fb {r.fb_price}, retro £{cur_retro:g})",
+                source=f"product-edit:{principal.email}",
+            ))
+        if successors:
+            try:
+                await run_in_threadpool(upsert_pricing_rules, successors, today)
+            except Exception:
+                logger.exception("product fb/retro rules rewrite failed")
+                return _error_page(_GENERIC_ERR)
+
     try:
         products = dict(getattr(snap, "products", {}) or {})
         info = products.pop(product_code, {}) or {}
-        products[new_code] = {**info, "desc": new_desc}
+        products[new_code] = {**info, "desc": new_desc, "retro_per_keg": retro_final}
         product_ids = dict(snap.product_ids)
         product_ids[new_code] = product_ids.pop(product_code, "pending-refresh")
         rules = [
@@ -1529,10 +1596,13 @@ async def master_product_apply(
                 rule_ids["|".join(parts)] = v
             else:
                 rule_ids[k] = v
-        publish_patched_snapshot(_dc_replace(
+        patched = _dc_replace(
             snap, products=products, product_ids=product_ids,
             rules=rules, rule_ids=rule_ids,
-        ))
+        )
+        if successors:
+            patched = patch_snapshot_for_bulk_upsert(patched, successors, today)
+        publish_patched_snapshot(patched)
     except Exception:
         logger.exception("snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
