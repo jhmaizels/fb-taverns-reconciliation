@@ -1174,6 +1174,81 @@ def test_route_site_create_end_all_delete():
             assert client.get("/master/site/new").status_code == 403
 
 
+def test_route_product_settings_rename_end_all_delete():
+    """Product settings: a code change PATCHes Products AND rewrites the
+    stored rule_key on every linked rule (else the next upload would duplicate
+    instead of supersede); end_all delists the line; delete refuses with
+    history; the patched cache shows the rename immediately."""
+    with FakeAirtable([_grid_rule("rec_old")]) as fa:
+        with FakeAuthClient("admin") as client:
+            # edit-mode product cells link to the settings page
+            r0 = client.get("/master", params={"edit": "1"})
+            assert "/master/product" in r0.text
+            r = client.get("/master/product", params={"product_code": PROD_CODE})
+            assert r.status_code == 200 and 'name="new_code"' in r.text
+
+            # rename code + name -> Products PATCH + rule_key rewrite
+            r2 = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save",
+                "new_code": "PKEG2", "new_desc": "Renamed Keg",
+            }, follow_redirects=False)
+            assert r2.status_code == 303, r2.text[:300]
+            prod_ups = [
+                recs for op, t, recs in fa.calls
+                if op == "update" and t == airtable_io.T["Products"]
+            ]
+            assert len(prod_ups) == 1 and prod_ups[0][0]["fields"] == {
+                "product_code": "PKEG2", "description": "Renamed Keg",
+            }
+            key_ups = [
+                recs for op, t, recs in fa.calls
+                if op == "update" and t == airtable_io.T["PricingRules"]
+            ]
+            assert len(key_ups) == 1 and key_ups[0][0]["fields"]["rule_key"] == (
+                f"{SITE_ID}|PKEG2|2026-01-01"
+            ), "a code change MUST rewrite the stored rule_key"
+
+            # patched cache: grid shows the new name/code immediately
+            r3 = client.get("/master")
+            assert "Renamed Keg" in r3.text and "PKEG2" in r3.text
+
+    # Fresh fakes per op below — the recording fakes don't mutate their
+    # tables, so each op runs against the original PKEG1 state (as Airtable
+    # would hold it before that op).
+    prods2 = PRODUCTS + [{"id": "rec_prod_2", "fields": {
+        "product_code": "OTHER", "description": "Other Keg"}}]
+    with FakeAirtable([_grid_rule("rec_old")], products=prods2):
+        with FakeAuthClient("admin") as client:
+            # renaming onto ANOTHER product's code is refused
+            r4 = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save",
+                "new_code": "OTHER", "new_desc": "Clash",
+            }, follow_redirects=False)
+            assert r4.status_code == 400 and "already taken" in r4.text
+
+            # delete refused while history exists
+            r5 = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "delete",
+            }, follow_redirects=False)
+            assert r5.status_code == 400 and "history" in r5.text
+
+    with FakeAirtable([_grid_rule("rec_old")]) as fa2:
+        with FakeAuthClient("admin") as client:
+            # end_all closes the open rule estate-wide
+            r6 = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "end_all",
+            }, follow_redirects=False)
+            assert r6.status_code == 303
+            ends = [u for u in _updates(fa2) if "valid_to" in u["fields"]]
+            assert any(u["id"] == "rec_old" for u in ends)
+            assert any("product removed from master" in u["fields"].get("reason", "")
+                       for u in ends)
+        with FakeAuthClient("viewer") as client:
+            assert client.get(
+                "/master/product", params={"product_code": PROD_CODE}
+            ).status_code == 403
+
+
 def test_route_upload_master_updates_grid_immediately():
     """/upload-master (whole-file replace): the prior rule is closed at the
     effective date, the file's prices land, AND the very next /master read
@@ -1286,6 +1361,7 @@ TESTS = [
     test_build_universal_increase_math,
     test_route_universal_increase_preview_apply,
     test_route_site_create_end_all_delete,
+    test_route_product_settings_rename_end_all_delete,
     test_route_upload_master_updates_grid_immediately,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,

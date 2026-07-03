@@ -397,6 +397,105 @@ def end_all_site_rules(site_id: str, on: date, reason: str, source: str) -> int:
     return len(to_close)
 
 
+def update_product(code: str, new_code: str, new_desc: str) -> int:
+    """Rename a product's code and/or description (Products PATCH).
+
+    A CODE change must also rewrite the stored ``rule_key`` on every linked
+    PricingRules record: the key embeds the code as text
+    ("site|code|valid_from"), and the upsert's close/patch pass matches on
+    that string — stale keys would make the next upload create DUPLICATE
+    rules instead of superseding the old ones. Returns how many rule keys
+    were rewritten (0 for a description-only change)."""
+    from reconcile import _to_str_code
+    code = _to_str_code(code)
+    new_code = _to_str_code(new_code)
+    new_desc = (new_desc or "").strip()
+    if not code:
+        raise ValueError("product_code is required")
+    if not new_code:
+        raise ValueError("the product code must not be empty")
+    if not new_desc:
+        raise ValueError("the product name must not be empty")
+    lookup = _product_lookup()
+    rec_id = lookup.get(code)
+    if not rec_id:
+        raise ValueError(f"product {code!r} is not in the master")
+    if new_code != code and new_code in lookup:
+        raise ValueError(f"product code {new_code!r} is already taken")
+    _batch(
+        [{"id": rec_id, "fields": {"product_code": new_code, "description": new_desc}}],
+        "update", T["Products"],
+    )
+    rewritten = 0
+    if new_code != code:
+        to_fix: list[dict] = []
+        for rec in _list_all(T["PricingRules"], fields=["product", "rule_key"]):
+            if rec_id not in (rec["fields"].get("product") or []):
+                continue
+            key = rec["fields"].get("rule_key") or ""
+            parts = key.split("|")
+            if len(parts) == 3 and parts[1] == code:
+                parts[1] = new_code
+                to_fix.append({"id": rec["id"], "fields": {"rule_key": "|".join(parts)}})
+        if to_fix:
+            _batch(to_fix, "update", T["PricingRules"])
+        rewritten = len(to_fix)
+    invalidate_master_cache()
+    return rewritten
+
+
+def delete_product(code: str) -> None:
+    """Delete a Products record — ONLY when no pricing rule references it
+    (typo cleanup). A product with rule history keeps its record; use
+    end_all_product_rules to take it off the master instead."""
+    code = (code or "").strip()
+    rec_id = _product_lookup().get(code)
+    if not rec_id:
+        raise ValueError(f"product {code!r} is not in the master")
+    for rec in _list_all(T["PricingRules"], fields=["product"]):
+        if rec_id in (rec["fields"].get("product") or []):
+            raise ValueError(
+                f"product {code!r} has pricing-rule history — it can't be deleted. "
+                "Use 'remove from master' to end its prices instead."
+            )
+    _do(
+        requests.delete, f"{DATA_URL}/{T['Products']}",
+        params={"records[]": [rec_id]}, idempotent=False,
+    )
+    invalidate_master_cache()
+
+
+def end_all_product_rules(code: str, on: date, reason: str, source: str) -> int:
+    """End every OPEN pricing rule for a product across ALL sites (delist the
+    line estate-wide). History kept. Returns the number of rules ended."""
+    code = (code or "").strip()
+    rec_id = _product_lookup().get(code)
+    if not rec_id:
+        raise ValueError(f"product {code!r} is not in the master")
+    existing = _list_all(
+        T["PricingRules"], fields=["product", "valid_from", "valid_to", "reason", "source"]
+    )
+    to_close: list[dict] = []
+    for rec in existing:
+        f = rec["fields"]
+        if rec_id not in (f.get("product") or []):
+            continue
+        if f.get("valid_to"):
+            continue
+        vf = _parse_date(f.get("valid_from"))
+        vt = on if (vf is None or vf < on) else vf + timedelta(days=1)
+        old_reason = (f.get("reason") or "").strip()
+        new_reason = f"{reason}; {old_reason}" if old_reason else reason
+        to_close.append({
+            "id": rec["id"],
+            "fields": {"valid_to": vt.isoformat(), "reason": new_reason, "source": source},
+        })
+    if to_close:
+        _batch(to_close, "update", T["PricingRules"])
+        invalidate_master_cache()
+    return len(to_close)
+
+
 def publish_patched_snapshot(snap: MasterSnapshot) -> None:
     """Install a locally-patched snapshot as the fresh cache entry.
 

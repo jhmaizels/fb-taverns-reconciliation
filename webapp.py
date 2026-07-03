@@ -69,8 +69,11 @@ from reconcile import (  # noqa: E402
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from airtable_io import (  # noqa: E402
     create_site,
+    delete_product,
     delete_site,
+    end_all_product_rules,
     end_all_site_rules,
+    update_product,
     load_master_snapshot,
     publish_patched_snapshot,
     refresh_master_cache_async,
@@ -1370,6 +1373,170 @@ async def master_site_create(
         ),
         status_code=303,
     )
+
+
+@app.get("/master/product", response_class=HTMLResponse)
+def master_product(
+    product_code: str = "",
+    fsite: str = "",
+    fq: str = "",
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Product settings (linked from the grid's edit-mode code/name cells):
+    edit code + name, end its prices everywhere, or delete an unused record."""
+    try:
+        snap = load_master_snapshot()
+        if product_code not in snap.product_ids:
+            return _master_not_found_page(principal, product_code)
+        body = master_pages.render_product_page(snap, product_code, fsite=fsite, fq=fq)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/product/apply")
+async def master_product_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Product settings ops: save (code/name rename — a code change also
+    rewrites the stored rule_keys) · end_all (delist the line estate-wide) ·
+    delete (record removal, only with NO history)."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    product_code = (form.get("product_code") or "").strip()
+    fsite = (form.get("fsite") or "").strip()
+    fq = (form.get("fq") or "").strip()
+    do = (form.get("do") or "save").strip()
+    new_code = (form.get("new_code") or "").strip()
+    new_desc = (form.get("new_desc") or "").strip()
+
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page(_GENERIC_ERR)
+    if product_code not in snap.product_ids:
+        return _master_not_found_page(principal, product_code)
+
+    def _rerender(errors: list[str]) -> HTMLResponse:
+        body = master_pages.render_product_page(
+            snap, product_code, fsite=fsite, fq=fq, errors=errors
+        )
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=400,
+        )
+
+    from dataclasses import replace as _dc_replace
+    today = date.today()
+
+    def _back() -> RedirectResponse:
+        back = [("edit", "1"), ("saved", "1")]
+        if fsite:
+            back.append(("site", fsite))
+        if fq:
+            back.append(("q", fq))
+        return RedirectResponse(
+            ext_url("/master") + "?" + urlencode(back), status_code=303
+        )
+
+    if do == "end_all":
+        try:
+            n = await run_in_threadpool(
+                end_all_product_rules, product_code, today,
+                "product removed from master",
+                f"product-remove:{principal.email}",
+            )
+        except ValueError as exc:
+            return _rerender([str(exc)])
+        except Exception:
+            logger.exception("product end_all failed")
+            return _error_page(_GENERIC_ERR)
+        logger.info("product %s removed from master by %s (%d rules ended)",
+                    product_code, principal.email, n)
+        try:
+            rules = [
+                _dc_replace(
+                    r,
+                    valid_to=(
+                        today if (r.valid_from is None or r.valid_from < today)
+                        else r.valid_from + timedelta(days=1)
+                    ),
+                )
+                if (r.product_code == product_code and r.valid_to is None) else r
+                for r in snap.rules
+            ]
+            publish_patched_snapshot(_dc_replace(snap, rules=rules))
+        except Exception:
+            logger.exception("snapshot patch failed — grid catches up on refresh")
+        refresh_master_cache_async()
+        return _back()
+
+    if do == "delete":
+        try:
+            await run_in_threadpool(delete_product, product_code)
+        except ValueError as exc:
+            return _rerender([str(exc)])
+        except Exception:
+            logger.exception("product delete failed")
+            return _error_page(_GENERIC_ERR)
+        logger.info("product %s deleted by %s", product_code, principal.email)
+        try:
+            products = {k: v for k, v in (getattr(snap, "products", {}) or {}).items()
+                        if k != product_code}
+            product_ids = {k: v for k, v in snap.product_ids.items() if k != product_code}
+            publish_patched_snapshot(
+                _dc_replace(snap, products=products, product_ids=product_ids)
+            )
+        except Exception:
+            logger.exception("snapshot patch failed — grid catches up on refresh")
+        refresh_master_cache_async()
+        return _back()
+
+    # default: save (code and/or name)
+    if not new_code or not new_desc:
+        return _rerender(["both the product code and the name are required"])
+    try:
+        rewritten = await run_in_threadpool(
+            update_product, product_code, new_code, new_desc
+        )
+    except ValueError as exc:
+        return _rerender([str(exc)])
+    except Exception:
+        logger.exception("product update failed")
+        return _error_page(_GENERIC_ERR)
+    logger.info("product %s -> %s (%s) by %s; %d rule keys rewritten",
+                product_code, new_code, new_desc, principal.email, rewritten)
+    try:
+        products = dict(getattr(snap, "products", {}) or {})
+        info = products.pop(product_code, {}) or {}
+        products[new_code] = {**info, "desc": new_desc}
+        product_ids = dict(snap.product_ids)
+        product_ids[new_code] = product_ids.pop(product_code, "pending-refresh")
+        rules = [
+            _dc_replace(r, product_code=new_code, product_desc=new_desc)
+            if r.product_code == product_code else r
+            for r in snap.rules
+        ]
+        rule_ids = {}
+        for k, v in snap.rule_ids.items():
+            parts = k.split("|")
+            if len(parts) == 3 and parts[1] == product_code:
+                parts[1] = new_code
+                rule_ids["|".join(parts)] = v
+            else:
+                rule_ids[k] = v
+        publish_patched_snapshot(_dc_replace(
+            snap, products=products, product_ids=product_ids,
+            rules=rules, rule_ids=rule_ids,
+        ))
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+    return _back()
 
 
 @app.get("/master/increase", response_class=HTMLResponse)

@@ -597,10 +597,20 @@ def render_master_pivot(
                 cask_started = True
         agg = prod_agg[p]
         price_c, retro_c, net_c = _left_cells(p, agg)
-        prod_cells = (
-            f'<td class="sticky-col c1 pcode">{escape(p)}</td>'
-            f'<td class="sticky-col c2">{escape(agg["desc"] or "")}</td>'
-        )
+        if edit:
+            # Edit mode: code/name open the product settings (rename / remove).
+            purl = ext_url("/master/product") + _qs(product_code=p, fsite=site_f, fq=q)
+            prod_cells = (
+                f'<td class="sticky-col c1 pcode"><a class="site-head" href="{purl}"'
+                f' title="Edit code / name, or remove this product">{escape(p)}</a></td>'
+                f'<td class="sticky-col c2"><a class="site-head" href="{purl}"'
+                f' title="Edit code / name, or remove this product">{escape(agg["desc"] or "")}</a></td>'
+            )
+        else:
+            prod_cells = (
+                f'<td class="sticky-col c1 pcode">{escape(p)}</td>'
+                f'<td class="sticky-col c2">{escape(agg["desc"] or "")}</td>'
+            )
         pinfo = (
             f'<td class="num pinfo">{price_c}</td>'
             f'<td class="num pinfo">{retro_c}</td>'
@@ -872,6 +882,88 @@ def render_site_new_page(errors: list[str] | None = None, site_id: str = "", nam
   site's column in edit mode — type its prices straight into the cells.</p>
   <button type="submit" style="margin-top:1em">Add site</button>
 </form>
+"""
+
+
+# ---------------------------------------------------------------------------
+# /master/product — product settings (grid edit mode)
+# ---------------------------------------------------------------------------
+
+def render_product_page(
+    snap: MasterSnapshot,
+    product_code: str,
+    fsite: str = "",
+    fq: str = "",
+    errors: list[str] | None = None,
+) -> str:
+    """Product settings: edit the code + name, and the exits — end its prices
+    everywhere (delist the line) or, with NO rule history, delete the record."""
+    descs = _product_descs(snap)
+    cur_desc = descs.get(product_code) or ""
+    back_pairs = [("edit", "1")]
+    if fsite:
+        back_pairs.append(("site", fsite))
+    if fq:
+        back_pairs.append(("q", fq))
+    back_href = ext_url("/master") + "?" + urlencode(back_pairs)
+    back = f'<p class="sub" style="margin-top:0"><a href="{back_href}">← Back to the price grid</a></p>'
+    err_html = ""
+    if errors:
+        items = "".join(f"<li>{escape(e)}</li>" for e in errors)
+        err_html = f'<div class="err" style="margin-bottom:1em"><ul style="margin:0; padding-left:1.2em">{items}</ul></div>'
+    hidden = _hidden({"product_code": product_code, "fsite": fsite, "fq": fq})
+
+    open_rules = [
+        r for r in snap.rules
+        if r.product_code == product_code and r.valid_to is None
+    ]
+    open_sites = {r.site_id for r in open_rules}
+    any_rules = any(r.product_code == product_code for r in snap.rules)
+    if open_rules:
+        danger = f"""
+<form method="post" action="{ext_url('/master/product/apply')}" style="max-width:540px; margin-top:1.5em; border-color:#caa; background:#fff8f8">
+  {hidden}
+  <h3 style="margin-top:0; color:#b00020">Remove this product from the master</h3>
+  <p class="help">Ends its <strong>{len(open_rules)}</strong> current price{"s" if len(open_rules) != 1 else ""} across
+  <strong>{len(open_sites)}</strong> site{"s" if len(open_sites) != 1 else ""} from today — the line drops off the price
+  grid and future deliveries would flag as not-on-master. History is kept; it can be re-added later.</p>
+  <button type="submit" name="do" value="end_all" style="background:#b00020"
+          onclick="return confirm('End all {len(open_rules)} current prices for this product from today?')">Remove from master</button>
+</form>"""
+    elif not any_rules:
+        danger = f"""
+<form method="post" action="{ext_url('/master/product/apply')}" style="max-width:540px; margin-top:1.5em; border-color:#caa; background:#fff8f8">
+  {hidden}
+  <h3 style="margin-top:0; color:#b00020">Delete this product</h3>
+  <p class="help">This product has no pricing history at all — deleting removes the record entirely
+  (use for a line added by mistake).</p>
+  <button type="submit" name="do" value="delete" style="background:#b00020"
+          onclick="return confirm('Delete product {escape(product_code)} entirely?')">Delete product</button>
+</form>"""
+    else:
+        danger = (
+            '<p class="help" style="margin-top:1.5em">This product has no current prices '
+            '(already off the master) but keeps its history, so it can\'t be deleted.</p>'
+        )
+
+    return f"""{back}
+<h1>Product settings</h1>
+<p class="sub" style="margin-bottom:1em"><strong>{escape(cur_desc or product_code)}</strong> <span style="color:#789">{escape(product_code)}</span></p>
+{err_html}
+<form method="post" action="{ext_url('/master/product/apply')}" style="max-width:540px">
+  {hidden}
+  <label for="pp-code">Product code</label>
+  <input type="text" name="new_code" id="pp-code" value="{escape(product_code)}" required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help"><strong>Change the code only to fix a mistake.</strong> The weekly LWC files match products
+  by this code — if LWC bills under a different code, reconciliations will flag the line as not-on-master.
+  Changing it also rewrites the code on every historical price for this product.</p>
+  <label for="pp-name">Product name</label>
+  <input type="text" name="new_desc" id="pp-name" value="{escape(cur_desc)}" required
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <button type="submit" name="do" value="save" style="margin-top:1em">Save</button>
+</form>
+{danger}
 """
 
 
