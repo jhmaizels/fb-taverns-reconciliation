@@ -55,8 +55,38 @@ def _gather_state(as_of: date | None = None):
 
 
 def build_master_xlsx_bytes(as_of: date | None = None) -> bytes:
+    """Fresh-sweep build (three full Airtable reads, ~30s at estate scale).
+    NOT for request paths behind the hub proxy (~30s timeout) — the
+    /export-master route uses build_master_xlsx_bytes_from_snapshot."""
     active_rules, sites, products_by_code = _gather_state(as_of)
+    return _build_xlsx(active_rules, sites, products_by_code, as_of)
 
+
+def build_master_xlsx_bytes_from_snapshot(snap, as_of: date | None = None) -> bytes:
+    """Build from an already-loaded MasterSnapshot — sub-second, so the
+    download works through the hub proxy. The snapshot is SWR-cached (≤60s
+    stale at worst) and every grid edit re-publishes it patched, so the
+    export always reflects the online master's current state."""
+    if as_of is None:
+        active_rules = [r for r in snap.rules if r.valid_to is None]
+    else:
+        active_rules = [
+            r for r in snap.rules
+            if (r.valid_from or date.min) <= as_of
+            and (r.valid_to is None or r.valid_to > as_of)
+        ]
+    products_by_code = {
+        code: {
+            "name": (info.get("desc") or ""),
+            "retro_per_keg": float(info.get("retro_per_keg") or 0.0),
+            "supplier": "",
+        }
+        for code, info in (getattr(snap, "products", {}) or {}).items()
+    }
+    return _build_xlsx(active_rules, snap.sites, products_by_code, as_of)
+
+
+def _build_xlsx(active_rules, sites, products_by_code, as_of: date | None) -> bytes:
     # site_ids: any site that currently has an active rule, sorted ascending
     site_ids = sorted({r.site_id for r in active_rules})
     site_name = lambda sid: (sites.get(sid) or {}).get("name", "") or sid

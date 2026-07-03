@@ -785,10 +785,13 @@ def upload_retro(
 
 @app.get("/export-master")
 def export_master(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
-    """Download the current Airtable master as a wide-form Excel."""
-    from master_export import build_master_xlsx_bytes  # lazy: keeps openpyxl off the boot path
+    """Download the current online master as a wide-form Excel. Built from
+    the cached snapshot (sub-second) — the previous fresh-sweep build took
+    ~30s+ and timed out the hub proxy as a bare Internal Server Error."""
+    from master_export import build_master_xlsx_bytes_from_snapshot  # lazy: keeps openpyxl off the boot path
     try:
-        data = build_master_xlsx_bytes()
+        snap = load_master_snapshot()
+        data = build_master_xlsx_bytes_from_snapshot(snap)
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")

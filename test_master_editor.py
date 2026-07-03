@@ -1326,6 +1326,30 @@ def test_route_upload_master_updates_grid_immediately():
             assert "£130.00" in r2.text and "£13.00" in r2.text and "£117.00" in r2.text
 
 
+def test_route_export_master_from_snapshot():
+    """/export-master builds from the CACHED snapshot (sub-second — the old
+    fresh-sweep build timed out the hub proxy) and the workbook carries the
+    current prices in the cost-file layout."""
+    from io import BytesIO
+    from openpyxl import load_workbook
+
+    rec = _grid_rule("rec_open")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]):
+        with FakeAuthClient("viewer") as client:   # download is viewer-level
+            r = client.get("/export-master")
+            assert r.status_code == 200, r.text[:300]
+            assert "spreadsheetml" in r.headers["content-type"]
+            wb = load_workbook(BytesIO(r.content))
+            ws = wb.active
+            headers = [c.value for c in ws[2]]
+            assert headers[:5] == ["Product Code", "Product Name", "Price",
+                                   "Retro P/Keg", "Net price"]
+            assert any(SITE_ID in str(h) for h in headers[5:]), headers
+            row = [c.value for c in ws[3]]
+            assert row[0] == PROD_CODE and row[2] == 120.0 and row[5] == 180.0
+
+
 def test_route_apply_revalidates_tampered_hidden_inputs():
     """/master/apply must re-validate server-side: a tampered/stale hidden
     form (key collision for op=price_change) is refused with nothing written."""
@@ -1397,6 +1421,7 @@ TESTS = [
     test_route_site_create_end_all_delete,
     test_route_product_settings_rename_end_all_delete,
     test_route_upload_master_updates_grid_immediately,
+    test_route_export_master_from_snapshot,
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cross_origin_post_rejected,
 ]
