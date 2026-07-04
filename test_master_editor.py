@@ -852,6 +852,28 @@ def _grid_rule(rec_id: str = "rec_open", vf: str = "2026-01-01") -> dict:
     return rec
 
 
+def test_mismatch_writer_is_idempotent_on_reupload():
+    """Re-uploading the same supplier file (deduped by content hash -> same
+    deterministic mismatch_keys) must NOT duplicate mismatch rows — the fix for
+    a bookkeeper re-uploading after a proxy timeout."""
+    def payload():
+        return [
+            {"fields": {"mismatch_key": "fileA|0001|001|PKEG1|INV1|wrong_price", "type": "x", "status": "open"}},
+            {"fields": {"mismatch_key": "fileA|0002|001|PKEG2|INV2|wrong_price", "type": "y", "status": "open"}},
+        ]
+    with FakeAirtable([]) as fa:
+        fa.tables[airtable_io.T["Mismatches"]] = []  # empty findings table
+        n1 = airtable_io._create_mismatches_deduped(payload())
+        n2 = airtable_io._create_mismatches_deduped(payload())  # re-upload
+    assert n1 == 2, "first upload writes both findings"
+    assert n2 == 0, "re-upload of the same file writes nothing (no duplicates)"
+    creates = [
+        r for op, t, recs in fa.calls
+        if op == "create" and t == airtable_io.T["Mismatches"] for r in recs
+    ]
+    assert len(creates) == 2, "only the first upload's two rows were ever created"
+
+
 def test_set_product_retro_updates_product_and_reflows_rules():
     """Retro is product-level (operator decision): set_product_retro PATCHes
     Products.retro_per_keg AND reflows every current tenanted rule with
@@ -1433,6 +1455,7 @@ TESTS = [
     test_preview_close_pass_skips_bounded_support_and_future_rule,
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
     test_compute_margin_math,
+    test_mismatch_writer_is_idempotent_on_reupload,
     test_set_product_retro_updates_product_and_reflows_rules,
     test_render_master_pivot_shape_and_winner,
     test_render_master_pivot_cask_section_and_edit_mode,

@@ -1091,6 +1091,28 @@ def get_tennents_master_info() -> dict:
     }
 
 
+def _create_mismatches_deduped(payload: list[dict]) -> int:
+    """Create Mismatches rows, skipping any mismatch_key already present.
+
+    Every finding-writer builds a DETERMINISTIC mismatch_key and the Files row
+    is deduped by content hash, so re-uploading the same file (the natural user
+    response to a hub-proxy timeout) yields identical keys. Skipping existing
+    keys makes re-upload idempotent — no duplicated rows — and preserves the
+    status of any finding already resolved (it isn't recreated as 'open')."""
+    table_id = T["Mismatches"]
+    if not payload:
+        return 0
+    existing_keys = {
+        rec["fields"].get("mismatch_key")
+        for rec in _list_all(table_id, fields=["mismatch_key"])
+        if rec["fields"].get("mismatch_key")
+    }
+    fresh = [p for p in payload if p["fields"].get("mismatch_key") not in existing_keys]
+    if not fresh:
+        return 0
+    return len(_batch(fresh, "create", table_id))
+
+
 def write_tennents_findings(summary, file_record_id: str) -> int:
     """Persist Tennents reconciliation findings to the Mismatches table."""
     table_id = T["Mismatches"]
@@ -1174,9 +1196,7 @@ def write_tennents_findings(summary, file_record_id: str) -> int:
             "notes": f"Tennents new customer {acct} {name} — needs master entries built.",
         }})
 
-    if not payload:
-        return 0
-    return len(_batch(payload, "create", table_id))
+    return _create_mismatches_deduped(payload)
 
 
 def write_retro_findings(retro_summary, file_record_id: str) -> int:
@@ -1245,9 +1265,7 @@ def write_retro_findings(retro_summary, file_record_id: str) -> int:
             fields["product"] = [product_ids[r.product_code]]
         payload.append({"fields": fields})
 
-    if not payload:
-        return 0
-    return len(_batch(payload, "create", table_id))
+    return _create_mismatches_deduped(payload)
 
 
 def write_mismatches(
@@ -1308,5 +1326,4 @@ def write_mismatches(
         fields = {k: v for k, v in fields.items() if v is not None}
         payload.append({"fields": fields})
 
-    created = _batch(payload, "create", table_id)
-    return len(created)
+    return _create_mismatches_deduped(payload)
