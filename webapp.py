@@ -2011,6 +2011,30 @@ async def master_apply(
         invalidate_master_cache()
         refresh_master_cache_async()
         return _error_page(master_pages.render_apply_failure(change, preview))
+    # Retro is product-level (operator decision 2026-07-04): a per-row retro
+    # edit propagates UP — set Products.retro_per_keg (which the retro
+    # reconciliation + export read) and reflow every site's net price — so the
+    # grid and the reconciliation can never disagree. Only when the retro was
+    # explicitly provided AND actually changes the product £/keg. Best-effort:
+    # a reflow failure must not fail the (already-committed) rule edit.
+    try:
+        if change.op in ("price_change", "fix_in_place", "add_rule") and change.retro_pct is not None:
+            fb = change.fb_price
+            if fb is None:
+                w = master_pages.pivot_winner_for(snap, change.site_id, change.product_code)
+                fb = w.fb_price if w else None
+            if fb:
+                new_retro_gbp = round(change.retro_pct * fb, 2)
+                cur = (getattr(snap, "products", {}) or {}).get(change.product_code) or {}
+                if abs(new_retro_gbp - float(cur.get("retro_per_keg") or 0.0)) > 0.005:
+                    from airtable_io import set_product_retro  # noqa: E402
+                    await run_in_threadpool(
+                        set_product_retro, change.product_code, new_retro_gbp,
+                        date.today(), f"retro-propagate:{principal.email}",
+                    )
+    except Exception:
+        logger.exception("retro propagation failed — product-level retro may be stale")
+
     # §3.4: result page renders from in-hand data only; kick the background
     # snapshot rebuild so "Back to master" doesn't eat the 30s inline fetch.
     refresh_master_cache_async()

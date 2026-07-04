@@ -852,6 +852,36 @@ def _grid_rule(rec_id: str = "rec_open", vf: str = "2026-01-01") -> dict:
     return rec
 
 
+def test_set_product_retro_updates_product_and_reflows_rules():
+    """Retro is product-level (operator decision): set_product_retro PATCHes
+    Products.retro_per_keg AND reflows every current tenanted rule with
+    retro_pct = retro£ / that rule's fb, tenant prices unchanged."""
+    from datetime import date as _date
+    rec = _grid_rule("rec_old", vf="2026-01-01")
+    rec["fields"]["fb_price"] = 120.0   # retro £15 -> retro_pct 0.125
+    with FakeAirtable([rec]) as fa:
+        n = airtable_io.set_product_retro(PROD_CODE, 15.0, _date(2026, 7, 4), "test")
+    assert n == 1
+    # Products PATCH carries the £ figure + eligibility
+    prod_ups = [
+        recs for op, t, recs in fa.calls
+        if op == "update" and t == airtable_io.T["Products"]
+    ]
+    assert prod_ups and prod_ups[0][0]["fields"]["retro_per_keg"] == 15.0
+    assert prod_ups[0][0]["fields"]["retro_eligible"] is True
+    # a successor rule reflowed from today with retro_pct = 15/120 = 0.125,
+    # tenant price unchanged
+    created = [
+        r for op, t, recs in fa.calls if op == "create" and t == airtable_io.T["PricingRules"]
+        for r in recs
+    ]
+    assert len(created) == 1
+    f = created[0]["fields"]
+    assert f["tenant_price"] == 180.0
+    assert abs(f["retro_pct"] - 0.125) < 1e-9
+    assert f["valid_from"] == "2026-07-04"
+
+
 def test_route_grid_viewer_ok_edit_admin_only():
     """Viewer can GET /master (no edit links); mutating pages are admin-gated;
     admin sees the links and the edit page renders both forms."""
@@ -1403,6 +1433,7 @@ TESTS = [
     test_preview_close_pass_skips_bounded_support_and_future_rule,
     test_backdated_price_change_behind_standing_open_rule_warns_with_window,
     test_compute_margin_math,
+    test_set_product_retro_updates_product_and_reflows_rules,
     test_render_master_pivot_shape_and_winner,
     test_render_master_pivot_cask_section_and_edit_mode,
     test_master_banner_escapes_source_filename,

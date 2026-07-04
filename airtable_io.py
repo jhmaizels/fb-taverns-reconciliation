@@ -448,6 +448,51 @@ def update_product(
     return rewritten
 
 
+def set_product_retro(
+    code: str, retro_per_keg: float, effective: date, source: str
+) -> int:
+    """Set a product's retro (£/keg) at the product level AND reflow every
+    current tenanted price so their net prices reflect it — the "retro is
+    product-level" model (operator decision 2026-07-04): a retro edit anywhere
+    updates Products.retro_per_keg (which the retro reconciliation + export
+    read) and re-dates every site's rule from ``effective`` with
+    retro_pct = retro£/that rule's fb (preserving the £ across differing list
+    prices), tenant prices unchanged. Returns the number of prices reflowed.
+
+    Rides upsert_pricing_rules (create-before-close), so it's crash-safe and a
+    re-run converges. Idempotent for a rule already dated on ``effective``
+    (same rule_key -> update-in-place)."""
+    from reconcile import _to_str_code
+    code = _to_str_code(code)
+    retro = float(retro_per_keg or 0.0)
+    rec_id = _product_lookup().get(code)
+    if not rec_id:
+        raise ValueError(f"product {code!r} is not in the master")
+    _batch(
+        [{"id": rec_id, "fields": {"retro_per_keg": retro, "retro_eligible": retro > 0}}],
+        "update", T["Products"],
+    )
+    successors: list[Rule] = []
+    for r in load_rules_from_airtable():
+        if r.product_code != code or r.valid_to is not None:
+            continue
+        if (r.status or "tenanted") != "tenanted":
+            continue
+        if r.valid_from is not None and r.valid_from > effective:
+            continue
+        new_retro_pct = (retro / r.fb_price) if (r.fb_price and retro) else 0.0
+        successors.append(Rule(
+            site_id=r.site_id, product_code=code, product_desc=r.product_desc,
+            tenant_price=r.tenant_price, fb_price=r.fb_price, retro_pct=new_retro_pct,
+            valid_from=effective, valid_to=None, status="tenanted",
+            reason=f"retro set to £{retro:g}/keg (product-level)", source=source,
+        ))
+    if successors:
+        upsert_pricing_rules(successors, effective)
+    invalidate_master_cache()
+    return len(successors)
+
+
 def delete_product(code: str) -> None:
     """Delete a Products record — ONLY when no pricing rule references it
     (typo cleanup). A product with rule history keeps its record; use
