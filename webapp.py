@@ -289,6 +289,8 @@ async def _auth_http_exception_handler(request: Request, exc: StarletteHTTPExcep
 HEAD_STYLE = """<!doctype html>
 <html><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23324556'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='sans-serif'%3EF%3C/text%3E%3C/svg%3E">
 <title>FB Taverns — Drinks Reconciliation</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #222; }

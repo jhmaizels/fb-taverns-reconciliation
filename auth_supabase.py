@@ -452,13 +452,20 @@ def require_drinks_role(minimum: str = "viewer"):
         if request.cookies.get(COOKIE_AT) or request.cookies.get(COOKIE_RT):
             request.state.drinks_clear_cookies = True
 
-        if request.method == "GET":
-            # No drinks session AND no hub session → the single sign-in lives at
-            # the HUB. Send them to the team-hub root to sign in there; drinks has
-            # no login of its own now (it trusts the hub session — see
-            # _hub_access_token). Relative "/" so the Render proxy's internal host
-            # isn't leaked, and standalone (no hub) falls back to its own login.
-            target = "/" if EXTERNAL_BASE_PATH else f"{ext_url('/login')}"
+        # No drinks session AND no hub session → the single sign-in lives at
+        # the HUB. Send them to the team-hub root to sign in there; drinks has
+        # no login of its own now (it trusts the hub session — see
+        # _hub_access_token). Relative "/" so the Render proxy's internal host
+        # isn't leaked, and standalone (no hub) falls back to its own login.
+        # A browser form POST on a stale/expired session (every drinks mutation
+        # is a browser form) should also land on sign-in — a raw JSON 401 is a
+        # dead end for a non-technical user. The 303 turns the POST into a GET
+        # of the sign-in page; the unsaved submit is lost, but the session is
+        # dead so it couldn't be processed anyway. JSON/XHR callers (Accept
+        # without text/html) still get the 401.
+        target = "/" if EXTERNAL_BASE_PATH else f"{ext_url('/login')}"
+        accepts_html = "text/html" in (request.headers.get("accept") or "")
+        if request.method == "GET" or accepts_html:
             raise _RedirectException(target)
         raise HTTPException(status_code=401, detail="Not authenticated")
 
