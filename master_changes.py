@@ -768,6 +768,7 @@ def build_universal_increase(
     skipped_support = 0
     skipped_future = 0
     skipped_no_price = 0
+    skipped_already_at_date = 0
     examples: list[dict] = []
     sites_seen: set = set()
     products_seen: set = set()
@@ -780,6 +781,17 @@ def build_universal_increase(
             continue
         if r.valid_from is not None and r.valid_from > effective:
             skipped_future += 1
+            continue
+        if r.valid_from is not None and r.valid_from == effective:
+            # Already dated ON the effective date: either a successor this run
+            # already created (a prior run that timed out part-way), or a
+            # same-day manual edit. Re-increasing it would COMPOUND the uplift,
+            # and its rule_key already equals the successor's — so skip it. This
+            # is what makes the apply idempotent and safe to re-run after a
+            # partial/timed-out apply (write order below is create-then-close,
+            # so a crash never drops a price — the successor already shadows the
+            # still-open original, and a re-run finishes the close pass).
+            skipped_already_at_date += 1
             continue
         if r.tenant_price is None:
             skipped_no_price += 1
@@ -831,7 +843,9 @@ def build_universal_increase(
             (r for r in snap.rules
              if r.valid_to is None and (r.status or "tenanted") == "tenanted"
              and r.tenant_price is not None
-             and (r.valid_from is None or r.valid_from <= effective)),
+             # strictly BEFORE the effective date — the exact set that will be
+             # rewritten (rules already at the effective date are skipped above)
+             and (r.valid_from is None or r.valid_from < effective)),
             key=lambda r: (r.site_id, r.product_code, _date_iso(r.valid_from)),
         )
     )
@@ -846,6 +860,7 @@ def build_universal_increase(
         "skipped_support": skipped_support,
         "skipped_future": skipped_future,
         "skipped_no_price": skipped_no_price,
+        "skipped_already_at_date": skipped_already_at_date,
         "examples": examples,
         "checksum": checksum,
     }

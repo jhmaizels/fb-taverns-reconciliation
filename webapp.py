@@ -1727,12 +1727,13 @@ async def master_increase_apply(
     try:
         snap = await run_in_threadpool(load_master_snapshot)
         new_rules, stats = build_universal_increase(snap, pct, vf, principal.email)
-        if not new_rules:
-            return _error_page("<p>No current prices match — nothing to apply.</p>")
-        # Idempotence guard: refuse if the affected prices are not the ones the
-        # operator previewed — catches a DOUBLE SUBMIT of Apply (the first run
-        # already moved every price, so a second would compound the increase)
-        # and any concurrent edit between preview and apply.
+        # Idempotence guard FIRST: refuse if the affected prices are not the ones
+        # the operator previewed — catches a DOUBLE SUBMIT of Apply (the first
+        # run already moved every price, so a second would compound the increase)
+        # and any concurrent edit between preview and apply. Checked before the
+        # empty-set check so a double submit gets the clear "already applied"
+        # message (a re-run's new_rules is empty because the successors are now
+        # dated on the effective date and skipped).
         if (form.get("state") or "") != stats["checksum"]:
             return _error_page(
                 "<p>The master's prices have changed since this preview — most "
@@ -1741,6 +1742,8 @@ async def master_increase_apply(
                 "<p><strong>Nothing was written.</strong> Check the grid, and re-run "
                 "the preview if an increase is still needed.</p>"
             )
+        if not new_rules:
+            return _error_page("<p>No current prices match — nothing to apply.</p>")
         created, updated, closed = await run_in_threadpool(
             upsert_pricing_rules, new_rules, vf
         )

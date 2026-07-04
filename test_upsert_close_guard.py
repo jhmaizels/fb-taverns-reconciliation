@@ -190,11 +190,65 @@ def test_open_rule_without_valid_from_is_still_closed():
     assert closed == 1, f"expected 1 closed, got {closed}"
 
 
+def test_successors_are_created_before_originals_are_closed():
+    """Crash-safety (pre-launch assessment): the create/update pass must run
+    BEFORE the close pass, so a process killed mid-apply never leaves a
+    (site, product) with its original closed and no successor."""
+    existing = [
+        _pr_record("rec_old", "001|PKEG1|2026-01-01", valid_from="2026-01-01")
+    ]
+    (_c, _u, closed), calls = _run_upsert(
+        existing, [_new_rule(date(2026, 6, 1))], date(2026, 6, 1)
+    )
+    pricing = airtable_io.T["PricingRules"]
+    ops = [op for op, t, _ in calls if t == pricing]
+    first_create = ops.index("create") if "create" in ops else 10**9
+    # the close pass is the update whose only field is valid_to
+    close_idx = next(
+        (i for i, (op, t, recs) in enumerate(calls)
+         if t == pricing and op == "update"
+         and all(set(r.get("fields", {}).keys()) == {"valid_to"} for r in recs)),
+        -1,
+    )
+    assert first_create < close_idx, (
+        f"successors must be created before originals are closed "
+        f"(create at {first_create}, close at {close_idx})"
+    )
+    assert closed == 1
+
+
+def test_reapplied_increase_does_not_compound():
+    """Idempotence: after an increase runs, re-running (e.g. after a partial /
+    timed-out apply) must NOT increase again the successors it already made."""
+    from datetime import date as _date
+    from reconcile import Rule
+    from airtable_io import MasterSnapshot
+    from master_changes import build_universal_increase
+
+    eff = _date(2026, 7, 4)
+    # A successor from a prior run: open, tenanted, valid_from == effective.
+    already = Rule(
+        site_id="001", product_code="PKEG1", product_desc="Keg",
+        tenant_price=207.0, fb_price=124.2, retro_pct=0.0,
+        valid_from=eff, valid_to=None, status="tenanted",
+        reason="annual increase +3.5% (was 200.0)", source="increase:me",
+    )
+    snap = MasterSnapshot(
+        sites={"001": {"name": "T"}}, rules=[already], site_ids={"001": "r"},
+        product_ids={"PKEG1": "p"}, rule_ids={}, banner_info={},
+    )
+    new_rules, stats = build_universal_increase(snap, 3.5, eff, "me")
+    assert new_rules == [], "a price already dated on the effective date must not be re-increased"
+    assert stats["skipped_already_at_date"] == 1
+
+
 TESTS = [
     test_future_dated_rule_is_not_closed,
     test_earlier_dated_rule_is_closed,
     test_same_rule_key_reupload_is_not_closed,
     test_open_rule_without_valid_from_is_still_closed,
+    test_successors_are_created_before_originals_are_closed,
+    test_reapplied_increase_does_not_compound,
 ]
 
 

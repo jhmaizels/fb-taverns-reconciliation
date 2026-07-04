@@ -726,14 +726,19 @@ def upsert_pricing_rules(
         _rule_key(r.site_id, r.product_code, r.valid_from) for r in rules
     }
 
-    closed = 0
+    # Compute the close set now, but DON'T write it yet — the successors are
+    # created first (below). Ordering (create/update successors, THEN close the
+    # originals) is a crash-safety guarantee for the bulk paths (annual
+    # increase, whole-file /upload-master): if the process is killed part-way
+    # (e.g. the 30s hub-proxy timeout), no (site, product) is ever left with the
+    # original closed and no successor — the successor's valid_from == the close
+    # date, so it wins the reconciler's newest-valid_from selection and prices
+    # keep billing. A re-run then finishes the close pass idempotently (the
+    # successor rule_key already exists → update-in-place, not a duplicate).
+    existing_open: list[dict] = []
     if close_keys_at_date:
-        # Reverse maps so each existing open rule's links resolve in O(1) rather
-        # than scanning site_ids / product_ids per rule (was O(existing x sites)
-        # + O(existing x products)). Behaviour is otherwise unchanged.
         id_to_site = {v: k for k, v in site_ids.items()}
         id_to_code = {v: k for k, v in product_ids.items()}
-        existing_open: list[dict] = []
         for rec in existing:
             f = rec["fields"]
             if f.get("valid_to"):
@@ -754,9 +759,6 @@ def upsert_pricing_rules(
             code = id_to_code.get(product_link)
             if sid and code and (sid, code) in keys_in_new:
                 existing_open.append({"id": rec["id"], "fields": {"valid_to": close_keys_at_date.isoformat()}})
-        if existing_open:
-            _batch(existing_open, "update", table_id)
-            closed = len(existing_open)
 
     to_create, to_update = [], []
     for r in rules:
@@ -783,8 +785,14 @@ def upsert_pricing_rules(
         else:
             to_create.append({"fields": fields})
 
+    # 1) create + update the successors FIRST (never leaves a price dropped),
     created = len(_batch(to_create, "create", table_id)) if to_create else 0
     updated = len(_batch(to_update, "update", table_id)) if to_update else 0
+    # 2) THEN close the superseded originals.
+    closed = 0
+    if existing_open:
+        _batch(existing_open, "update", table_id)
+        closed = len(existing_open)
     invalidate_master_cache()
     return created, updated, closed
 

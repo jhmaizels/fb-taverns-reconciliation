@@ -1060,6 +1060,11 @@ def render_increase_preview_page(pct: float, vf: date, stats: dict, warnings: li
         skipped_bits.append(f'{stats["skipped_future"]} future-dated rule(s) left alone')
     if stats.get("skipped_no_price"):
         skipped_bits.append(f'{stats["skipped_no_price"]} rule(s) without a tenant price skipped')
+    if stats.get("skipped_already_at_date"):
+        skipped_bits.append(
+            f'{stats["skipped_already_at_date"]} price(s) already dated on the effective date '
+            "left alone (already increased, or a same-day edit)"
+        )
     skipped = f'<p class="help">{escape(" · ".join(skipped_bits))}</p>' if skipped_bits else ""
     hidden = _hidden({
         "pct": repr(pct), "valid_from": vf.isoformat(), "confirm": "1",
