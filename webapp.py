@@ -201,10 +201,48 @@ async def _timing_middleware(request, call_next):
     # /version (json) keep their own semantics.
     if response.headers.get("content-type", "").startswith("text/html"):
         response.headers["Cache-Control"] = "no-store"
+    # Baseline security response headers (pre-launch assessment). The app is
+    # served inside the hub via a same-origin rewrite (not an iframe), so
+    # frame-ancestors 'none' is safe and blocks clickjacking; nosniff stops
+    # content-type confusion; Referrer-Policy avoids leaking the (tokenless)
+    # URLs. No broad CSP: the pages use small inline <script>/<style> the CSP
+    # would have to allowlist — deferred to avoid breaking them at launch.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
     elapsed_ms = (time.perf_counter() - start) * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
     logger.info("%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed_ms)
     return response
+
+
+# Uploads are all small supplier/cost .xlsx files (a few MB); an xlsx is a
+# zip, so cap the bytes we buffer into openpyxl to refuse an accidental huge
+# or zip-bomb file before it can OOM the shared /drinks process (this service
+# has an OOM/restart history). Pre-launch assessment P2.
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+def _read_upload_capped(file: "UploadFile", cap: int = MAX_UPLOAD_BYTES) -> bytes:
+    """Read an UploadFile fully but refuse anything over `cap` bytes, reading
+    in chunks so an oversize file is rejected without buffering all of it."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = file.file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise _UploadTooLarge(
+                f"file is over {cap // (1024 * 1024)} MB — a supplier/cost file is only a few MB"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.exception_handler(Exception)
@@ -685,7 +723,7 @@ def upload(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file.file.read())
+            tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
 
         # One coherent master read (Sites/Products/PricingRules fetched once),
@@ -750,7 +788,7 @@ def upload_retro(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file.file.read())
+            tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
 
         master = load_agreed_retros()
@@ -829,7 +867,7 @@ def upload_master(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file.file.read())
+            tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
 
         # Push directly to Airtable WITHOUT writing to local CSV — the deployed
@@ -2048,7 +2086,7 @@ def upload_tennents_master(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file.file.read())
+            tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
         agreements = parse_tennents_master(tmp_path)
         if not agreements:
@@ -2095,7 +2133,7 @@ def upload_tennents(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file.file.read())
+            tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
 
         agreements = load_tennents_agreements()

@@ -17,12 +17,10 @@ Design decisions (operator-confirmed — build to these EXACTLY):
       needed. The uid comes from validating the token first; the query filters
       by that same uid so the self-read returns exactly their row.
 
-  D2  CUTOVER = DUAL-MODE WINDOW. Legacy HTTP Basic keeps working as a
-      time-boxed fallback, gated by env flag LEGACY_BASIC_FALLBACK (truthy)
-      AND the continued presence of WEB_PASSWORD. A request with NO valid
-      Supabase session but valid Basic creds (and fallback enabled) is allowed
-      as admin-equivalent. The app MUST NOT fail closed (503) when WEB_PASSWORD
-      is absent once Supabase auth is primary.
+  D2  CUTOVER COMPLETE (2026-07-04). The legacy HTTP Basic dual-mode fallback
+      has been REMOVED (pre-launch assessment P0: one shared password granted
+      admin-equivalent, bypassing per-user roles). Auth is solely the hub's
+      Supabase session; no Supabase session => not authorised.
 
 Role mapping = three-tier by blast radius. ROLE_RANK = viewer:1, editor:2,
 admin:3. See the integration contract for the route->minimum-role table.
@@ -38,7 +36,6 @@ import base64
 import json
 import logging
 import os
-import secrets
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from urllib.parse import quote
@@ -84,20 +81,11 @@ TENANCY_ADMIN_URL = (
     or "https://tenancy-master.onrender.com/admin"
 )
 
-# Legacy HTTP Basic — dual-mode fallback ONLY (D2). Removed at cutover.
-WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
-WEB_PASSWORD = os.environ.get("WEB_PASSWORD")
-
-
-def _env_truthy(name: str) -> bool:
-    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def legacy_basic_enabled() -> bool:
-    """Dual-mode fallback is live only when the flag is truthy AND a password
-    is still configured. Read live (not cached) so the operator can flip the
-    flag / drop WEB_PASSWORD without a code change at cutover."""
-    return _env_truthy("LEGACY_BASIC_FALLBACK") and bool(os.environ.get("WEB_PASSWORD"))
+# Legacy HTTP Basic dual-mode fallback REMOVED at cutover (2026-07-04,
+# pre-launch assessment P0): the single-shared-password path granted full
+# drinks-admin, bypassing the per-user Supabase role model. Auth is now
+# solely via the hub's Supabase session. WEB_USERNAME/WEB_PASSWORD/
+# LEGACY_BASIC_FALLBACK are no longer read; delete them from the Render env.
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +152,9 @@ def role_at_least(role: Optional[str], minimum: str) -> bool:
 # ---------------------------------------------------------------------------
 @dataclass
 class DrinksPrincipal:
-    email: str          # signed-in email (or the Basic username in legacy mode)
+    email: str          # signed-in email
     role: str           # one of viewer/editor/admin
-    user_id: Optional[str] = None   # Supabase uid; None for legacy Basic
-    legacy: bool = False            # True => authed via HTTP Basic fallback
+    user_id: Optional[str] = None   # Supabase uid
 
     @property
     def is_admin(self) -> bool:
@@ -293,29 +280,6 @@ def get_drinks_role(user_id: str, access_token: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Legacy HTTP Basic credential check (dual-mode fallback only)
-# ---------------------------------------------------------------------------
-def _basic_creds_valid(request: Request) -> bool:
-    """Return True iff the request carries a valid HTTP Basic Authorization
-    header matching WEB_USERNAME/WEB_PASSWORD. Caller must already have checked
-    legacy_basic_enabled(). Constant-time comparison. Never raises."""
-    header = request.headers.get("authorization") or ""
-    if not header.lower().startswith("basic "):
-        return False
-    try:
-        decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
-    except Exception:
-        return False
-    username, _, password = decoded.partition(":")
-    pw_env = os.environ.get("WEB_PASSWORD") or ""
-    if not pw_env:
-        return False
-    ok_user = secrets.compare_digest(username.encode(), WEB_USERNAME.encode())
-    ok_pass = secrets.compare_digest(password.encode(), pw_env.encode())
-    return bool(ok_user and ok_pass)
-
-
-# ---------------------------------------------------------------------------
 # SINGLE SIGN-ON: trust the hub's Supabase session.
 #
 # Under the tenancy-master proxy this app is same-origin with the hub, so the
@@ -413,7 +377,6 @@ def _resolve_supabase(request: Request) -> Tuple[Optional[DrinksPrincipal], Opti
         email=user.get("email") or "",
         role=role or "",
         user_id=user["id"],
-        legacy=False,
     )
     # role may be "" (no drinks row) — caller distinguishes "authed but no
     # access" from "below minimum".
@@ -481,15 +444,8 @@ def require_drinks_role(minimum: str = "viewer"):
                 raise HTTPException(status_code=403, detail=FORBIDDEN_DETAIL)
             return principal
 
-        # No Supabase session — dual-mode legacy Basic fallback (D2).
-        if legacy_basic_enabled() and _basic_creds_valid(request):
-            legacy_principal = DrinksPrincipal(
-                email=WEB_USERNAME, role="admin", user_id=None, legacy=True,
-            )
-            request.state.drinks = legacy_principal
-            return legacy_principal
-
-        # Not authorised. If the request carried (now-stale) session cookies,
+        # No Supabase session → not authorised (the legacy Basic fallback was
+        # removed at cutover). If the request carried (now-stale) session cookies,
         # stage them for clearing so a dead/expired session doesn't trigger a
         # wasteful validate+refresh round-trip on every subsequent request. The
         # middleware clears them on the redirect (GET) / 401 (POST) response.
@@ -504,11 +460,7 @@ def require_drinks_role(minimum: str = "viewer"):
             # isn't leaked, and standalone (no hub) falls back to its own login.
             target = "/" if EXTERNAL_BASE_PATH else f"{ext_url('/login')}"
             raise _RedirectException(target)
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Basic"} if legacy_basic_enabled() else None,
-        )
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     return _dependency
 
