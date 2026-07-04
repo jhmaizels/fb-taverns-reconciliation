@@ -148,17 +148,30 @@ if not logger.handlers:
     logger.propagate = False
 
 
+import threading
+
+# Set once the boot master-cache warm-up SUCCEEDS. /healthz stays 503 until
+# then (or a deadline) so Render's zero-downtime cutover waits for a WARM
+# instance — otherwise the first /master hit on the new instance eats the ~30s
+# inline rebuild and times out the hub proxy (the whole point of the warm-up).
+_master_cache_ready = threading.Event()
+# ...but never block a deploy forever on a persistent Airtable outage: after
+# this many seconds /healthz reports ready regardless (accepting a possibly
+# cold first hit over a stuck deploy).
+_READINESS_DEADLINE_S = 60
+
+
 @app.on_event("startup")
 def _warm_master_cache() -> None:
     """Build the master snapshot in the background at boot so the FIRST page
     request after a deploy/restart doesn't do the ~30s inline Airtable rebuild
     (which times out the tenancy-hub proxy → bare 500). Post-boot expiries are
     handled by stale-while-revalidate in load_master_snapshot."""
-    import threading
 
     def _warm() -> None:
         try:
             load_master_snapshot()
+            _master_cache_ready.set()
             logger.info("master-cache warm-up complete")
         except Exception:
             logger.warning("master-cache warm-up failed", exc_info=True)
@@ -429,12 +442,19 @@ def render_head(user_email: str = "", drinks_role: str = "") -> str:
 PAGE_FOOT = "</main></body></html>"
 
 
+_PROCESS_START = time.time()
+
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
-
-
-_PROCESS_START = time.time()
+    """Readiness check for Render's zero-downtime cutover: 200 only once the
+    master cache is warm (or the deadline has passed), so traffic isn't routed
+    to an instance that would eat the ~30s inline rebuild on its first hit.
+    Liveness is implied — the process answering at all means it's up."""
+    warm = _master_cache_ready.is_set()
+    if warm or (time.time() - _PROCESS_START) > _READINESS_DEADLINE_S:
+        return {"status": "ok", "warm": warm}
+    return JSONResponse({"status": "warming"}, status_code=503)
 
 
 @app.get("/version")
