@@ -992,22 +992,21 @@ def add_support(
         return _error_page("Support description is empty.")
 
     try:
-        # Build the lookup tables Claude needs to resolve site + product references
-        site_records = load_sites_from_airtable()
-        # Products: pull from Airtable directly so the LLM sees every code we know about
-        from airtable_io import _list_all, T  # noqa: E402
-        product_records = _list_all(T["Products"], fields=["product_code", "description"])
+        # Lookup tables Claude needs to resolve site + product references. Read
+        # from the SWR-cached master snapshot (≤60s stale, refreshed on every
+        # write) — NOT ~5 fresh full-table Airtable sweeps, which together with
+        # the LLM call below pushed this one POST toward the 30s hub-proxy
+        # timeout. Sites/products/rules don't change second-to-second, so a
+        # cache-fresh view is right here.
+        snap = load_master_snapshot()
+        rules = snap.rules
         products = {
-            (rec["fields"].get("product_code") or ""): {
-                "description": rec["fields"].get("description") or "",
-            }
-            for rec in product_records
-            if rec["fields"].get("product_code")
+            code: {"description": (info or {}).get("desc") or ""}
+            for code, info in (getattr(snap, "products", {}) or {}).items()
         }
         # Filter sites to those with active rules so the LLM doesn't pick a retired one
-        rules = load_rules_from_airtable()
         active_sites = {r.site_id for r in rules if r.valid_to is None}
-        sites = {sid: info for sid, info in site_records.items() if sid in active_sites}
+        sites = {sid: info for sid, info in snap.sites.items() if sid in active_sites}
 
         parsed = parse_support_request(text, sites, products)
         errors = validate_support_fields(parsed, sites, products)
