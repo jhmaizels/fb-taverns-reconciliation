@@ -309,7 +309,9 @@ HEAD_STYLE = """<!doctype html>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #222; }
   .container { max-width: 1080px; margin: 2em auto; padding: 0 1em; }
   .site-header { background: #324556; display: flex; align-items: center; justify-content: space-between; padding: 0.55em 1.5em; }
+  .site-header .brand { display: flex; align-items: center; gap: 0.85em; }
   .site-header .brand img { height: 44px; display: block; }
+  .site-header .brand img.app-icon { height: 36px; }
   .site-user { display: flex; align-items: center; gap: 0.6em; }
   .site-user .who { color: rgba(255,255,255,0.85); font-size: 0.8em; }
   .site-user form { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
@@ -433,7 +435,7 @@ def render_head(user_email: str = "", drinks_role: str = "") -> str:
     # ext_url("/") is the app's own root (identity with no base path).
     brand_href = "/" if EXTERNAL_BASE_PATH else ext_url("/")
     return f"""{HEAD_STYLE}<header class="site-header">
-  <a class="brand" href="{brand_href}"><img src="{ext_url('/static/fb-taverns-logo.png')}" alt="FB Taverns"></a>
+  <a class="brand" href="{brand_href}"><img src="{ext_url('/static/fb-taverns-logo.png')}" alt="FB Taverns"><img class="app-icon" src="{ext_url('/static/app-drinks.svg')}" alt="Drinks reconciliation"></a>
   {user_block}
 </header>
 <main class="container">
