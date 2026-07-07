@@ -13,6 +13,7 @@ runs reconciliation, pushes mismatches + a Files row back to Airtable.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
 import time
@@ -46,6 +47,7 @@ from auth_supabase import (  # noqa: E402
     ext_url,
     install_auth_handlers,
     require_drinks_role,
+    role_at_least,
     set_session_cookies,
     validate_token,
 )
@@ -62,6 +64,7 @@ from reconcile import (  # noqa: E402
     build_master,
     load_master,
     _parse_date,
+    _to_str_code,
     Rule,
 )
 # master_export (which imports openpyxl) is imported lazily inside /export-master
@@ -784,7 +787,11 @@ def upload(
                 pass
 
     summary = build_summary(original_name, lines, mismatches, sites, active_site_ids=active_site_ids)
-    summary_html = render_summary_html(summary)
+    summary_html = render_summary_html(
+        summary,
+        accept_url=ext_url("/accept-master-rule"),
+        can_accept=role_at_least(principal.role, "admin"),
+    )
 
     return f"""{render_head(principal.email, principal.role)}
 <h1>Reconciliation complete</h1>
@@ -796,6 +803,123 @@ def upload(
 </p>
 {summary_html}
 {PAGE_FOOT}"""
+
+
+@app.post("/accept-master-rule")
+async def accept_master_rule(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Accept an invoiced price from the reconciliation findings page into the
+    live master as a new PricingRule for (site, product). Backs the findings
+    page 'Add to master' buttons; returns JSON for the in-page fetch. Flows
+    through the same master_changes seam (validate -> apply -> refresh) as the
+    master editor, expressed as an 'add_rule' that may auto-create the
+    site/product for a product that was not on the master at all."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    site_id = (form.get("site_id") or "").strip()
+    product_code = (form.get("product_code") or "").strip()
+    product_desc = (form.get("product_desc") or "").strip()
+
+    def _num(name: str):
+        raw = (form.get(name) or "").strip()
+        if not raw:
+            return None
+        try:
+            v = float(raw)
+        except ValueError:
+            return "err"
+        return v if math.isfinite(v) else "err"
+
+    tenant_price = _num("tenant_price")
+    fb_price = _num("fb_price")
+    if tenant_price in (None, "err") or (isinstance(tenant_price, float) and tenant_price <= 0):
+        return JSONResponse({"ok": False, "error": "A valid positive charged price is required."}, status_code=400)
+    if fb_price == "err":
+        fb_price = None
+    vf = _parse_date((form.get("valid_from") or "").strip())
+    if vf is None:
+        return JSONResponse({"ok": False, "error": "Could not read the effective date."}, status_code=400)
+
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("accept: snapshot load failed")
+        return JSONResponse({"ok": False, "error": "Server error preparing the change."}, status_code=500)
+
+    # Inherit the product-level retro when the product is already on the master
+    # (the tenant_price_missing case) so the new rule's net price / margin match
+    # the rest of the estate. For a product not on the master at all, retro is
+    # genuinely unknown and stays 0 for a later master update / LWC confirmation.
+    retro_pct = None
+    products = getattr(snap, "products", {}) or {}
+    prod = products.get(product_code) or products.get(_to_str_code(product_code))
+    if prod and fb_price and fb_price > 0:
+        retro_gbp = float(prod.get("retro_per_keg") or 0.0)
+        if retro_gbp > 0:
+            retro_pct = retro_gbp / fb_price
+
+    change = MasterChange(
+        op="add_rule",
+        site_id=site_id,
+        product_code=product_code,
+        product_desc=product_desc or None,
+        tenant_price=tenant_price,
+        fb_price=fb_price if (fb_price and fb_price > 0) else None,
+        retro_pct=retro_pct,
+        status="tenanted",
+        valid_from=vf,
+        reason="accepted invoiced price from reconciliation findings",
+        source_note="findings",
+        create_missing_site=True,
+        create_missing_product=True,
+    )
+    preview = preview_master_change(change, snap)
+    if preview.errors:
+        return JSONResponse({"ok": False, "error": "; ".join(preview.errors)}, status_code=400)
+    # A one-click accept must only ADD a genuinely-missing price. If it would
+    # CLOSE an existing open rule (e.g. an older invoice line predating a live
+    # price), refuse and send the operator to the master editor — which shows the
+    # full close/winner preview — rather than silently overwriting a live price.
+    if preview.will_close:
+        return JSONResponse({
+            "ok": False,
+            "needs_editor": True,
+            "error": (
+                "This site already has a live price for this product that accepting would "
+                "replace. Open it in the master editor to change the price with a full preview."
+            ),
+        }, status_code=409)
+    try:
+        result = await run_in_threadpool(apply_master_change, change, principal.email)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    except Exception:
+        logger.exception("accept apply failed")
+        from airtable_io import invalidate_master_cache  # noqa: E402
+        invalidate_master_cache()
+        refresh_master_cache_async()
+        return JSONResponse({"ok": False, "error": "The change could not be saved — please try again."}, status_code=502)
+    # Keep the master cache warm — a burst of accepts must not land it on None and
+    # force a ~30s inline rebuild on the next read. Publish the in-memory patch the
+    # way the grid editor does, then kick the authoritative background refresh.
+    try:
+        publish_patched_snapshot(patch_snapshot_for_change(snap, change, principal.email))
+    except Exception:
+        logger.exception("accept: snapshot patch failed — background refresh will catch up")
+    refresh_master_cache_async()
+    logger.info(
+        "findings-accept %s/%s -> £%.2f by %s (created=%d updated=%d)",
+        site_id, product_code, tenant_price, principal.email, result.created, result.updated,
+    )
+    return JSONResponse({
+        "ok": True,
+        "created": result.created,
+        "updated": result.updated,
+        "message": f"{site_id}/{product_code} set to £{tenant_price:.2f} from {vf.isoformat()}",
+    })
 
 
 @app.post("/upload-retro", response_class=HTMLResponse)

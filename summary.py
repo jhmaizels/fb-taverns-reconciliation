@@ -9,7 +9,10 @@ operator's review workflow:
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from html import escape
 from typing import Iterable
 
@@ -70,6 +73,9 @@ class OtherFindingRow:
     product_desc: str
     qty: float
     notes: str = ""
+    charged: float = 0.0   # qty-weighted invoiced unit price (LWC UNIT)
+    cost: float = 0.0      # qty-weighted FB cost basis (LWC MASTER)
+    mixed: bool = False    # True when the source lines had differing unit prices
 
 
 @dataclass
@@ -187,38 +193,92 @@ def build_summary(
                 )
             )
 
-    # 4a-c. Split the former "Other findings" / no_rule_for_line into actionable buckets.
-    products_not_on_master: list[OtherFindingRow] = []
-    tenant_price_missing: list[OtherFindingRow] = []
+    # 4a-c. Split the former "Other findings" / no_rule_for_line into actionable
+    # buckets. The two priced buckets (products_not_on_master / tenant_price_missing)
+    # aggregate by (site, product) so each product is ONE actionable row carrying
+    # the qty-weighted charged price (LWC UNIT) and cost basis (LWC MASTER) — the
+    # basis for the margin shown and the "accept into master" button.
     sites_in_sales_not_on_master: list[OtherFindingRow] = []
     seen_unknown_site_keys: set[tuple[str, str]] = set()
     other_counts: dict[str, int] = {}
+    _pnm: dict[tuple[str, str], dict] = {}
+    _tpm: dict[tuple[str, str], dict] = {}
+
+    def _fin(x) -> float:
+        """Coerce to a finite float — a blank/NaN invoice cell would otherwise
+        propagate NaN into the JSON blob and kill the whole findings script."""
+        x = x or 0.0
+        return x if isinstance(x, (int, float)) and math.isfinite(x) else 0.0
+
+    def _accumulate(acc: dict, line: InvoiceLine) -> None:
+        key = (line.site_id, line.product_code)
+        a = acc.get(key)
+        if a is None:
+            a = {"site_id": line.site_id, "site_name": line.site_name,
+                 "product_code": line.product_code, "product_desc": line.product_desc,
+                 "qty": 0.0, "uq": 0.0, "mq": 0.0, "n": 0, "usum": 0.0, "msum": 0.0,
+                 "umin": None, "umax": None}
+            acc[key] = a
+        q = _fin(line.qty)
+        up = _fin(line.unit_price)
+        mp = _fin(line.master_price)
+        a["qty"] += q
+        a["uq"] += up * q
+        a["mq"] += mp * q
+        a["usum"] += up
+        a["msum"] += mp
+        a["n"] += 1
+        a["umin"] = up if a["umin"] is None else min(a["umin"], up)
+        a["umax"] = up if a["umax"] is None else max(a["umax"], up)
+        if line.site_name and not a["site_name"]:
+            a["site_name"] = line.site_name
+        if line.product_desc and not a["product_desc"]:
+            a["product_desc"] = line.product_desc
+
+    def _finalize(acc: dict) -> list[OtherFindingRow]:
+        out: list[OtherFindingRow] = []
+        for a in acc.values():
+            qty = a["qty"]
+            if qty > 0:
+                charged, cost = a["uq"] / qty, a["mq"] / qty
+            elif a["n"]:
+                charged, cost = a["usum"] / a["n"], a["msum"] / a["n"]
+            else:
+                charged = cost = 0.0
+            mixed = (
+                a["umin"] is not None and a["umax"] is not None
+                and (a["umax"] - a["umin"]) > 0.01
+            )
+            out.append(OtherFindingRow(
+                site_id=a["site_id"], site_name=a["site_name"],
+                product_code=a["product_code"], product_desc=a["product_desc"],
+                qty=_fin(qty), charged=_fin(charged), cost=_fin(cost), mixed=mixed,
+            ))
+        return out
 
     for m in mismatches:
         t = m.type
         if t in ("wrong_tenant_price", "wrong_fb_price"):
             continue
         line = m.line
-        row = OtherFindingRow(
-            site_id=line.site_id,
-            site_name=line.site_name,
-            product_code=line.product_code,
-            product_desc=line.product_desc,
-            qty=line.qty,
-            notes=m.notes,
-        )
         if t == "product_not_on_master":
-            products_not_on_master.append(row)
+            _accumulate(_pnm, line)
         elif t == "tenant_price_missing":
-            tenant_price_missing.append(row)
+            _accumulate(_tpm, line)
         elif t == "unknown_site":
             key = (line.site_id, line.site_name)
             if key not in seen_unknown_site_keys:
                 seen_unknown_site_keys.add(key)
-                sites_in_sales_not_on_master.append(row)
+                sites_in_sales_not_on_master.append(OtherFindingRow(
+                    site_id=line.site_id, site_name=line.site_name,
+                    product_code=line.product_code, product_desc=line.product_desc,
+                    qty=line.qty, notes=m.notes,
+                ))
         else:
             other_counts[t] = other_counts.get(t, 0) + 1
 
+    products_not_on_master = _finalize(_pnm)
+    tenant_price_missing = _finalize(_tpm)
     products_not_on_master.sort(key=lambda r: (r.product_code, r.site_id))
     tenant_price_missing.sort(key=lambda r: (r.site_id, r.product_code))
     sites_in_sales_not_on_master.sort(key=lambda r: r.site_id)
@@ -250,8 +310,130 @@ def _money_neutral(v: float) -> str:
     return f"£{v:,.2f}"
 
 
-def render_summary_html(s: Summary) -> str:
-    parts: list[str] = []
+def _margin(charged: float, cost: float) -> tuple[float, float]:
+    """(£/unit, %) FB margin of the invoiced price over the LWC cost basis.
+    Pre-retro — the invoice line carries no retro, and a real retro only widens
+    the margin, so a thin margin here is a reliable 'LWC mis-priced it' signal."""
+    gbp = charged - cost
+    pct = (gbp / charged * 100.0) if charged else 0.0
+    return gbp, pct
+
+
+def _margin_cls(gbp: float, pct: float) -> str:
+    if gbp <= 0:
+        return "mg-bad"
+    if pct < 5:
+        return "mg-warn"
+    return "mg-ok"
+
+
+def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
+    """Table for the two actionable 'other' buckets: charged price, FB cost,
+    margin £ and %, plus (admins only) an 'Add to master' button that writes the
+    charged price into the master for that (site, product)."""
+    head_action = "<th></th>" if can_accept else ""
+    _mtitle = "Pre-retro gross margin: (charged − FB cost) ÷ charged. A rebate only widens it."
+    out = [
+        "<table><thead><tr>"
+        "<th>Site</th><th>Name</th><th>Code</th><th>Description</th>"
+        "<th class='r'>Qty</th><th class='r'>Charged</th><th class='r'>FB cost</th>"
+        f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin/unit *</th>"
+        f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin % *</th>"
+        f"{head_action}</tr></thead><tbody>"
+    ]
+    for r in rows:
+        gbp, pct = _margin(r.charged, r.cost)
+        mcls = _margin_cls(gbp, pct)
+        charged_cell = _money_neutral(r.charged)
+        if r.mixed:
+            charged_cell += " <span class='mixed-note'>(varied)</span>"
+        btn = ""
+        if can_accept:
+            if r.mixed:
+                # Differing prices across this file's lines: the weighted figure
+                # matches no single invoice, so don't offer a one-click write —
+                # route to the editor to pick a specific price.
+                btn = (
+                    "<td><span class='mixed-note' title='This product was charged at more "
+                    "than one price in this file — set it in the master editor'>use editor</span></td>"
+                )
+            else:
+                btn = (
+                    "<td><button type='button' class='accept-btn'"
+                    f" data-site=\"{escape(r.site_id, quote=True)}\""
+                    f" data-sitename=\"{escape(r.site_name, quote=True)}\""
+                    f" data-product=\"{escape(r.product_code, quote=True)}\""
+                    f" data-desc=\"{escape(r.product_desc, quote=True)}\""
+                    f" data-charged=\"{r.charged:.2f}\" data-cost=\"{r.cost:.2f}\""
+                    f" data-qty=\"{r.qty:g}\">Add to master</button></td>"
+                )
+        out.append(
+            f"<tr data-key=\"{escape(r.site_id + '|' + r.product_code, quote=True)}\">"
+            f"<td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
+            f"<td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
+            f"<td class='r'>{r.qty:g}</td>"
+            f"<td class='r'>{charged_cell}</td>"
+            f"<td class='r'>{_money_neutral(r.cost)}</td>"
+            f"<td class='r {mcls}'>{_money(gbp)}</td>"
+            f"<td class='r {mcls}'>{pct:.1f}%</td>"
+            f"{btn}</tr>"
+        )
+    out.append("</tbody></table>")
+    out.append("<p class='sub' style='margin-top:-0.4em'>* Margin is pre-retro (gross) &mdash; a rebate only widens it.</p>")
+    return "".join(out)
+
+
+_FINDINGS_STYLE = """<style>
+  .mg-bad { color:#b00020; font-weight:600; }
+  .mg-warn { color:#8a6500; font-weight:600; }
+  .mg-ok { color:#1f7a1f; }
+  .accept-btn { background:#33691e; color:#fff; border:0; padding:0.3em 0.7em; border-radius:4px; font-size:0.82em; cursor:pointer; white-space:nowrap; }
+  .accept-btn:hover { background:#274f16; }
+  .accept-btn:disabled { opacity:0.6; cursor:default; }
+  tr.accepted td { background:#eef7ea; color:#567; }
+  .accepted-tag { color:#1f7a1f; font-weight:700; font-size:0.85em; }
+  .email-draft { background:#f6f9ff; border:1px solid #c7d8f0; border-radius:6px; padding:1em; margin-top:1em; max-width:none; }
+  .email-draft label { display:block; margin:0.6em 0 0.2em; font-weight:600; }
+  .email-draft input[type=text] { width:100%; padding:0.45em; box-sizing:border-box; margin:0; }
+  .email-draft textarea { width:100%; min-height:230px; box-sizing:border-box; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:0.85em; }
+  .email-actions { margin-top:0.6em; display:flex; gap:0.6em; align-items:center; flex-wrap:wrap; }
+  .email-actions .ok { color:#1f7a1f; font-size:0.85em; }
+  .eff-date-bar { max-width:none; }
+  .eff-date-bar input[type=date] { display:inline; width:auto; margin:0 0 0 0.3em; }
+  .mixed-note { color:#8a6500; font-size:0.85em; font-style:italic; }
+  #email-dirty-note { color:#8a6500; font-size:0.85em; }
+</style>"""
+
+
+def _findings_script(cfg: dict) -> str:
+    # allow_nan=False: never emit bare NaN/Infinity — invalid JSON that would kill
+    # JSON.parse and the entire findings script. Escape < > & as \\u00xx so no
+    # product description / site name can break out of the <script> data context
+    # (a lone '</' replacement misses e.g. '<!--<script'); these round-trip
+    # through JSON.parse unchanged.
+    try:
+        cfg_json = json.dumps(cfg, allow_nan=False)
+    except ValueError:
+        cfg_json = json.dumps({
+            "acceptUrl": cfg.get("acceptUrl", ""),
+            "sourceFile": cfg.get("sourceFile", ""),
+            "defaultEffDate": cfg.get("defaultEffDate", ""),
+            "email": {"file": cfg.get("sourceFile", ""),
+                      "tenant_mismatches": [], "missing_products": [], "missing_prices": []},
+        })
+    cfg_json = cfg_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return (
+        f'<script id="findings-config" type="application/json">{cfg_json}</script>'
+        + _FINDINGS_JS
+    )
+
+
+def render_summary_html(
+    s: Summary,
+    accept_url: str = "/accept-master-rule",
+    can_accept: bool = False,
+) -> str:
+    parts: list[str] = [_FINDINGS_STYLE]
 
     parts.append(
         f"""<div class="result">
@@ -354,23 +536,27 @@ def render_summary_html(s: Summary) -> str:
 
     parts.append("<h2>4. Other findings</h2>")
 
+    if can_accept and (s.products_not_on_master or s.tenant_price_missing):
+        parts.append(
+            "<div class='result eff-date-bar'>"
+            "<label for='accept-eff-date' style='display:inline; font-weight:600'>Effective date for accepted prices</label>"
+            f"<input type='date' id='accept-eff-date' value='{(date.today() - timedelta(days=14)).isoformat()}'>"
+            " <span class='sub' style='margin:0'>— applies to every price you accept below.</span>"
+            "</div>"
+        )
+
     parts.append(
         f"<h3>Products not on master <span class='pill'>{len(s.products_not_on_master)}</span></h3>"
     )
     if not s.products_not_on_master:
         parts.append("<p><em>None.</em></p>")
     else:
-        parts.append("<p class='sub'>Add a product row to the master, or treat as a one-off guest line.</p>")
         parts.append(
-            "<table><thead><tr><th>Code</th><th>Description</th><th>Site</th><th>Site name</th><th class='r'>Qty</th></tr></thead><tbody>"
+            "<p class='sub'>Charged price and margin over FB cost for each. Healthy margin &rarr; "
+            "add it to the master at the charged price; near-zero margin is likely an LWC "
+            "mis-price &mdash; leave it for the email below.</p>"
         )
-        for r in s.products_not_on_master:
-            parts.append(
-                f"<tr><td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
-                f"<td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
-                f"<td class='r'>{r.qty:g}</td></tr>"
-            )
-        parts.append("</tbody></table>")
+        parts.append(_acceptable_table(s.products_not_on_master, can_accept))
 
     parts.append(
         f"<h3>Tenant price missing for site <span class='pill'>{len(s.tenant_price_missing)}</span></h3>"
@@ -378,17 +564,12 @@ def render_summary_html(s: Summary) -> str:
     if not s.tenant_price_missing:
         parts.append("<p><em>None.</em></p>")
     else:
-        parts.append("<p class='sub'>Product is on the master but the tenant-price cell for this site is blank — populate it.</p>")
         parts.append(
-            "<table><thead><tr><th>Site</th><th>Site name</th><th>Code</th><th>Description</th><th class='r'>Qty</th></tr></thead><tbody>"
+            "<p class='sub'>Product is on the master but this site has no tenant price. The "
+            "charged price and its margin are shown &mdash; accept it into the master, or (if the "
+            "margin looks wrong) chase LWC via the email below.</p>"
         )
-        for r in s.tenant_price_missing:
-            parts.append(
-                f"<tr><td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
-                f"<td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
-                f"<td class='r'>{r.qty:g}</td></tr>"
-            )
-        parts.append("</tbody></table>")
+        parts.append(_acceptable_table(s.tenant_price_missing, can_accept))
 
     if s.sites_in_sales_not_on_master:
         parts.append(
@@ -405,4 +586,228 @@ def render_summary_html(s: Summary) -> str:
             parts.append(f"<div class='summary-row'><span>{escape(t)}</span><strong>{c}</strong></div>")
         parts.append("</div>")
 
+    # 5. Draft email to LWC — built client-side from the mismatches + missing
+    # items; accepting a missing item into the master (buttons above) drops it
+    # from the draft live. The accept buttons' JS also lives in this block, so it
+    # is emitted whenever there is anything actionable on the page.
+    if s.tenant_blocks or s.products_not_on_master or s.tenant_price_missing:
+        default_subject = f"FB Taverns pricing — {s.file_name}"
+        email_data = {
+            "file": s.file_name,
+            "tenant_mismatches": [
+                {"site": b.site_id, "site_name": b.site_name, "product": r.product_code,
+                 "desc": r.product_desc, "expected": round(r.expected, 2),
+                 "charged": round(r.actual, 2), "delta_total": round(r.delta_total, 2),
+                 "qty": r.qty}
+                for b in s.tenant_blocks for r in b.rows
+            ],
+            "missing_products": [
+                {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
+                 "desc": r.product_desc, "charged": round(r.charged, 2),
+                 "cost": round(r.cost, 2), "qty": r.qty}
+                for r in s.products_not_on_master
+            ],
+            "missing_prices": [
+                {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
+                 "desc": r.product_desc, "charged": round(r.charged, 2),
+                 "cost": round(r.cost, 2), "qty": r.qty}
+                for r in s.tenant_price_missing
+            ],
+        }
+        parts.append("<h2>5. Draft email to LWC</h2>")
+        parts.append(
+            "<p class='sub'>Auto-drafted from the price mismatches and missing items above &mdash; "
+            "the tenant prices for LWC to correct, plus a request to set pricing for anything "
+            "missing. Accepting an item into the master removes it from this draft. Edit freely, "
+            "then copy or open in your mail app.</p>"
+        )
+        parts.append(
+            "<div class='email-draft'>"
+            "<label for='email-subject'>Subject</label>"
+            f"<input type='text' id='email-subject' value=\"{escape(default_subject, quote=True)}\">"
+            "<label for='email-body'>Body</label>"
+            "<textarea id='email-body'></textarea>"
+            "<div class='email-actions'>"
+            "<button type='button' id='email-copy'>Copy email</button>"
+            "<a class='button' id='email-mailto' href='#' style='margin-top:0'>Open in mail app</a>"
+            "<span class='ok' id='email-copied' style='display:none'>Copied &check;</span>"
+            "<span id='email-dirty-note' style='display:none'>&#9888; Edited &mdash; accepted items are no longer auto-removed; delete them by hand.</span>"
+            "</div></div>"
+        )
+        parts.append(_findings_script({
+            "acceptUrl": accept_url,
+            "sourceFile": s.file_name,
+            "defaultEffDate": (date.today() - timedelta(days=14)).isoformat(),
+            "email": email_data,
+        }))
+
     return "\n".join(parts)
+
+
+# Client-side logic for the findings page: the "Add to master" accept buttons
+# (POST to accept_url, confirm dialog, mark row done) and the live-drafted LWC
+# email. Reads config from the <script id="findings-config"> JSON blob so no
+# server values are interpolated into JS. Plain string (NOT an f-string) — the
+# JS uses braces heavily.
+_FINDINGS_JS = """<script>
+(function () {
+  var el = document.getElementById('findings-config');
+  if (!el) return;
+  var CFG;
+  try { CFG = JSON.parse(el.textContent); } catch (e) { return; }
+  var accepted = new Set();
+  var bodyDirty = false;
+  var subject = document.getElementById('email-subject');
+  var body = document.getElementById('email-body');
+  var mailto = document.getElementById('email-mailto');
+
+  function fmtQty(q) {
+    q = Number(q) || 0;
+    var n = (q % 1 === 0) ? q.toFixed(0) : q.toFixed(2);
+    return n + ' keg' + (q === 1 ? '' : 's');
+  }
+  function money(v) { return '\\u00a3' + (Number(v) || 0).toFixed(2); }
+
+  function effDate() {
+    var d = document.getElementById('accept-eff-date');
+    return (d && d.value) || CFG.defaultEffDate;
+  }
+
+  function buildBody() {
+    var e = CFG.email, L = [];
+    L.push('Hi,');
+    L.push('');
+    L.push('Reviewing ' + e.file + ', the following need your attention:');
+    L.push('');
+    if (e.tenant_mismatches && e.tenant_mismatches.length) {
+      L.push('1) Tenant prices charged that differ from the agreed price - please correct these on your system:');
+      e.tenant_mismatches.forEach(function (m) {
+        L.push('   - ' + m.site + ' ' + m.site_name + ' / ' + m.product + ' ' + m.desc +
+               ': agreed ' + money(m.expected) + ', charged ' + money(m.charged) +
+               ' (diff ' + money(m.delta_total) + ' over ' + fmtQty(m.qty) + ')');
+      });
+      L.push('');
+    }
+    var missing = [];
+    (e.missing_products || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'not on our price list'; missing.push(y); });
+    (e.missing_prices || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'no agreed price for this site'; missing.push(y); });
+    missing = missing.filter(function (x) { return !accepted.has(x.site + '|' + x.product); });
+    if (missing.length) {
+      L.push('2) Please confirm the agreed tenant price for these (missing from our records):');
+      missing.forEach(function (x) {
+        L.push('   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc +
+               ': charged ' + money(x.charged) + ' (' + x.kind + ')');
+      });
+      L.push('');
+    }
+    L.push('Thanks,');
+    return L.join('\\n');
+  }
+
+  function updateMailto() {
+    if (!mailto) return;
+    var s = subject ? subject.value : '';
+    var b = body ? body.value : '';
+    var href = 'mailto:?subject=' + encodeURIComponent(s) + '&body=' + encodeURIComponent(b);
+    // Mail apps / ShellExecute cap the URL near 2000 chars; a full weekly draft
+    // can exceed that and silently no-op. Past the cap, drop the body and steer
+    // the user to Copy.
+    if (href.length > 1900) {
+      mailto.setAttribute('href', 'mailto:?subject=' + encodeURIComponent(s));
+      mailto.textContent = 'Open in mail app (too long \\u2014 use Copy for the body)';
+    } else {
+      mailto.setAttribute('href', href);
+      mailto.textContent = 'Open in mail app';
+    }
+  }
+
+  function rebuild() {
+    if (body && !bodyDirty) body.value = buildBody();
+    updateMailto();
+  }
+
+  function acceptRule(btn) {
+    var d = btn.dataset;
+    var msg = 'Add to the live pricing master?\\n\\n' +
+      'Site ' + d.site + ' ' + d.sitename + '\\n' +
+      'Product ' + d.product + ' ' + d.desc + '\\n' +
+      'Tenant price: ' + money(d.charged) + '\\n' +
+      'FB cost: ' + money(d.cost) + '\\n' +
+      'Effective from: ' + effDate();
+    if (!window.confirm(msg)) return;
+    var orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Saving\\u2026';
+    var params = new URLSearchParams();
+    params.set('site_id', d.site);
+    params.set('product_code', d.product);
+    params.set('product_desc', d.desc);
+    params.set('tenant_price', d.charged);
+    params.set('fb_price', d.cost);
+    params.set('valid_from', effDate());
+    params.set('source_file', CFG.sourceFile);
+    fetch(CFG.acceptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      credentials: 'same-origin',
+      body: params.toString()
+    }).then(function (r) {
+      return r.json().catch(function () { return { ok: false, error: 'HTTP ' + r.status }; })
+        .then(function (j) { return { ok: r.ok && j && j.ok, j: j }; });
+    }).then(function (res) {
+      if (res.ok) {
+        var row = btn.closest('tr');
+        if (row) row.classList.add('accepted');
+        var td = btn.parentNode;
+        td.textContent = '';
+        var tag = document.createElement('span');
+        tag.className = 'accepted-tag';
+        tag.textContent = '\\u2713 added';
+        td.appendChild(tag);
+        accepted.add(d.site + '|' + d.product);
+        if (bodyDirty) {
+          var note = document.getElementById('email-dirty-note');
+          if (note) note.style.display = 'inline';
+        }
+        rebuild();
+      } else {
+        btn.disabled = false;
+        btn.textContent = orig;
+        window.alert('Could not add to master: ' + ((res.j && res.j.error) || 'unknown error'));
+      }
+    }).catch(function (err) {
+      btn.disabled = false;
+      btn.textContent = orig;
+      window.alert('Network error: ' + err);
+    });
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('.accept-btn'), function (b) {
+    b.addEventListener('click', function () { acceptRule(b); });
+  });
+  if (body) body.addEventListener('input', function () { bodyDirty = true; updateMailto(); });
+  if (subject) subject.addEventListener('input', updateMailto);
+  var copyBtn = document.getElementById('email-copy');
+  if (copyBtn) copyBtn.addEventListener('click', function () {
+    var text = (subject ? 'Subject: ' + subject.value + '\\n\\n' : '') + (body ? body.value : '');
+    var done = document.getElementById('email-copied');
+    function shown() { if (done) { done.style.display = 'inline'; setTimeout(function () { done.style.display = 'none'; }, 2000); } }
+    function fallbackCopy() {
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) { shown(); }
+      else if (body) { body.focus(); body.select(); window.alert('Press Ctrl-C / Cmd-C to copy the draft.'); }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(shown, fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+  });
+  rebuild();
+})();
+</script>"""
