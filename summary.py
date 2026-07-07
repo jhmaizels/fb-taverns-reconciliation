@@ -736,11 +736,14 @@ _FINDINGS_JS = """<script>
     L.push('');
     if (e.tenant_mismatches && e.tenant_mismatches.length) {
       L.push('1) Tenant prices charged that differ from the agreed price - please correct these on your system:');
+      var total1 = 0;
       e.tenant_mismatches.forEach(function (m) {
+        total1 += Number(m.delta_total) || 0;
         L.push('   - ' + m.site + ' ' + m.site_name + ' / ' + m.product + ' ' + m.desc +
                ': agreed ' + money(m.expected) + ', charged ' + money(m.charged) +
                ' (diff ' + money(m.delta_total) + ' over ' + fmtQty(m.qty) + ')');
       });
+      L.push('   Total tenant-price discrepancy across the above: ' + money(Math.abs(total1)) + ' ' + (total1 >= 0 ? 'overcharged' : 'undercharged') + '.');
       L.push('');
     }
     var missing = [];
