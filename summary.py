@@ -327,18 +327,60 @@ def _margin_cls(gbp: float, pct: float) -> str:
     return "mg-ok"
 
 
+# Pricing policy for the price we INSTRUCT LWC to set when there's no agreed price
+# (operator, 2026): cask → a fixed £35/keg margin over FB cost (price = cost + 35);
+# other draught → 40% gross margin of the selling price, pre-retro
+# (price = cost / (1 − 0.40)). Cask is identified the same way as the master editor
+# (master_pages._is_cask): "cask" in the product description.
+CASK_FIXED_MARGIN_GBP = 35.0
+DRAUGHT_TARGET_GP = 0.40
+
+
+def _is_cask(desc: str) -> bool:
+    return "cask" in (desc or "").lower()
+
+
+def _suggested_price(desc: str, cost: float) -> float | None:
+    """Tenant price to instruct LWC to set, per policy. None with no cost basis."""
+    if not cost or cost <= 0:
+        return None
+    if _is_cask(desc):
+        return cost + CASK_FIXED_MARGIN_GBP
+    return cost / (1.0 - DRAUGHT_TARGET_GP)
+
+
+def _sug_round(desc: str, cost: float):
+    v = _suggested_price(desc, cost)
+    return round(v, 2) if v is not None else None
+
+
+def _suggest_basis(desc: str) -> str:
+    if _is_cask(desc):
+        return f"cask: FB cost + £{CASK_FIXED_MARGIN_GBP:.0f}/keg"
+    return (
+        f"{DRAUGHT_TARGET_GP * 100:.0f}% gross margin (pre-retro): "
+        f"FB cost ÷ {1 - DRAUGHT_TARGET_GP:.2f}"
+    )
+
+
 def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
     """Table for the two actionable 'other' buckets: charged price, FB cost,
     margin £ and %, plus (admins only) an 'Add to master' button that writes the
     charged price into the master for that (site, product)."""
     head_action = "<th></th>" if can_accept else ""
     _mtitle = "Pre-retro gross margin: (charged − FB cost) ÷ charged. A rebate only widens it."
+    _stitle = (
+        f"Price to instruct LWC to set — cask: FB cost + £{CASK_FIXED_MARGIN_GBP:.0f}/keg; "
+        f"other draught: {DRAUGHT_TARGET_GP * 100:.0f}% gross margin pre-retro "
+        f"(FB cost ÷ {1 - DRAUGHT_TARGET_GP:.2f})"
+    )
     out = [
         "<table><thead><tr>"
         "<th>Site</th><th>Name</th><th>Code</th><th>Description</th>"
         "<th class='r'>Qty</th><th class='r'>Charged</th><th class='r'>FB cost</th>"
         f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin/unit *</th>"
         f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin % *</th>"
+        f"<th class='r' title=\"{escape(_stitle, quote=True)}\">Suggested</th>"
         f"{head_action}</tr></thead><tbody>"
     ]
     for r in rows:
@@ -347,6 +389,14 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
         charged_cell = _money_neutral(r.charged)
         if r.mixed:
             charged_cell += " <span class='mixed-note'>(varied)</span>"
+        sug = _suggested_price(r.product_desc, r.cost)
+        if sug is not None:
+            sug_cell = (
+                f"<td class='r' title=\"{escape(_suggest_basis(r.product_desc), quote=True)}\">"
+                f"<strong>{_money_neutral(sug)}</strong></td>"
+            )
+        else:
+            sug_cell = "<td class='r'>&mdash;</td>"
         btn = ""
         if can_accept:
             if r.mixed:
@@ -376,6 +426,7 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
             f"<td class='r'>{_money_neutral(r.cost)}</td>"
             f"<td class='r {mcls}'>{_money(gbp)}</td>"
             f"<td class='r {mcls}'>{pct:.1f}%</td>"
+            f"{sug_cell}"
             f"{btn}</tr>"
         )
     out.append("</tbody></table>")
@@ -552,9 +603,10 @@ def render_summary_html(
         parts.append("<p><em>None.</em></p>")
     else:
         parts.append(
-            "<p class='sub'>Charged price and margin over FB cost for each. Healthy margin &rarr; "
-            "add it to the master at the charged price; near-zero margin is likely an LWC "
-            "mis-price &mdash; leave it for the email below.</p>"
+            "<p class='sub'>Charged price, margin over FB cost, and our <strong>suggested</strong> "
+            "price to set (cask FB cost + £35/keg; other draught 40% gross margin pre-retro). Healthy "
+            "charged margin &rarr; add it at the charged price; otherwise the email below instructs "
+            "LWC to set our suggested price.</p>"
         )
         parts.append(_acceptable_table(s.products_not_on_master, can_accept))
 
@@ -565,9 +617,9 @@ def render_summary_html(
         parts.append("<p><em>None.</em></p>")
     else:
         parts.append(
-            "<p class='sub'>Product is on the master but this site has no tenant price. The "
-            "charged price and its margin are shown &mdash; accept it into the master, or (if the "
-            "margin looks wrong) chase LWC via the email below.</p>"
+            "<p class='sub'>Product is on the master but this site has no tenant price. Charged price, "
+            "margin, and our suggested price are shown &mdash; accept the charged price into the master, "
+            "or let the email below instruct LWC to set our suggested price.</p>"
         )
         parts.append(_acceptable_table(s.tenant_price_missing, can_accept))
 
@@ -604,22 +656,25 @@ def render_summary_html(
             "missing_products": [
                 {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
                  "desc": r.product_desc, "charged": round(r.charged, 2),
-                 "cost": round(r.cost, 2), "qty": r.qty}
+                 "cost": round(r.cost, 2), "qty": r.qty,
+                 "suggested": _sug_round(r.product_desc, r.cost), "is_cask": _is_cask(r.product_desc)}
                 for r in s.products_not_on_master
             ],
             "missing_prices": [
                 {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
                  "desc": r.product_desc, "charged": round(r.charged, 2),
-                 "cost": round(r.cost, 2), "qty": r.qty}
+                 "cost": round(r.cost, 2), "qty": r.qty,
+                 "suggested": _sug_round(r.product_desc, r.cost), "is_cask": _is_cask(r.product_desc)}
                 for r in s.tenant_price_missing
             ],
         }
         parts.append("<h2>5. Draft email to LWC</h2>")
         parts.append(
             "<p class='sub'>Auto-drafted from the price mismatches and missing items above &mdash; "
-            "the tenant prices for LWC to correct, plus a request to set pricing for anything "
-            "missing. Accepting an item into the master removes it from this draft. Edit freely, "
-            "then copy or open in your mail app.</p>"
+            "the tenant prices for LWC to correct, plus our <strong>required prices</strong> for "
+            "anything missing (cask at a fixed £35/keg margin, other draught at 40% gross margin "
+            "pre-retro) to instruct rather than ask. Accepting an item into the master removes it "
+            "from this draft. Edit freely, then copy or open in your mail app.</p>"
         )
         parts.append(
             "<div class='email-draft'>"
@@ -693,10 +748,15 @@ _FINDINGS_JS = """<script>
     (e.missing_prices || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'no agreed price for this site'; missing.push(y); });
     missing = missing.filter(function (x) { return !accepted.has(x.site + '|' + x.product); });
     if (missing.length) {
-      L.push('2) Please confirm the agreed tenant price for these (missing from our records):');
+      L.push('2) Please set the following tenant prices on your system. These are our required prices (cask: a fixed \\u00a335/keg margin; other draught: 40% gross margin pre-retro):');
       missing.forEach(function (x) {
-        L.push('   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc +
-               ': charged ' + money(x.charged) + ' (' + x.kind + ')');
+        var line = '   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc + ': ';
+        if (x.suggested != null) {
+          line += 'set to ' + money(x.suggested) + ' (currently charged ' + money(x.charged) + (x.is_cask ? '; cask' : '') + ')';
+        } else {
+          line += 'please confirm the agreed tenant price (currently charged ' + money(x.charged) + ')';
+        }
+        L.push(line);
       });
       L.push('');
     }
