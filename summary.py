@@ -751,11 +751,11 @@ _FINDINGS_JS = """<script>
     (e.missing_prices || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'no agreed price for this site'; missing.push(y); });
     missing = missing.filter(function (x) { return !accepted.has(x.site + '|' + x.product); });
     if (missing.length) {
-      L.push('2) Please set the following tenant prices on your system. These are our required prices (cask: a fixed \\u00a335/keg margin; other draught: 40% gross margin pre-retro):');
+      L.push('2) Please set the following tenant prices on your system:');
       missing.forEach(function (x) {
         var line = '   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc + ': ';
         if (x.suggested != null) {
-          line += 'set to ' + money(x.suggested) + ' (currently charged ' + money(x.charged) + (x.is_cask ? '; cask' : '') + ')';
+          line += 'set to ' + money(x.suggested) + ' (currently charged ' + money(x.charged) + ')';
         } else {
           line += 'please confirm the agreed tenant price (currently charged ' + money(x.charged) + ')';
         }
