@@ -332,47 +332,94 @@ def _margin_cls(gbp: float, pct: float) -> str:
 # other draught → 40% gross margin of the selling price, pre-retro
 # (price = cost / (1 − 0.40)). Cask is identified the same way as the master editor
 # (master_pages._is_cask): "cask" in the product description.
+# Fallback defaults. The LIVE values come from the editable Config record
+# (airtable_io.load_pricing_policy) and are threaded through as `policy`; these
+# apply only when no policy is passed (tests / cold config).
 CASK_FIXED_MARGIN_GBP = 35.0
 DRAUGHT_TARGET_GP = 0.40
+
+
+def _policy_get(policy, key, default):
+    if policy and policy.get(key) is not None:
+        return policy[key]
+    return default
+
+
+def _policy_cask(policy) -> float:
+    return float(_policy_get(policy, "cask_margin_gbp", CASK_FIXED_MARGIN_GBP))
+
+
+def _policy_gp(policy) -> float:
+    gp = float(_policy_get(policy, "draught_target_gp", DRAUGHT_TARGET_GP))
+    return gp / 100.0 if gp >= 1 else gp   # tolerate 40 entered instead of 0.40
 
 
 def _is_cask(desc: str) -> bool:
     return "cask" in (desc or "").lower()
 
 
-def _suggested_price(desc: str, cost: float) -> float | None:
+def _suggested_price(desc: str, cost: float, policy=None) -> float | None:
     """Tenant price to instruct LWC to set, per policy. None with no cost basis."""
     if not cost or cost <= 0:
         return None
     if _is_cask(desc):
-        return cost + CASK_FIXED_MARGIN_GBP
-    return cost / (1.0 - DRAUGHT_TARGET_GP)
+        return cost + _policy_cask(policy)
+    gp = _policy_gp(policy)
+    return cost / (1.0 - gp) if 0 <= gp < 1 else None
 
 
-def _sug_round(desc: str, cost: float):
-    v = _suggested_price(desc, cost)
+def _sug_round(desc: str, cost: float, policy=None):
+    v = _suggested_price(desc, cost, policy)
     return round(v, 2) if v is not None else None
 
 
-def _suggest_basis(desc: str) -> str:
+def _suggest_basis(desc: str, policy=None) -> str:
     if _is_cask(desc):
-        return f"cask: FB cost + £{CASK_FIXED_MARGIN_GBP:.0f}/keg"
+        return f"cask: FB cost + £{_policy_cask(policy):.0f}/keg"
+    gp = _policy_gp(policy)
+    return f"{gp * 100:.0f}% gross margin (pre-retro): FB cost ÷ {1 - gp:.2f}"
+
+
+def _policy_banner_html(policy, policy_url: str, can_accept: bool) -> str:
+    """Footnote showing the current suggested-price policy; an amber reminder
+    once the annual review date has passed (bump the cask margin + tell LWC)."""
+    cask = _policy_cask(policy)
+    gp = _policy_gp(policy)
+    eff = _policy_get(policy, "effective_from", "")
+    review = _policy_get(policy, "next_review_date", "")
+    due = False
+    try:
+        if review:
+            due = date.today() >= date.fromisoformat(str(review)[:10])
+    except (ValueError, TypeError):
+        due = False
+    link = (f" <a href=\"{escape(policy_url, quote=True)}\">Review policy &rarr;</a>"
+            if (policy_url and can_accept) else "")
+    if due:
+        return (
+            "<div class='policy-banner due'>&#9888; <strong>Pricing policy due for its annual "
+            f"RPI review</strong> (cask margin £{cask:.0f}/keg, set {escape(str(eff))}). Increase it "
+            "and <strong>inform LWC that the cask margin rises across the board by the inflation "
+            f"amount</strong>.{link}</div>"
+        )
     return (
-        f"{DRAUGHT_TARGET_GP * 100:.0f}% gross margin (pre-retro): "
-        f"FB cost ÷ {1 - DRAUGHT_TARGET_GP:.2f}"
+        f"<p class='sub policy-note'>Suggested prices use cask FB cost + £{cask:.0f}/keg and "
+        f"{gp * 100:.0f}% gross margin (pre-retro) for other draught. Effective {escape(str(eff))}; "
+        f"next review {escape(str(review))}.{link}</p>"
     )
 
 
-def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
+def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool, policy=None) -> str:
     """Table for the two actionable 'other' buckets: charged price, FB cost,
-    margin £ and %, plus (admins only) an 'Add to master' button that writes the
-    charged price into the master for that (site, product)."""
+    margin £ and %, suggested price (policy), plus (admins only) an 'Add to
+    master' button that writes the charged price for that (site, product)."""
     head_action = "<th></th>" if can_accept else ""
     _mtitle = "Pre-retro gross margin: (charged − FB cost) ÷ charged. A rebate only widens it."
+    _cask = _policy_cask(policy)
+    _gp = _policy_gp(policy)
     _stitle = (
-        f"Price to instruct LWC to set — cask: FB cost + £{CASK_FIXED_MARGIN_GBP:.0f}/keg; "
-        f"other draught: {DRAUGHT_TARGET_GP * 100:.0f}% gross margin pre-retro "
-        f"(FB cost ÷ {1 - DRAUGHT_TARGET_GP:.2f})"
+        f"Price to instruct LWC to set — cask: FB cost + £{_cask:.0f}/keg; "
+        f"other draught: {_gp * 100:.0f}% gross margin pre-retro (FB cost ÷ {1 - _gp:.2f})"
     )
     out = [
         "<table><thead><tr>"
@@ -389,10 +436,10 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool) -> str:
         charged_cell = _money_neutral(r.charged)
         if r.mixed:
             charged_cell += " <span class='mixed-note'>(varied)</span>"
-        sug = _suggested_price(r.product_desc, r.cost)
+        sug = _suggested_price(r.product_desc, r.cost, policy)
         if sug is not None:
             sug_cell = (
-                f"<td class='r' title=\"{escape(_suggest_basis(r.product_desc), quote=True)}\">"
+                f"<td class='r' title=\"{escape(_suggest_basis(r.product_desc, policy), quote=True)}\">"
                 f"<strong>{_money_neutral(sug)}</strong></td>"
             )
         else:
@@ -453,6 +500,8 @@ _FINDINGS_STYLE = """<style>
   .eff-date-bar input[type=date] { display:inline; width:auto; margin:0 0 0 0.3em; }
   .mixed-note { color:#8a6500; font-size:0.85em; font-style:italic; }
   #email-dirty-note { color:#8a6500; font-size:0.85em; }
+  .policy-banner.due { background:#fff4cf; border:1px solid #e6c34d; border-radius:6px; padding:0.7em 1em; margin:0.6em 0; color:#6b4e00; font-size:0.92em; }
+  .policy-note { font-size:0.85em; color:#666; margin:0.3em 0 0.6em; }
 </style>"""
 
 
@@ -483,6 +532,8 @@ def render_summary_html(
     s: Summary,
     accept_url: str = "/accept-master-rule",
     can_accept: bool = False,
+    policy: dict | None = None,
+    policy_url: str = "",
 ) -> str:
     parts: list[str] = [_FINDINGS_STYLE]
 
@@ -587,6 +638,9 @@ def render_summary_html(
 
     parts.append("<h2>4. Other findings</h2>")
 
+    if s.products_not_on_master or s.tenant_price_missing:
+        parts.append(_policy_banner_html(policy, policy_url, can_accept))
+
     if can_accept and (s.products_not_on_master or s.tenant_price_missing):
         parts.append(
             "<div class='result eff-date-bar'>"
@@ -604,11 +658,10 @@ def render_summary_html(
     else:
         parts.append(
             "<p class='sub'>Charged price, margin over FB cost, and our <strong>suggested</strong> "
-            "price to set (cask FB cost + £35/keg; other draught 40% gross margin pre-retro). Healthy "
-            "charged margin &rarr; add it at the charged price; otherwise the email below instructs "
-            "LWC to set our suggested price.</p>"
+            "price to set (per the policy shown above). Healthy charged margin &rarr; add it at the "
+            "charged price; otherwise the email below instructs LWC to set our suggested price.</p>"
         )
-        parts.append(_acceptable_table(s.products_not_on_master, can_accept))
+        parts.append(_acceptable_table(s.products_not_on_master, can_accept, policy))
 
     parts.append(
         f"<h3>Tenant price missing for site <span class='pill'>{len(s.tenant_price_missing)}</span></h3>"
@@ -621,7 +674,7 @@ def render_summary_html(
             "margin, and our suggested price are shown &mdash; accept the charged price into the master, "
             "or let the email below instruct LWC to set our suggested price.</p>"
         )
-        parts.append(_acceptable_table(s.tenant_price_missing, can_accept))
+        parts.append(_acceptable_table(s.tenant_price_missing, can_accept, policy))
 
     if s.sites_in_sales_not_on_master:
         parts.append(
@@ -657,14 +710,14 @@ def render_summary_html(
                 {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
                  "desc": r.product_desc, "charged": round(r.charged, 2),
                  "cost": round(r.cost, 2), "qty": r.qty,
-                 "suggested": _sug_round(r.product_desc, r.cost), "is_cask": _is_cask(r.product_desc)}
+                 "suggested": _sug_round(r.product_desc, r.cost, policy), "is_cask": _is_cask(r.product_desc)}
                 for r in s.products_not_on_master
             ],
             "missing_prices": [
                 {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
                  "desc": r.product_desc, "charged": round(r.charged, 2),
                  "cost": round(r.cost, 2), "qty": r.qty,
-                 "suggested": _sug_round(r.product_desc, r.cost), "is_cask": _is_cask(r.product_desc)}
+                 "suggested": _sug_round(r.product_desc, r.cost, policy), "is_cask": _is_cask(r.product_desc)}
                 for r in s.tenant_price_missing
             ],
         }
@@ -672,9 +725,8 @@ def render_summary_html(
         parts.append(
             "<p class='sub'>Auto-drafted from the price mismatches and missing items above &mdash; "
             "the tenant prices for LWC to correct, plus our <strong>required prices</strong> for "
-            "anything missing (cask at a fixed £35/keg margin, other draught at 40% gross margin "
-            "pre-retro) to instruct rather than ask. Accepting an item into the master removes it "
-            "from this draft. Edit freely, then copy or open in your mail app.</p>"
+            "anything missing, to instruct rather than ask. Accepting an item into the master removes "
+            "it from this draft. Edit freely, then copy or open in your mail app.</p>"
         )
         parts.append(
             "<div class='email-draft'>"

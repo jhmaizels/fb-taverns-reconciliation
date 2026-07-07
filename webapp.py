@@ -78,6 +78,8 @@ from airtable_io import (  # noqa: E402
     end_all_site_rules,
     update_product,
     load_master_snapshot,
+    load_pricing_policy,
+    save_pricing_policy,
     publish_patched_snapshot,
     refresh_master_cache_async,
     rename_site,
@@ -680,6 +682,10 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
     # the Excel-upload path is retired from this page — /upload-master stays
     # routable for a bulk re-import emergency, but day-to-day everything is
     # edited in the grid and reconciliations check against it directly.
+    policy_link = (
+        f' <a class="button" href="{ext_url("/master/policy")}" style="margin-top:0;background:#666">Suggested-price policy</a>'
+        if role_at_least(principal.role, "admin") else ""
+    )
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
@@ -690,7 +696,7 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
   margins, and (admins) edit directly in the grid — prices, products, sites, the annual increase. Every change
   takes effect from the day it's made, with history kept underneath, and reconciliations check supplier files
   against it.</p>
-  <p style="margin-bottom:0"><a class="button" href="{ext_url('/master')}" style="margin-top:0">Open price file</a></p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/master')}" style="margin-top:0">Open price file</a>{policy_link}</p>
 </div>
 
 <div class="grid2" style="margin-top:1em">
@@ -787,10 +793,16 @@ def upload(
                 pass
 
     summary = build_summary(original_name, lines, mismatches, sites, active_site_ids=active_site_ids)
+    try:
+        policy = load_pricing_policy()
+    except Exception:
+        policy = None  # render falls back to defaults
     summary_html = render_summary_html(
         summary,
         accept_url=ext_url("/accept-master-rule"),
         can_accept=role_at_least(principal.role, "admin"),
+        policy=policy,
+        policy_url=ext_url("/master/policy"),
     )
 
     return f"""{render_head(principal.email, principal.role)}
@@ -964,6 +976,127 @@ async def accept_master_rule(
         "updated": result.updated,
         "message": f"{site_id}/{product_code} set to £{tenant_price:.2f} from {vf.isoformat()}",
     })
+
+
+def _policy_page_html(policy: dict | None, saved: bool = False, errors: list | None = None) -> str:
+    p = policy or {}
+    _c = p.get("cask_margin_gbp")
+    cask = float(_c) if _c is not None else 35.0
+    _g = p.get("draught_target_gp")
+    gp = float(_g) if _g is not None else 0.40
+    gp_pct = gp * 100 if gp < 1 else gp
+    eff = p.get("effective_from") or "2026-04-01"
+    review = p.get("next_review_date") or "2027-04-01"
+    if errors:
+        msg = "<div class='result err'><ul>" + "".join(f"<li>{escape(e)}</li>" for e in errors) + "</ul></div>"
+    elif saved:
+        msg = ("<div class='result' style='border-color:#9ecb9e;background:#eef7ea'>Saved. "
+               "New suggested prices take effect immediately.</div>")
+    else:
+        msg = ""
+    return f"""
+<p class="sub" style="margin-top:0"><a href="{ext_url('/lwc')}">&larr; Back to LWC</a></p>
+<h1>Suggested-price policy</h1>
+<p class="sub">These drive the <strong>Suggested</strong> price on the reconciliation findings page
+and the prices the LWC email instructs. Cask is a fixed &pound;/keg margin over FB cost; other draught
+targets a gross-margin % of the selling price (pre-retro).</p>
+{msg}
+<form action="{ext_url('/master/policy/apply')}" method="post" style="max-width:540px">
+  <label for="cask">Cask margin (&pound; per keg, over FB cost)</label>
+  <input type="number" step="0.01" min="0" name="cask_margin_gbp" id="cask" value="{cask:.2f}" required>
+  <label for="gp">Target draught margin (% gross margin, pre-retro)</label>
+  <input type="number" step="0.1" min="0" max="99.9" name="draught_target_gp_pct" id="gp" value="{gp_pct:.1f}" required>
+  <label for="eff">Effective from</label>
+  <input type="date" name="effective_from" id="eff" value="{escape(str(eff))}" required>
+  <label for="review">Next review date (annual RPI uplift)</label>
+  <input type="date" name="next_review_date" id="review" value="{escape(str(review))}" required>
+  <p class="help">On/after the review date, the findings page shows a reminder to increase these and
+  <strong>inform LWC that the cask margin rises across the board</strong>. After the annual RPI uplift,
+  bump the cask margin here and roll this date forward a year.</p>
+  <button type="submit">Save policy</button>
+</form>
+"""
+
+
+@app.get("/master/policy", response_class=HTMLResponse)
+async def master_policy(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Admin box for the suggested-price policy (cask £/keg, target draught GP,
+    effective + next-review dates). Reads with defaults, so it works before the
+    Config table exists."""
+    try:
+        policy = await run_in_threadpool(load_pricing_policy)
+    except Exception:
+        logger.exception("policy load failed")
+        policy = None
+    body = _policy_page_html(policy, saved=(request.query_params.get("saved") == "1"))
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+@app.post("/master/policy/apply")
+async def master_policy_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+
+    def _num(name: str):
+        try:
+            v = float((form.get(name) or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    cask = _num("cask_margin_gbp")
+    gp_pct = _num("draught_target_gp_pct")
+    eff_d = _parse_date((form.get("effective_from") or "").strip())
+    review_d = _parse_date((form.get("next_review_date") or "").strip())
+
+    errors: list[str] = []
+    if cask is None or cask < 0:
+        errors.append("Cask margin must be a non-negative number.")
+    if gp_pct is None or not (0 <= gp_pct < 100):
+        errors.append("Target draught margin must be a percentage between 0 and 100.")
+    if eff_d is None:
+        errors.append("Effective-from date is not a valid date.")
+    if review_d is None:
+        errors.append("Next-review date is not a valid date.")
+
+    async def _rerender(errs: list[str], status: int) -> HTMLResponse:
+        try:
+            pol = await run_in_threadpool(load_pricing_policy)
+        except Exception:
+            pol = None
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{_policy_page_html(pol, errors=errs)}{PAGE_FOOT}",
+            status_code=status,
+        )
+
+    if errors:
+        return await _rerender(errors, 400)
+
+    # Store dates normalised to ISO (the form's <input type=date> already yields
+    # ISO, but a direct/curl submit could send an ambiguous non-ISO string).
+    values = {
+        "cask_margin_gbp": cask,
+        "draught_target_gp": gp_pct / 100.0,
+        "effective_from": eff_d.isoformat(),
+        "next_review_date": review_d.isoformat(),
+    }
+    try:
+        await run_in_threadpool(save_pricing_policy, values, principal.email)
+    except Exception:
+        logger.exception("policy save failed")
+        return await _rerender([
+            "Could not save the policy — please try again.",
+            "If this persists, the Airtable token may need schema (metadata) access to create the Config table.",
+        ], 502)
+    logger.info("pricing-policy updated by %s (cask=%.2f gp=%.3f)", principal.email, cask, gp_pct / 100.0)
+    return RedirectResponse(ext_url("/master/policy") + "?saved=1", status_code=303)
 
 
 @app.post("/upload-retro", response_class=HTMLResponse)

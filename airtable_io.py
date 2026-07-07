@@ -300,6 +300,160 @@ def refresh_master_cache_async() -> None:
     threading.Thread(target=_work, daemon=True, name="master-cache-refresh").start()
 
 
+# ---------- pricing policy config (Config table, single record) ----------
+# The cask fixed £/keg margin and the draught target GP drive the "suggested
+# price" on the findings page + the LWC email. They change once a year at the
+# April RPI uplift, so they live in an editable Config record (admin box) rather
+# than in code. Reads fall back to defaults (env-overridable) so the app works
+# even before the Config table/record exists; the table is auto-created on the
+# first save. next_review_date drives the annual "review + tell LWC" reminder.
+
+def _envf(name: str, default: float) -> float:
+    """Env float with a tolerant fallback — a fat-fingered Render var (a stray
+    £/%/comma) must never raise at import and take the whole app (incl. /healthz)
+    down with it."""
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+PRICING_POLICY_DEFAULTS = {
+    "cask_margin_gbp": _envf("CASK_FIXED_MARGIN_GBP", 35.0),
+    "draught_target_gp": _envf("DRAUGHT_TARGET_GP", 0.40),
+    "effective_from": os.environ.get("PRICING_EFFECTIVE_FROM", "2026-04-01"),
+    "next_review_date": os.environ.get("PRICING_REVIEW_DATE", "2027-04-01"),
+}
+
+_CONFIG_TABLE_NAME = "Config"
+_POLICY_KEY = "pricing_policy"
+_META_URL = f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables"
+_CONFIG_TABLE_ID: dict = {"id": None}
+_POLICY_CACHE: dict = {"policy": None, "ts": 0.0}
+_POLICY_TTL = float(os.environ.get("POLICY_CACHE_TTL", "60"))
+_POLICY_FIELDS = ["key", "cask_margin_gbp", "draught_target_gp", "effective_from", "next_review_date"]
+
+
+def _resolve_config_table_id(create: bool = False) -> str | None:
+    """Config table id, resolved by name via the Metadata API (cached). With
+    create=True, create the table if missing (raises AirtableError on failure).
+    Returns None when the table doesn't exist and create=False, or metadata is
+    unavailable — callers then fall back to defaults."""
+    if _CONFIG_TABLE_ID["id"]:
+        return _CONFIG_TABLE_ID["id"]
+    _require_env()
+    try:
+        r = requests.get(_META_URL, headers=HEADERS)
+        if r.status_code < 300:
+            for t in r.json().get("tables", []):
+                if t.get("name") == _CONFIG_TABLE_NAME:
+                    _CONFIG_TABLE_ID["id"] = t["id"]
+                    return t["id"]
+    except Exception:
+        if not create:
+            return None
+    if not create:
+        return None
+    spec = {
+        "name": _CONFIG_TABLE_NAME,
+        "description": "App settings (single-record key/value). 'pricing_policy' holds the cask/draught pricing policy.",
+        "fields": [
+            {"name": "key", "type": "singleLineText"},
+            {"name": "cask_margin_gbp", "type": "number", "options": {"precision": 2}},
+            {"name": "draught_target_gp", "type": "number", "options": {"precision": 4}},
+            {"name": "effective_from", "type": "date", "options": {"dateFormat": {"name": "iso"}}},
+            {"name": "next_review_date", "type": "date", "options": {"dateFormat": {"name": "iso"}}},
+            {"name": "updated_by", "type": "singleLineText"},
+            {"name": "updated_at", "type": "singleLineText"},
+        ],
+    }
+    r = requests.post(_META_URL, headers=HEADERS, json=spec)
+    if r.status_code >= 300:
+        # The table may already exist (a concurrent create, or the earlier GET
+        # transiently failed) — re-list before giving up so we never duplicate it.
+        try:
+            r2 = requests.get(_META_URL, headers=HEADERS)
+            if r2.status_code < 300:
+                for t in r2.json().get("tables", []):
+                    if t.get("name") == _CONFIG_TABLE_NAME:
+                        _CONFIG_TABLE_ID["id"] = t["id"]
+                        return t["id"]
+        except Exception:
+            pass
+        raise AirtableError(f"Could not create {_CONFIG_TABLE_NAME} table: {r.status_code} {r.text[:200]}")
+    tid = r.json()["id"]
+    _CONFIG_TABLE_ID["id"] = tid
+    return tid
+
+
+def invalidate_policy_cache() -> None:
+    _POLICY_CACHE["policy"] = None
+    _POLICY_CACHE["ts"] = 0.0
+
+
+def load_pricing_policy(force_refresh: bool = False) -> dict:
+    """The pricing policy {cask_margin_gbp, draught_target_gp, effective_from,
+    next_review_date}. Served from a short-lived cache; ALWAYS returns a usable
+    dict — any Airtable problem falls back to PRICING_POLICY_DEFAULTS."""
+    now = time.monotonic()
+    if not force_refresh and _POLICY_CACHE["policy"] is not None and (now - _POLICY_CACHE["ts"]) < _POLICY_TTL:
+        return _POLICY_CACHE["policy"]
+    policy = dict(PRICING_POLICY_DEFAULTS)
+    try:
+        tid = _resolve_config_table_id(create=False)
+        if tid:
+            rec = next(
+                (r for r in _list_all(tid, fields=_POLICY_FIELDS)
+                 if r["fields"].get("key") == _POLICY_KEY),
+                None,
+            )
+            if rec:
+                f = rec["fields"]
+                if f.get("cask_margin_gbp") is not None:
+                    policy["cask_margin_gbp"] = float(f["cask_margin_gbp"])
+                if f.get("draught_target_gp") is not None:
+                    policy["draught_target_gp"] = float(f["draught_target_gp"])
+                if f.get("effective_from"):
+                    policy["effective_from"] = str(f["effective_from"])[:10]
+                if f.get("next_review_date"):
+                    policy["next_review_date"] = str(f["next_review_date"])[:10]
+    except Exception:
+        logging.getLogger("fbtaverns.airtable").warning(
+            "load_pricing_policy fell back to defaults", exc_info=True
+        )
+    _POLICY_CACHE["policy"] = policy
+    _POLICY_CACHE["ts"] = now
+    return policy
+
+
+def save_pricing_policy(values: dict, actor: str = "") -> dict:
+    """Upsert the pricing_policy record (creating the Config table if missing).
+    Returns the freshly-loaded policy. Raises AirtableError if the table can't
+    be reached/created."""
+    tid = _resolve_config_table_id(create=True)
+    if not tid:
+        raise AirtableError("Config table is unavailable (Airtable metadata access needed).")
+    rec = next(
+        (r for r in _list_all(tid, fields=["key"]) if r["fields"].get("key") == _POLICY_KEY),
+        None,
+    )
+    fields = {
+        "key": _POLICY_KEY,
+        "cask_margin_gbp": float(values["cask_margin_gbp"]),
+        "draught_target_gp": float(values["draught_target_gp"]),
+        "effective_from": values["effective_from"],
+        "next_review_date": values["next_review_date"],
+        "updated_by": actor or "",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if rec:
+        _batch([{"id": rec["id"], "fields": fields}], "update", tid)
+    else:
+        _batch([{"fields": fields}], "create", tid)
+    invalidate_policy_cache()
+    return load_pricing_policy(force_refresh=True)
+
+
 def rename_site(site_id: str, name: str) -> str:
     """Set a site's display name (Sites.name). Returns the record id.
 
