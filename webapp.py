@@ -843,77 +843,121 @@ async def accept_master_rule(
     if vf is None:
         return JSONResponse({"ok": False, "error": "Could not read the effective date."}, status_code=400)
 
+    site_n = _to_str_code(site_id)
+    code_n = _to_str_code(product_code)
     try:
         snap = await run_in_threadpool(load_master_snapshot)
+
+        # Inherit the product-level retro when the product is already on the
+        # master (the tenant_price_missing case) so the new rule's net price /
+        # margin match the rest of the estate. For a product not on the master at
+        # all, retro is unknown and stays 0 for a later master update / LWC confirm.
+        retro_pct = None
+        products = getattr(snap, "products", {}) or {}
+        prod = products.get(product_code) or products.get(code_n)
+        if prod and fb_price and fb_price > 0:
+            retro_gbp = float(prod.get("retro_per_keg") or 0.0)
+            if retro_gbp > 0:
+                retro_pct = retro_gbp / fb_price
+
+        change = MasterChange(
+            op="add_rule",
+            site_id=site_id,
+            product_code=product_code,
+            product_desc=product_desc or None,
+            tenant_price=tenant_price,
+            fb_price=fb_price if (fb_price and fb_price > 0) else None,
+            retro_pct=retro_pct,
+            status="tenanted",
+            valid_from=vf,
+            reason="accepted invoiced price from reconciliation findings",
+            source_note="findings",
+            create_missing_site=True,
+            create_missing_product=True,
+        )
+        preview = preview_master_change(change, snap)
+
+        if preview.errors:
+            # A prior accept can leave the rule ALREADY created at this exact key
+            # — e.g. the hub proxy timed out on a cold-cache rebuild and showed a
+            # spurious error while the write actually landed. Make the retry
+            # idempotent: same price -> report it's already set; a different
+            # existing price -> send the operator to the master editor.
+            existing = next(
+                (r for r in snap.rules
+                 if _to_str_code(r.site_id) == site_n
+                 and _to_str_code(r.product_code) == code_n
+                 and r.valid_from == vf),
+                None,
+            )
+            if existing is not None:
+                if existing.tenant_price is not None and abs(existing.tenant_price - tenant_price) <= 0.01:
+                    return JSONResponse({
+                        "ok": True, "created": 0, "updated": 0, "already": True,
+                        "message": f"{site_id}/{product_code} is already set to £{tenant_price:.2f}.",
+                    })
+                other = (f"£{existing.tenant_price:.2f}" if existing.tenant_price is not None else "a different price")
+                return JSONResponse({
+                    "ok": False, "needs_editor": True,
+                    "error": (
+                        f"{other} already starts on {vf.isoformat()} for this product — open it in "
+                        "the master editor to change it."
+                    ),
+                }, status_code=409)
+            return JSONResponse({"ok": False, "error": "; ".join(preview.errors)}, status_code=400)
+
+        # A one-click accept must only ADD a genuinely-missing price. If it would
+        # CLOSE an existing open rule (e.g. an older invoice line predating a live
+        # price), refuse and route to the master editor rather than silently
+        # overwriting a live price.
+        if preview.will_close:
+            return JSONResponse({
+                "ok": False,
+                "needs_editor": True,
+                "error": (
+                    "This site already has a live price for this product that accepting would "
+                    "replace. Open it in the master editor to change the price with a full preview."
+                ),
+            }, status_code=409)
+
+        try:
+            result = await run_in_threadpool(apply_master_change, change, principal.email)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+        except Exception:
+            logger.exception("accept apply failed")
+            from airtable_io import invalidate_master_cache  # noqa: E402
+            invalidate_master_cache()
+            refresh_master_cache_async()
+            return JSONResponse({
+                "ok": False,
+                "error": "The change could not be saved — please try again (and check Airtable in case it was set).",
+            }, status_code=502)
     except Exception:
-        logger.exception("accept: snapshot load failed")
-        return JSONResponse({"ok": False, "error": "Server error preparing the change."}, status_code=500)
-
-    # Inherit the product-level retro when the product is already on the master
-    # (the tenant_price_missing case) so the new rule's net price / margin match
-    # the rest of the estate. For a product not on the master at all, retro is
-    # genuinely unknown and stays 0 for a later master update / LWC confirmation.
-    retro_pct = None
-    products = getattr(snap, "products", {}) or {}
-    prod = products.get(product_code) or products.get(_to_str_code(product_code))
-    if prod and fb_price and fb_price > 0:
-        retro_gbp = float(prod.get("retro_per_keg") or 0.0)
-        if retro_gbp > 0:
-            retro_pct = retro_gbp / fb_price
-
-    change = MasterChange(
-        op="add_rule",
-        site_id=site_id,
-        product_code=product_code,
-        product_desc=product_desc or None,
-        tenant_price=tenant_price,
-        fb_price=fb_price if (fb_price and fb_price > 0) else None,
-        retro_pct=retro_pct,
-        status="tenanted",
-        valid_from=vf,
-        reason="accepted invoiced price from reconciliation findings",
-        source_note="findings",
-        create_missing_site=True,
-        create_missing_product=True,
-    )
-    preview = preview_master_change(change, snap)
-    if preview.errors:
-        return JSONResponse({"ok": False, "error": "; ".join(preview.errors)}, status_code=400)
-    # A one-click accept must only ADD a genuinely-missing price. If it would
-    # CLOSE an existing open rule (e.g. an older invoice line predating a live
-    # price), refuse and send the operator to the master editor — which shows the
-    # full close/winner preview — rather than silently overwriting a live price.
-    if preview.will_close:
+        logger.exception("accept-master-rule failed before write")
         return JSONResponse({
             "ok": False,
-            "needs_editor": True,
-            "error": (
-                "This site already has a live price for this product that accepting would "
-                "replace. Open it in the master editor to change the price with a full preview."
-            ),
-        }, status_code=409)
-    try:
-        result = await run_in_threadpool(apply_master_change, change, principal.email)
-    except ValueError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
-    except Exception:
-        logger.exception("accept apply failed")
-        from airtable_io import invalidate_master_cache  # noqa: E402
-        invalidate_master_cache()
-        refresh_master_cache_async()
-        return JSONResponse({"ok": False, "error": "The change could not be saved — please try again."}, status_code=502)
-    # Keep the master cache warm — a burst of accepts must not land it on None and
-    # force a ~30s inline rebuild on the next read. Publish the in-memory patch the
-    # way the grid editor does, then kick the authoritative background refresh.
+            "error": "Something went wrong preparing the change. If it recurs, check Airtable in case the price was set.",
+        }, status_code=500)
+
+    # ---- the write SUCCEEDED past this point; never report failure now. Keep the
+    # cache warm (a completed accept must not leave it on None → a ~30s inline
+    # rebuild that times out the hub proxy). All best-effort. ----
     try:
         publish_patched_snapshot(patch_snapshot_for_change(snap, change, principal.email))
     except Exception:
         logger.exception("accept: snapshot patch failed — background refresh will catch up")
-    refresh_master_cache_async()
-    logger.info(
-        "findings-accept %s/%s -> £%.2f by %s (created=%d updated=%d)",
-        site_id, product_code, tenant_price, principal.email, result.created, result.updated,
-    )
+    try:
+        refresh_master_cache_async()
+    except Exception:
+        logger.exception("accept: cache refresh kick failed")
+    try:
+        logger.info(
+            "findings-accept %s/%s -> £%.2f by %s (created=%d updated=%d)",
+            site_id, product_code, tenant_price, principal.email, result.created, result.updated,
+        )
+    except Exception:
+        pass
     return JSONResponse({
         "ok": True,
         "created": result.created,
