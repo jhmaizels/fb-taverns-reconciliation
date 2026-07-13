@@ -560,10 +560,24 @@ def render_summary_html(
     )
 
     parts.append("<h2>1. Tenant pricing mismatches — by site &amp; product</h2>")
+    span1 = 8 if can_accept else 7
     if not s.tenant_blocks:
         parts.append("<p><em>No tenant pricing mismatches.</em></p>")
     else:
+        if can_accept:
+            parts.append(
+                "<p class='sub'>The <strong>Set master to charged</strong> button accepts LWC's "
+                "charged price into the master as a change <strong>from today</strong> (past invoices "
+                "unaffected). Use it only when the price legitimately changed and the master is stale — "
+                "not to paper over an LWC error.</p>"
+            )
         for b in s.tenant_blocks:
+            # A (site, product) can appear on more than one line; only offer a
+            # one-click overwrite when every occurrence was charged the SAME
+            # price. Differing prices are ambiguous -> route to the editor.
+            charged_by_product: dict[str, set] = {}
+            for r in b.rows:
+                charged_by_product.setdefault(r.product_code, set()).add(round(r.actual, 2))
             parts.append(
                 f"""<details open class="block">
   <summary><strong>{escape(b.site_id)} — {escape(b.site_name)}</strong>
@@ -574,6 +588,7 @@ def render_summary_html(
       <th>Product</th><th>Description</th>
       <th class="r">Expected</th><th class="r">Charged</th>
       <th class="r">Qty</th><th class="r">Δ / unit</th><th class="r">Δ total</th>
+      {'<th></th>' if can_accept else ''}
     </tr></thead>
     <tbody>"""
             )
@@ -582,6 +597,28 @@ def render_summary_html(
                 desc_cell = escape(r.product_desc)
                 if r.support_note:
                     desc_cell += " <span class='support-tag'>SUPPORT</span>"
+                acc_cell = ""
+                if can_accept:
+                    if r.support_note:
+                        # Never overwrite a temporary support arrangement one-click.
+                        acc_cell = "<td></td>"
+                    elif len(charged_by_product.get(r.product_code, ())) > 1:
+                        acc_cell = (
+                            "<td><span class='mixed-note' title='Charged at more than one price in "
+                            "this file — set it in the master editor'>use editor</span></td>"
+                        )
+                    elif r.actual and r.actual > 0:
+                        acc_cell = (
+                            "<td><button type='button' class='accept-btn'"
+                            f" data-site=\"{escape(b.site_id, quote=True)}\""
+                            f" data-sitename=\"{escape(b.site_name, quote=True)}\""
+                            f" data-product=\"{escape(r.product_code, quote=True)}\""
+                            f" data-desc=\"{escape(r.product_desc, quote=True)}\""
+                            f" data-charged=\"{r.actual:.2f}\" data-expected=\"{r.expected:.2f}\""
+                            " data-overwrite=\"1\">Set master to charged</button></td>"
+                        )
+                    else:
+                        acc_cell = "<td></td>"
                 parts.append(
                     f"<tr class='{cls}'>"
                     f"<td>{escape(r.product_code)}</td>"
@@ -591,12 +628,13 @@ def render_summary_html(
                     f"<td class='r'>{r.qty:g}</td>"
                     f"<td class='r'>{_money(r.delta_per_unit)}</td>"
                     f"<td class='r'><strong>{_money(r.delta_total)}</strong></td>"
+                    f"{acc_cell}"
                     f"</tr>"
                 )
                 if r.support_note:
                     parts.append(
                         f"<tr class='support-note'>"
-                        f"<td colspan='7'><em>{escape(r.support_note)}</em></td>"
+                        f"<td colspan='{span1}'><em>{escape(r.support_note)}</em></td>"
                         f"</tr>"
                     )
             parts.append("</tbody></table></details>")
@@ -798,10 +836,11 @@ _FINDINGS_JS = """<script>
     L.push('');
     L.push('Reviewing ' + e.file + ', the following need your attention:');
     L.push('');
-    if (e.tenant_mismatches && e.tenant_mismatches.length) {
+    var tmis = (e.tenant_mismatches || []).filter(function (m) { return !accepted.has(m.site + '|' + m.product); });
+    if (tmis.length) {
       L.push('1) Tenant prices charged that differ from the agreed price - please correct these on your system:');
       var total1 = 0;
-      e.tenant_mismatches.forEach(function (m) {
+      tmis.forEach(function (m) {
         total1 += Number(m.delta_total) || 0;
         L.push('   - ' + m.site + ' ' + m.site_name + ' / ' + m.product + ' ' + m.desc +
                ': agreed ' + money(m.expected) + ', charged ' + money(m.charged) +
@@ -855,12 +894,24 @@ _FINDINGS_JS = """<script>
 
   function acceptRule(btn) {
     var d = btn.dataset;
-    var msg = 'Add to the live pricing master?\\n\\n' +
-      'Site ' + d.site + ' ' + d.sitename + '\\n' +
-      'Product ' + d.product + ' ' + d.desc + '\\n' +
-      'Tenant price: ' + money(d.charged) + '\\n' +
-      'FB cost: ' + money(d.cost) + '\\n' +
-      'Effective from: ' + effDate();
+    var overwrite = d.overwrite === '1';
+    var msg;
+    if (overwrite) {
+      // A tenant-mismatch line already has a live agreed price; this OVERWRITES
+      // it with the charged price, effective today.
+      msg = 'Change the live master price to what LWC charged?\\n\\n' +
+        'Site ' + d.site + ' ' + d.sitename + '\\n' +
+        'Product ' + d.product + ' ' + d.desc + '\\n' +
+        'From ' + money(d.expected) + ' to ' + money(d.charged) + '\\n' +
+        'Effective today \\u2014 past invoices are unaffected.';
+    } else {
+      msg = 'Add to the live pricing master?\\n\\n' +
+        'Site ' + d.site + ' ' + d.sitename + '\\n' +
+        'Product ' + d.product + ' ' + d.desc + '\\n' +
+        'Tenant price: ' + money(d.charged) + '\\n' +
+        'FB cost: ' + money(d.cost) + '\\n' +
+        'Effective from: ' + effDate();
+    }
     if (!window.confirm(msg)) return;
     var orig = btn.textContent;
     btn.disabled = true;
@@ -870,9 +921,13 @@ _FINDINGS_JS = """<script>
     params.set('product_code', d.product);
     params.set('product_desc', d.desc);
     params.set('tenant_price', d.charged);
-    params.set('fb_price', d.cost);
-    params.set('valid_from', effDate());
     params.set('source_file', CFG.sourceFile);
+    if (overwrite) {
+      params.set('overwrite', '1');   // server forces valid_from = today
+    } else {
+      params.set('fb_price', d.cost);
+      params.set('valid_from', effDate());
+    }
     fetch(CFG.acceptUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -889,7 +944,7 @@ _FINDINGS_JS = """<script>
         td.textContent = '';
         var tag = document.createElement('span');
         tag.className = 'accepted-tag';
-        tag.textContent = '\\u2713 added';
+        tag.textContent = overwrite ? '\\u2713 updated' : '\\u2713 added';
         td.appendChild(tag);
         accepted.add(d.site + '|' + d.product);
         if (bodyDirty) {

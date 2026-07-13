@@ -1441,6 +1441,81 @@ def test_route_cross_origin_post_rejected():
     assert not fa.calls, "cross-origin POSTs must never reach a write"
 
 
+def test_route_accept_overwrite_price_change_from_today():
+    """The tenant-mismatch 'Set master to charged' button (overwrite=1) accepts
+    the charged price as a FROM-TODAY price change: closes the live rule today,
+    opens a successor at the charged price today (fb inherited). Never backdates."""
+    today_iso = date.today().isoformat()
+    rec = _grid_rule("rec_live", vf="2026-01-01")   # live £180 since January
+    rec["fields"]["fb_price"] = 200.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/accept-master-rule", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "195.00", "overwrite": "1",
+            })
+            assert r.status_code == 200, r.text[:300]
+            j = r.json()
+            assert j["ok"] is True and "from today" in j["message"], j
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_live"]
+            assert closes[0]["fields"]["valid_to"] == today_iso
+            created = _creates(fa)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["tenant_price"] == 195.0 and f["valid_from"] == today_iso
+            assert f["fb_price"] == 200.0, "fb inherited from the live rule"
+
+
+def test_route_accept_overwrite_idempotent_same_price():
+    """Overwriting to the SAME live price writes nothing and reports already-set."""
+    rec = _grid_rule("rec_live", vf="2026-01-01")   # £180
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/accept-master-rule", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "180.00", "overwrite": "1",
+            })
+            assert r.status_code == 200
+            j = r.json()
+            assert j.get("ok") is True and j.get("already") is True, j
+            assert not _updates(fa) and not _creates(fa), "no write when already at that price"
+
+
+def test_findings_overwrite_button_render_and_guards():
+    """Section 1 shows the overwrite button for admins only; a support row and a
+    product charged at >1 price in the file get NO one-click button."""
+    from summary import Summary, TenantSiteBlock, TenantRow, render_summary_html
+
+    def _summary(rows):
+        return Summary(
+            file_name="wk.csv", line_count=len(rows), mismatch_count=len(rows),
+            tenant_blocks=[TenantSiteBlock(site_id="001", site_name="Bar", rows=rows)],
+            fb_blocks=[], missing_sites=[], products_not_on_master=[],
+            tenant_price_missing=[], sites_in_sales_not_on_master=[], other_counts={},
+        )
+
+    single = _summary([TenantRow("P1", "Ale 9G", 180.0, 195.0, 2, 15.0, 30.0)])
+    html_admin = render_summary_html(single, can_accept=True)
+    assert 'data-overwrite="1"' in html_admin and "Set master to charged" in html_admin
+    assert 'data-charged="195.00"' in html_admin and 'data-expected="180.00"' in html_admin
+    html_view = render_summary_html(single, can_accept=False)
+    assert "Set master to charged" not in html_view, "viewers get no accept button"
+
+    # Support row -> no one-click overwrite (assert on the button marker, since
+    # the section's explanatory intro paragraph also mentions the button name).
+    supp = _summary([TenantRow("P1", "Ale 9G", 180.0, 195.0, 1, 15.0, 15.0, "support in effect")])
+    assert 'data-overwrite="1"' not in render_summary_html(supp, can_accept=True)
+
+    # Same product charged at two different prices -> ambiguous, route to editor.
+    mixed = _summary([
+        TenantRow("P1", "Ale 9G", 180.0, 195.0, 1, 15.0, 15.0),
+        TenantRow("P1", "Ale 9G", 180.0, 200.0, 1, 20.0, 20.0),
+    ])
+    html_mixed = render_summary_html(mixed, can_accept=True)
+    assert "use editor" in html_mixed and 'data-overwrite="1"' not in html_mixed
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -1481,6 +1556,9 @@ TESTS = [
     test_route_upload_master_updates_grid_immediately,
     test_route_export_master_from_snapshot,
     test_route_apply_revalidates_tampered_hidden_inputs,
+    test_route_accept_overwrite_price_change_from_today,
+    test_route_accept_overwrite_idempotent_same_price,
+    test_findings_overwrite_button_render_and_guards,
     test_route_cross_origin_post_rejected,
 ]
 

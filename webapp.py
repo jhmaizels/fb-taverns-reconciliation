@@ -817,6 +817,100 @@ def upload(
 {PAGE_FOOT}"""
 
 
+async def _accept_price_change_from_today(
+    principal: DrinksPrincipal,
+    site_id: str,
+    product_code: str,
+    tenant_price: float,
+) -> JSONResponse:
+    """Accept a charged price from a tenant-mismatch line as a FROM-TODAY price
+    change over the existing live rule. Backs the mismatch section's button;
+    returns JSON for the in-page fetch. Mirrors /master/cell/apply's op routing
+    (price_change, or fix_in_place when the live rule already starts today) so
+    the same key never collides, and flows through the same master_changes seam.
+    Never backdates: past invoices reconciled against the old price stay put."""
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("accept-overwrite failed before write")
+        return JSONResponse(
+            {"ok": False, "error": "Something went wrong preparing the change."},
+            status_code=500,
+        )
+    if site_id not in snap.sites or product_code not in snap.product_ids:
+        return JSONResponse(
+            {"ok": False, "needs_editor": True,
+             "error": f"{site_id}/{product_code} is not on the master — add it via the editor."},
+            status_code=404,
+        )
+    winner = master_pages.pivot_winner_for(snap, site_id, product_code)
+    if winner is None or winner.tenant_price is None:
+        return JSONResponse(
+            {"ok": False, "needs_editor": True,
+             "error": "No live price to change for this product — add it via the master editor."},
+            status_code=409,
+        )
+    if abs(tenant_price - winner.tenant_price) <= 0.01:
+        return JSONResponse(
+            {"ok": True, "created": 0, "updated": 0, "already": True,
+             "message": f"{site_id}/{product_code} is already set to £{tenant_price:.2f}."}
+        )
+
+    today = date.today()
+    was = winner.tenant_price
+    common = dict(
+        site_id=site_id, product_code=product_code, tenant_price=tenant_price,
+        status=winner.status or "tenanted", valid_from=today,
+        reason=f"accepted charged price from reconciliation (was £{was:.2f})",
+        source_note="findings",
+    )
+    if winner.valid_from == today:
+        # The live rule already starts today -> correct it in place (same
+        # rule_key) rather than close+reopen on the same date. fb/retro None keep
+        # the stored values.
+        change = MasterChange(op="fix_in_place", fb_price=None, retro_pct=None, **common)
+    else:
+        change = MasterChange(
+            op="price_change", fb_price=winner.fb_price,
+            retro_pct=winner.retro_pct or None, **common,
+        )
+
+    preview = preview_master_change(change, snap)
+    if preview.errors:
+        return JSONResponse({"ok": False, "error": "; ".join(preview.errors)}, status_code=400)
+    try:
+        result = await run_in_threadpool(apply_master_change, change, principal.email)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    except Exception:
+        logger.exception("accept-overwrite apply failed")
+        from airtable_io import invalidate_master_cache  # noqa: E402
+        invalidate_master_cache()
+        refresh_master_cache_async()
+        return JSONResponse(
+            {"ok": False,
+             "error": "The change could not be saved — please try again "
+                      "(and check Airtable in case it was set)."},
+            status_code=502,
+        )
+    try:
+        publish_patched_snapshot(patch_snapshot_for_change(snap, change, principal.email))
+    except Exception:
+        logger.exception("accept-overwrite: snapshot patch failed — background refresh will catch up")
+    refresh_master_cache_async()
+    try:
+        logger.info(
+            "findings-overwrite %s/%s £%.2f -> £%.2f by %s",
+            site_id, product_code, was, tenant_price, principal.email,
+        )
+    except Exception:
+        pass
+    return JSONResponse({
+        "ok": True, "created": result.created, "updated": result.updated,
+        "message": f"{site_id}/{product_code} changed to £{tenant_price:.2f} from today (was £{was:.2f})",
+    })
+
+
 @app.post("/accept-master-rule")
 async def accept_master_rule(
     request: Request,
@@ -851,6 +945,19 @@ async def accept_master_rule(
         return JSONResponse({"ok": False, "error": "A valid positive charged price is required."}, status_code=400)
     if fb_price == "err":
         fb_price = None
+
+    # A tenant pricing MISMATCH line already has a live agreed price. Its button
+    # sends overwrite=1: accept the charged price as a price change FROM TODAY
+    # (operator choice 2026-07-13 — never backdated, so past reconciliations are
+    # untouched). This is the deliberate exception to the add_rule path below,
+    # which refuses to overwrite a live price; here overwriting IS the intent, so
+    # will_close is expected. The write still runs through the same
+    # validate -> apply -> patch seam.
+    if (form.get("overwrite") or "").strip():
+        return await _accept_price_change_from_today(
+            principal, site_id, product_code, tenant_price
+        )
+
     vf = _parse_date((form.get("valid_from") or "").strip())
     if vf is None:
         return JSONResponse({"ok": False, "error": "Could not read the effective date."}, status_code=400)
