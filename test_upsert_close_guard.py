@@ -84,7 +84,10 @@ def _run_upsert(existing_pricing_records, new_rules, close_at):
         airtable_io.T["PricingRules"]: existing_pricing_records,
     }
 
-    def fake_list_all(table_id, fields=None):
+    def fake_list_all(table_id, fields=None, filter_by_formula=None):
+        # filter_by_formula (server-side scope) is verified against live Airtable
+        # separately; the fake returns the full set so the in-Python close pass —
+        # what these tests assert — runs over every record.
         out = []
         for rec in tables.get(table_id, []):
             f = rec["fields"]

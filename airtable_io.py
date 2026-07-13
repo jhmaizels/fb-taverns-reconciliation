@@ -103,7 +103,8 @@ def _do(method, url, *, params=None, json_body=None, idempotent=True):
 
 # ---------- low-level ----------
 
-def _list_all(table_id: str, fields: list[str] | None = None) -> list[dict]:
+def _list_all(table_id: str, fields: list[str] | None = None,
+              filter_by_formula: str | None = None) -> list[dict]:
     start = time.perf_counter()
     out: list[dict] = []
     pages = 0
@@ -111,6 +112,12 @@ def _list_all(table_id: str, fields: list[str] | None = None) -> list[dict]:
         params: dict = {"pageSize": 100}
         if fields:
             params["fields[]"] = fields
+        if filter_by_formula:
+            # Server-side row filter (Airtable formula). Used to scope a
+            # single-rule upsert's close pass to the touched (site, product)
+            # instead of sweeping the whole ~6600-row table (~28s) behind the
+            # 30s hub proxy.
+            params["filterByFormula"] = filter_by_formula
         offset = None
         while True:
             if offset:
@@ -916,6 +923,22 @@ def _ensure_sites_and_products(rules: list[Rule]) -> tuple[dict[str, str], dict[
     return site_ids, product_ids
 
 
+def _site_prefix_formula(site_ids_seen: list[str]) -> str | None:
+    """Airtable filterByFormula selecting PricingRules whose rule_key starts with
+    one of the given "site|" prefixes — i.e. every rule for those sites. The "|"
+    delimiter makes the prefix exact ("804|" cannot match "8041|..."). Returns
+    None if any id is unsafe to embed in a formula, so the caller reads the full
+    table instead."""
+    clauses = []
+    for sid in site_ids_seen:
+        if not sid or '"' in sid or "\\" in sid:
+            return None
+        clauses.append(f'FIND("{sid}|",{{rule_key}})=1')
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else "OR(" + ",".join(clauses) + ")"
+
+
 def upsert_pricing_rules(
     rules: list[Rule],
     close_keys_at_date: date | None,
@@ -936,7 +959,29 @@ def upsert_pricing_rules(
         lookups_out["site_ids"] = site_ids
         lookups_out["product_ids"] = product_ids
     table_id = T["PricingRules"]
-    existing = _list_all(table_id, fields=["rule_key", "valid_from", "valid_to", "site", "product"])
+    _read_fields = ["rule_key", "valid_from", "valid_to", "site", "product"]
+    # A full PricingRules sweep is ~28s at 6600+ rows (Airtable rate-limited
+    # pagination) — enough to blow the ~30s hub-proxy timeout on a single-rule
+    # edit/accept even though the write itself lands, surfacing to the operator as
+    # a spurious "Internal Server Error". When the batch touches only a few sites,
+    # scope the read to those sites' rule_key prefixes (verified: exact subset,
+    # ~1.6s for one site vs ~30s). Bulk paths (whole-file /upload-master, annual
+    # increase) touch every site and keep the full sweep — a huge OR would exceed
+    # Airtable's formula limit, and they are the accepted long-POST exception. The
+    # Python close pass below still filters by keys_in_new, so a wider-than-needed
+    # read is only slower, never wrong.
+    sites_seen = sorted({r.site_id for r in rules if r.site_id})
+    existing = None
+    if 0 < len(sites_seen) <= 5:
+        formula = _site_prefix_formula(sites_seen)
+        if formula:
+            try:
+                existing = _list_all(table_id, fields=_read_fields, filter_by_formula=formula)
+            except AirtableError:
+                logger.warning("scoped rule read failed; falling back to full sweep", exc_info=True)
+                existing = None
+    if existing is None:
+        existing = _list_all(table_id, fields=_read_fields)
     by_key = {rec["fields"].get("rule_key"): rec["id"] for rec in existing}
 
     keys_in_new = {(r.site_id, r.product_code) for r in rules}

@@ -78,7 +78,10 @@ class FakeAirtable:
         self.calls: list[tuple] = []
         self.invalidations = 0
 
-    def _list_all(self, table_id, fields=None):
+    def _list_all(self, table_id, fields=None, filter_by_formula=None):
+        # filter_by_formula is a server-side perf scope (verified against live
+        # Airtable separately); the fake returns the full set and lets the
+        # in-Python close pass do the filtering the tests actually assert on.
         out = []
         for rec in self.tables.get(table_id, []):
             f = rec["fields"]
@@ -1441,6 +1444,18 @@ def test_route_cross_origin_post_rejected():
     assert not fa.calls, "cross-origin POSTs must never reach a write"
 
 
+def test_site_prefix_formula():
+    """The scoped-read formula matches every rule_key starting with a site's
+    "site|" prefix, OR-joins multiple sites, and bails (None -> full sweep) on an
+    id that can't be safely embedded."""
+    assert airtable_io._site_prefix_formula(["804"]) == 'FIND("804|",{rule_key})=1'
+    assert airtable_io._site_prefix_formula(["804", "812"]) == (
+        'OR(FIND("804|",{rule_key})=1,FIND("812|",{rule_key})=1)'
+    )
+    assert airtable_io._site_prefix_formula([]) is None
+    assert airtable_io._site_prefix_formula(['80"4']) is None   # unsafe -> full read
+
+
 def test_route_accept_overwrite_price_change_from_today():
     """The tenant-mismatch 'Set master to charged' button (overwrite=1) accepts
     the charged price as a FROM-TODAY price change: closes the live rule today,
@@ -1556,6 +1571,7 @@ TESTS = [
     test_route_upload_master_updates_grid_immediately,
     test_route_export_master_from_snapshot,
     test_route_apply_revalidates_tampered_hidden_inputs,
+    test_site_prefix_formula,
     test_route_accept_overwrite_price_change_from_today,
     test_route_accept_overwrite_idempotent_same_price,
     test_findings_overwrite_button_render_and_guards,

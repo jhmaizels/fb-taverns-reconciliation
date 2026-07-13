@@ -893,11 +893,16 @@ async def _accept_price_change_from_today(
                       "(and check Airtable in case it was set)."},
             status_code=502,
         )
+    # ---- the write SUCCEEDED past this point; never report failure now (a
+    # completed change must not surface as a 500). All best-effort. ----
     try:
         publish_patched_snapshot(patch_snapshot_for_change(snap, change, principal.email))
     except Exception:
         logger.exception("accept-overwrite: snapshot patch failed — background refresh will catch up")
-    refresh_master_cache_async()
+    try:
+        refresh_master_cache_async()
+    except Exception:
+        logger.exception("accept-overwrite: cache refresh kick failed")
     try:
         logger.info(
             "findings-overwrite %s/%s £%.2f -> £%.2f by %s",
