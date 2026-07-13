@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from html import escape
@@ -354,8 +355,19 @@ def _policy_gp(policy) -> float:
     return gp / 100.0 if gp >= 1 else gp   # tolerate 40 entered instead of 0.40
 
 
+# A 9-gallon firkin (and a 4.5G pin) IS a cask container, so trade descriptions
+# routinely mark cask by size — "SHARPS TWIN COAST PALE ALE 9G" — without ever
+# writing the word "cask". Treat those as cask too, else they fall through to the
+# 40%-GP draught rule and get over-priced. Safe for this estate: 42/42 nine-gallon
+# products in the master are cask and none is a keg. Deliberately NOT 10G (Bass
+# cask vs Stella keg — ambiguous) and NOT the bare word "pin" (hits pineapple/gin),
+# either of which could tag a keg as cask and UNDER-price it.
+_CASK_SIZE_RE = re.compile(r"\b(?:9|4\.5)\s*g(?:al(?:lon)?s?)?\b|\bfirkin\b", re.IGNORECASE)
+
+
 def _is_cask(desc: str) -> bool:
-    return "cask" in (desc or "").lower()
+    d = (desc or "").lower()
+    return "cask" in d or bool(_CASK_SIZE_RE.search(d))
 
 
 def _suggested_price(desc: str, cost: float, policy=None) -> float | None:
