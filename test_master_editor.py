@@ -789,6 +789,10 @@ def _reset_master_cache() -> None:
     with airtable_io._MASTER_CACHE_LOCK:
         airtable_io._MASTER_CACHE["snapshot"] = None
         airtable_io._MASTER_CACHE["ts"] = 0.0
+        # Also clear the stale-fallback snapshot, else one test's master leaks
+        # into the next (production retains "last" across writes on purpose; a
+        # test swapping fake fixtures must not).
+        airtable_io._MASTER_CACHE["last"] = None
         airtable_io._MASTER_CACHE["gen"] += 1
 
 

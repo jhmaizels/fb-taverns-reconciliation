@@ -256,12 +256,22 @@ class MasterSnapshot:
 # write (upsert_pricing_rules / upsert_products_with_retros). Never holds Files
 # or Mismatches (those are written every upload and must stay fresh).
 MASTER_CACHE_TTL = float(os.environ.get("MASTER_CACHE_TTL", "60"))
-_MASTER_CACHE: dict = {"snapshot": None, "ts": 0.0, "gen": 0, "refreshing": False}
+# "snapshot" is the authoritative live entry (None once a write invalidates it).
+# "last" retains the previous good snapshot ACROSS invalidation so a read landing
+# in the post-write window serves it stale-while-revalidate instead of doing the
+# ~30s inline Airtable rebuild that times out the hub proxy — the failure the
+# operator sees as "pressed one button then the next and it overloaded" when
+# back-to-back accepts race the cache to None. Writers publish a fresh patched
+# snapshot right after invalidating (publish_patched_snapshot), so "last" only
+# covers the brief race window or a patch failure, never a normal post-write read.
+_MASTER_CACHE: dict = {"snapshot": None, "ts": 0.0, "gen": 0, "refreshing": False, "last": None}
 _MASTER_CACHE_LOCK = threading.Lock()
 
 
 def invalidate_master_cache() -> None:
     with _MASTER_CACHE_LOCK:
+        if _MASTER_CACHE["snapshot"] is not None:
+            _MASTER_CACHE["last"] = _MASTER_CACHE["snapshot"]
         _MASTER_CACHE["snapshot"] = None
         _MASTER_CACHE["ts"] = 0.0
         _MASTER_CACHE["gen"] += 1
@@ -289,6 +299,7 @@ def refresh_master_cache_async() -> None:
                 if _MASTER_CACHE["gen"] == gen_before:
                     _MASTER_CACHE["snapshot"] = snap
                     _MASTER_CACHE["ts"] = time.monotonic()
+                    _MASTER_CACHE["last"] = snap
         except Exception:
             logging.getLogger("fbtaverns.airtable").warning(
                 "background master-cache refresh failed", exc_info=True
@@ -714,6 +725,7 @@ def publish_patched_snapshot(snap: MasterSnapshot) -> None:
     with _MASTER_CACHE_LOCK:
         _MASTER_CACHE["snapshot"] = snap
         _MASTER_CACHE["ts"] = time.monotonic()
+        _MASTER_CACHE["last"] = snap
         _MASTER_CACHE["gen"] += 1
 
 
@@ -812,21 +824,33 @@ def load_master_snapshot(force_refresh: bool = False) -> MasterSnapshot:
     with _MASTER_CACHE_LOCK:
         cached = _MASTER_CACHE["snapshot"]
         ts = _MASTER_CACHE["ts"]
+        last = _MASTER_CACHE["last"]
         gen_before = _MASTER_CACHE["gen"]
     if not force_refresh and cached is not None:
         if (time.monotonic() - ts) < MASTER_CACHE_TTL:
             return cached
         # STALE-WHILE-REVALIDATE: the inline rebuild takes ~30s+ and times out
         # the tenancy-hub proxy (bare 500s to users). Serve the expired snapshot
-        # NOW and refresh in the background. Master writes still invalidate to
-        # None, so post-write reads take the coherent inline fetch below.
+        # NOW and refresh in the background.
         refresh_master_cache_async()
         return cached
+    # Cache is cold — invalidated by a write (or never populated). If a previous
+    # good snapshot is retained, serve it stale-while-revalidate rather than doing
+    # the ~30s inline rebuild that times out the hub proxy: two accepts in quick
+    # succession would otherwise send the second click into a cold rebuild. Write
+    # paths patch a FRESH snapshot straight after invalidating, so this only
+    # covers the race window / a patch failure. A truly cold start (no retained
+    # snapshot, e.g. first read after boot) still falls through to the inline
+    # fetch — the startup warm-up thread and /healthz warmth gate cover that.
+    if not force_refresh and last is not None:
+        refresh_master_cache_async()
+        return last
     snap = _fetch_master_snapshot()
     with _MASTER_CACHE_LOCK:
         if _MASTER_CACHE["gen"] == gen_before:
             _MASTER_CACHE["snapshot"] = snap
             _MASTER_CACHE["ts"] = time.monotonic()
+        _MASTER_CACHE["last"] = snap
     return snap
 
 
