@@ -82,7 +82,8 @@ from airtable_io import (  # noqa: E402
     save_pricing_policy,
     publish_patched_snapshot,
     refresh_master_cache_async,
-    rename_site,
+    update_site_fields,
+    update_site_accounts,
     load_rules_from_airtable,
     load_sites_from_airtable,
     upsert_file_record,
@@ -376,6 +377,7 @@ HEAD_STYLE = """<!doctype html>
   table.pivot thead th { position: sticky; top: 0; z-index: 3; background: #eef2f7; text-align: right; vertical-align: bottom; font-weight: 600; }
   table.pivot thead th.site { max-width: 120px; white-space: normal; line-height: 1.15; }
   table.pivot thead th.site .sid { display: block; font-weight: 400; color: #789; font-size: 0.82em; }
+  table.pivot thead th.site .acct { display: block; font-weight: 400; color: #9aa7b4; font-size: 0.74em; letter-spacing: 0.02em; }
   table.pivot .sticky-col { position: sticky; z-index: 2; background: #fff; text-align: left; white-space: normal; }
   table.pivot .sticky-col.c1 { left: 0; width: 72px; min-width: 72px; max-width: 72px; box-sizing: border-box; overflow-wrap: anywhere; }
   table.pivot .sticky-col.c2 { left: 72px; min-width: 180px; max-width: 240px; box-shadow: 1px 0 0 #ddd; }
@@ -786,6 +788,22 @@ def upload(
             mismatches, file_rec_id,
             site_ids=snap.site_ids, product_ids=snap.product_ids, rule_ids=snap.rule_ids,
         )
+
+        # Best-effort: capture each pub's LWC account number (the ACCOUNT NO
+        # column) onto its Sites record so the master grid + export can show it.
+        # Fully isolated from reconciliation — a failure here must never affect
+        # the findings; only changed accounts are written.
+        try:
+            accounts = {ln.site_id: ln.account_no for ln in lines if ln.site_id and ln.account_no}
+            if accounts:
+                # Reuse the snapshot already loaded this request (its sites carry
+                # account_no + the site_ids rec-id map) so the capture adds no
+                # extra Sites reads on the response path.
+                n_acct = update_site_accounts(accounts, site_ids=snap.site_ids, sites=snap.sites)
+                if n_acct:
+                    logger.info("captured %d site account numbers from %s", n_acct, original_name)
+        except Exception:
+            logger.exception("site account capture failed (non-fatal)")
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
@@ -1678,6 +1696,7 @@ async def master_site_apply(
     fsite = (form.get("fsite") or "").strip()
     fq = (form.get("fq") or "").strip()
     name = (form.get("name") or "").strip()
+    account_no = (form.get("account_no") or "").strip()
     do = (form.get("do") or "rename").strip()
 
     try:
@@ -1756,22 +1775,32 @@ async def master_site_apply(
             status_code=303,
         )
 
-    # default: rename
+    # default: save name (+ account number). Name stays required; the account
+    # number is optional (blank clears it).
     if not name:
         return _rerender(["the site name must not be empty"])
+    # A blank account field means "leave the stored account unchanged" (pass
+    # None -> update_site_fields skips it), NOT "clear it". This removes the
+    # lost-update where saving a name would blank an account that a concurrent
+    # upload had just auto-captured. To change an account, type the new value.
     try:
-        await run_in_threadpool(rename_site, site_id, name)
+        await run_in_threadpool(
+            update_site_fields, site_id, {"name": name, "account_no": account_no or None}
+        )
     except ValueError as exc:
         return _rerender([str(exc)])
     except Exception:
-        logger.exception("site rename failed")
+        logger.exception("site save failed")
         return _error_page(_GENERIC_ERR)
 
     # Same instant-grid pattern as the cell editor: patch the cached snapshot
-    # (new name in the sites dict) and re-publish, then reconcile async.
+    # (new name + account number in the sites dict) and re-publish, then
+    # reconcile async. Blank keeps the previously-stored account, mirroring the
+    # write above.
     try:
         sites = dict(snap.sites)
-        sites[site_id] = {**sites[site_id], "name": name}
+        kept_acct = account_no or (sites.get(site_id, {}) or {}).get("account_no", "")
+        sites[site_id] = {**sites[site_id], "name": name, "account_no": kept_acct}
         publish_patched_snapshot(_dc_replace(snap, sites=sites))
     except Exception:
         logger.exception("snapshot patch failed — grid catches up on refresh")

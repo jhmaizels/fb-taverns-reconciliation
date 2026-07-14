@@ -1171,31 +1171,33 @@ def test_route_apply_add_product_shows_in_grid_immediately():
 
 
 def test_route_site_rename():
-    """Grid edit-mode site headers link to /master/site; POST renames the site
-    in Airtable (Sites PATCH), the patched cache shows the new name on the
-    redirect target immediately, and viewers are locked out."""
+    """Grid edit-mode site headers link to /master/site; POST saves the site
+    name AND its LWC account number in one Sites PATCH, the patched cache shows
+    both on the redirect target immediately, and viewers are locked out."""
     with FakeAirtable([_grid_rule()]) as fa:
         with FakeAuthClient("admin") as client:
-            # edit-mode header links to the rename form
+            # edit-mode header links to the site settings form
             r0 = client.get("/master", params={"edit": "1"})
             assert "/master/site" in r0.text and "site-head" in r0.text
             r = client.get("/master/site", params={"site_id": SITE_ID})
-            assert r.status_code == 200 and 'name="name"' in r.text
+            assert r.status_code == 200 and 'name="name"' in r.text and 'name="account_no"' in r.text
 
             r2 = client.post("/master/site/apply", data={
-                "site_id": SITE_ID, "name": "Victoria Barnsley",
+                "site_id": SITE_ID, "name": "Victoria Barnsley", "account_no": "17591759",
             }, follow_redirects=False)
             assert r2.status_code == 303, r2.text[:300]
             ups = [
                 (op, recs) for op, t, recs in fa.calls
                 if op == "update" and t == airtable_io.T["Sites"]
             ]
-            assert len(ups) == 1 and ups[0][1][0]["fields"] == {"name": "Victoria Barnsley"}
+            assert len(ups) == 1 and ups[0][1][0]["fields"] == {
+                "name": "Victoria Barnsley", "account_no": "17591759",
+            }
             assert ups[0][1][0]["id"] == SITE_REC
 
-            # patched cache: the new name is in the header immediately
+            # patched cache: the new name AND account number show immediately
             r3 = client.get("/master")
-            assert "Victoria Barnsley" in r3.text
+            assert "Victoria Barnsley" in r3.text and "17591759" in r3.text
 
             # empty name -> 400, nothing written
             n_calls = len(fa.calls)
@@ -1210,6 +1212,68 @@ def test_route_site_rename():
                 "site_id": SITE_ID, "name": "X",
             }, follow_redirects=False)
             assert r5.status_code == 403
+
+
+def test_site_account_shows_in_grid_and_export():
+    """A site's LWC account number (Sites.account_no) shows in the grid column
+    header (view + edit) alongside the site id, and in the export's row 1."""
+    from io import BytesIO
+    from openpyxl import load_workbook
+
+    sites = [{"id": SITE_REC, "fields": {
+        "site_id": SITE_ID, "name": "The Crown", "account_no": "17591759",
+    }}]
+    with FakeAirtable([_grid_rule()], sites=sites):
+        with FakeAuthClient("admin") as client:
+            for params in ({}, {"edit": "1"}):
+                g = client.get("/master", params=params)
+                assert "The Crown" in g.text and "A/C 17591759" in g.text, params
+            r = client.get("/export-master")
+            assert r.status_code == 200
+            ws = load_workbook(BytesIO(r.content)).active
+            row1 = [str(c.value) for c in ws[1] if c.value is not None]
+            assert "17591759" in row1, row1
+            # row 2 still carries the name + site id header
+            assert any("The Crown" in str(c.value) and SITE_ID in str(c.value)
+                       for c in ws[2] if c.value)
+
+
+def test_update_site_accounts_only_writes_changed():
+    """update_site_accounts (the upload auto-capture) writes only sites whose
+    stored account_no changed, and skips ids not on the master."""
+    sites = [
+        {"id": SITE_REC, "fields": {"site_id": SITE_ID, "account_no": "111"}},   # unchanged
+        {"id": SITE2_REC, "fields": {"site_id": SITE2_ID}},                       # new
+    ]
+    with FakeAirtable([], sites=sites) as fa:
+        n = airtable_io.update_site_accounts(
+            {SITE_ID: "111", SITE2_ID: "222", "999": "333"}  # 999 not on master
+        )
+    assert n == 1
+    ups = [r for op, t, recs in fa.calls
+           if op == "update" and t == airtable_io.T["Sites"] for r in recs]
+    assert len(ups) == 1 and ups[0]["id"] == SITE2_REC
+    assert ups[0]["fields"] == {"account_no": "222"}
+
+
+def test_site_save_blank_account_keeps_stored():
+    """Saving a site with a BLANK account field leaves the stored account
+    UNCHANGED (must never clear an account a concurrent upload just captured);
+    only the name is written, and the grid still shows the stored account."""
+    sites = [{"id": SITE_REC, "fields": {
+        "site_id": SITE_ID, "name": "Crown", "account_no": "17591759",
+    }}]
+    with FakeAirtable([_grid_rule()], sites=sites) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/site/apply", data={
+                "site_id": SITE_ID, "name": "The Crown", "account_no": "",
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            ups = [rec for op, t, recs in fa.calls
+                   if op == "update" and t == airtable_io.T["Sites"] for rec in recs]
+            assert len(ups) == 1 and ups[0]["fields"] == {"name": "The Crown"}, ups
+            # patched grid still carries the stored account, not blanked
+            assert "17591759" in client.get("/master").text
 
 
 def test_build_universal_increase_math():
@@ -1672,6 +1736,9 @@ TESTS = [
     test_route_preview_apply_roundtrip,
     test_route_cell_editor_amend_and_remove,
     test_route_site_rename,
+    test_site_account_shows_in_grid_and_export,
+    test_update_site_accounts_only_writes_changed,
+    test_site_save_blank_account_keeps_stored,
     test_build_universal_increase_math,
     test_route_universal_increase_preview_apply,
     test_route_site_create_end_all_delete,

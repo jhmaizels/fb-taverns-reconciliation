@@ -168,7 +168,7 @@ def _batch(records: list[dict], op: str, table_id: str) -> list[dict]:
 # ---------- read: master + sites ----------
 
 def load_sites_from_airtable() -> dict[str, dict]:
-    rows = _list_all(T["Sites"], fields=["site_id", "name", "status", "country", "notes"])
+    rows = _list_all(T["Sites"], fields=["site_id", "name", "account_no", "status", "country", "notes"])
     sites: dict[str, dict] = {}
     for rec in rows:
         f = rec["fields"]
@@ -177,6 +177,7 @@ def load_sites_from_airtable() -> dict[str, dict]:
             continue
         sites[sid] = {
             "name": f.get("name", "") or "",
+            "account_no": (f.get("account_no", "") or "").strip(),
             "status": (f.get("status") or "tenanted").strip().lower(),
             "country": f.get("country", "") or "",
             "notes": f.get("notes", "") or "",
@@ -492,6 +493,56 @@ def rename_site(site_id: str, name: str) -> str:
     return rec_id
 
 
+def update_site_fields(site_id: str, fields: dict) -> str:
+    """PATCH selected Sites fields (currently name / account_no) in one write.
+    Ignores None values so callers can pass only what changed. Admin-gated at
+    the route layer."""
+    site_id = (site_id or "").strip()
+    if not site_id:
+        raise ValueError("site_id is required")
+    rec_id = _site_lookup().get(site_id)
+    if not rec_id:
+        raise ValueError(f"site {site_id!r} is not in the master")
+    clean = {k: v for k, v in fields.items() if v is not None}
+    if not clean:
+        return rec_id
+    _batch([{"id": rec_id, "fields": clean}], "update", T["Sites"])
+    invalidate_master_cache()
+    return rec_id
+
+
+def update_site_accounts(
+    mapping: dict[str, str],
+    site_ids: dict | None = None,
+    sites: dict | None = None,
+) -> int:
+    """Best-effort bulk set of Sites.account_no from a {site_id: account_no} map
+    (captured from the LWC weekly file's ACCOUNT NO column). Only writes sites
+    that exist on the master AND whose stored account_no actually differs, so a
+    routine upload with unchanged accounts writes nothing. Returns the count
+    updated. Never raises for a site not on the master — that's just skipped.
+
+    Pass site_ids (site_id -> rec id) and sites (the snapshot sites dict, each
+    carrying account_no) to reuse an already-loaded snapshot — the /upload path
+    does this so the capture adds no extra Sites reads on the response path."""
+    lookup = site_ids if site_ids is not None else _site_lookup()
+    current = sites if sites is not None else load_sites_from_airtable()
+    updates = []
+    for sid, acct in mapping.items():
+        sid = (sid or "").strip()
+        acct = (acct or "").strip()
+        if not sid or not acct or sid not in lookup:
+            continue
+        if (current.get(sid, {}).get("account_no") or "").strip() == acct:
+            continue
+        updates.append({"id": lookup[sid], "fields": {"account_no": acct}})
+    if not updates:
+        return 0
+    _batch(updates, "update", T["Sites"])
+    invalidate_master_cache()
+    return len(updates)
+
+
 def create_site(site_id: str, name: str) -> str:
     """Create a Sites record (defaults matching the add-rule auto-create:
     status=tenanted, country=england). Refuses an existing id. Returns rec id."""
@@ -737,7 +788,7 @@ def publish_patched_snapshot(snap: MasterSnapshot) -> None:
 
 
 def _fetch_master_snapshot() -> MasterSnapshot:
-    site_recs = _list_all(T["Sites"], fields=["site_id", "name", "status", "country", "notes"])
+    site_recs = _list_all(T["Sites"], fields=["site_id", "name", "account_no", "status", "country", "notes"])
     product_recs = _list_all(T["Products"], fields=["product_code", "description", "retro_per_keg"])
     rule_recs = _list_all(T["PricingRules"], fields=_RULE_FIELDS)
 
@@ -751,6 +802,7 @@ def _fetch_master_snapshot() -> MasterSnapshot:
             continue
         sites[sid] = {
             "name": f.get("name", "") or "",
+            "account_no": (f.get("account_no", "") or "").strip(),
             "status": (f.get("status") or "tenanted").strip().lower(),
             "country": f.get("country", "") or "",
             "notes": f.get("notes", "") or "",

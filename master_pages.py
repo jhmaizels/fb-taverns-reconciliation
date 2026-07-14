@@ -370,6 +370,9 @@ def render_master_pivot(
     def _site_name(sid: str) -> str:
         return (snap.sites.get(sid) or {}).get("name") or ""
 
+    def _site_account(sid: str) -> str:
+        return (snap.sites.get(sid) or {}).get("account_no") or ""
+
     # Columns = sites carrying ≥1 current rule, ascending by site id — the same
     # inclusion + order as /export-master (master_export.py), i.e. the Excel's.
     priced_sites = sorted({s for (s, _p) in winners})
@@ -510,17 +513,21 @@ def render_master_pivot(
 
     # ---- header row (the Excel's: Code | Name | Price | Retro P/Keg | Net price | sites…) ----
     def _site_head(sid: str) -> str:
+        acct = _site_account(sid)
+        # The LWC account number under the site id (both shown, per operator).
+        acct_html = f'<span class="acct">A/C {escape(acct)}</span>' if acct else ""
         label = (
-            f'{escape(_site_name(sid) or sid)}<span class="sid">{escape(sid)}</span>'
+            f'{escape(_site_name(sid) or sid)}'
+            f'<span class="sid">{escape(sid)}</span>{acct_html}'
         )
         if edit:
-            # Edit mode: the header opens the site-name form — auto-created
-            # sites have no name and show as bare ids until fixed here.
+            # Edit mode: the header opens the site settings form — set the name
+            # (auto-created sites show as bare ids) and the account number here.
             url = ext_url("/master/site") + _qs(site_id=sid, fsite=site_f, fq=q)
-            hint = "Rename this site" if _site_name(sid) else "Name this site"
+            hint = "Site settings (name / account no)"
             label = f'<a class="site-head" href="{url}" title="{hint}">{label}</a>'
         return (
-            f'<th class="num site" title="{escape(sid)} — {escape(_site_name(sid))}">'
+            f'<th class="num site" title="{escape(sid)}{f" · A/C {escape(acct)}" if acct else ""} — {escape(_site_name(sid))}">'
             f"{label}</th>"
         )
 
@@ -820,6 +827,7 @@ def render_site_name_page(
     ids) plus the exits — end all its prices ('leaves the estate', history
     kept) or, for a site with NO rule history at all, delete the record."""
     cur = (snap.sites.get(site_id) or {}).get("name") or ""
+    cur_acct = (snap.sites.get(site_id) or {}).get("account_no") or ""
     back_pairs = [("edit", "1")]
     if fsite:
         back_pairs.append(("site", fsite))
@@ -874,8 +882,13 @@ def render_site_name_page(
   <label for="sn-name">Site name</label>
   <input type="text" name="name" id="sn-name" value="{escape(cur)}" autofocus required
          style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
-  <p class="help">Shown across the price grid, exports and reconciliation reports.</p>
-  <button type="submit" name="do" value="rename" style="margin-top:1em">Save name</button>
+  <label for="sn-acct">LWC account number</label>
+  <input type="text" name="account_no" id="sn-acct" value="{escape(cur_acct)}"
+         placeholder="e.g. 17591759"
+         style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:0.6em">
+  <p class="help">Shown across the price grid, exports and reconciliation reports.
+  The account number is filled in automatically from the weekly LWC files; set or correct it here.</p>
+  <button type="submit" name="do" value="rename" style="margin-top:1em">Save</button>
 </form>
 {danger}
 """

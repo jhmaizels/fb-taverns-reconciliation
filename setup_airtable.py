@@ -56,6 +56,7 @@ def site_table_spec():
         "fields": [
             f_text("site_id"),
             f_text("name"),
+            f_text("account_no"),  # LWC customer account number (from the weekly files' ACCOUNT NO)
             f_select("status", ["tenanted", "managed"]),
             f_select("country", ["england", "scotland"]),
             f_long("notes"),

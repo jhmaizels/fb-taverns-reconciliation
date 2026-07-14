@@ -474,6 +474,7 @@ class InvoiceLine:
     unit_price: float
     master_price: float
     diff_master: float
+    account_no: str = ""  # LWC customer account number (ACCOUNT NO column), if present
 
 
 def _normalise_lwc_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -533,6 +534,7 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
                 unit_price=unit,
                 master_price=master,
                 diff_master=diff,
+                account_no=_to_str_code(row.get("account_no")) if not pd.isna(row.get("account_no")) else "",
             )
         )
     return lines

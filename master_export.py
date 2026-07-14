@@ -90,6 +90,7 @@ def _build_xlsx(active_rules, sites, products_by_code, as_of: date | None) -> by
     # site_ids: any site that currently has an active rule, sorted ascending
     site_ids = sorted({r.site_id for r in active_rules})
     site_name = lambda sid: (sites.get(sid) or {}).get("name", "") or sid
+    site_account = lambda sid: (sites.get(sid) or {}).get("account_no", "") or ""
 
     # product_codes: anything with an active rule OR a retro on the master
     codes_active = {r.product_code for r in active_rules}
@@ -128,12 +129,14 @@ def _build_xlsx(active_rules, sites, products_by_code, as_of: date | None) -> by
     border = Border(*([Side(style="thin", color="CCCCCC")] * 4))
     centre = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # Row 1: blank (in the cost file this holds account codes; we don't track those)
+    # Row 1: each site's LWC account number (blank in the 5 left columns),
+    #        matching the cost file whose top row holds the account codes.
     # Row 2: headers
     headers = ["Product Code", "Product Name", "Price", "Retro P/Keg", "Net price"]
     for sid in site_ids:
         headers.append(f"{site_name(sid)} {sid}")
-    ws.append([None] * len(headers))   # row 1
+    account_row = [None] * 5 + [site_account(sid) or None for sid in site_ids]
+    ws.append(account_row)              # row 1 — account numbers
     ws.append(headers)                  # row 2
     for col_idx, _ in enumerate(headers, start=1):
         cell = ws.cell(row=2, column=col_idx)
