@@ -2493,8 +2493,18 @@ async def master_apply(
     except Exception:
         logger.exception("retro propagation failed — product-level retro may be stale")
 
-    # §3.4: result page renders from in-hand data only; kick the background
-    # snapshot rebuild so "Back to master" doesn't eat the 30s inline fetch.
+    # Publish a PATCHED snapshot so "Back to master" shows this change
+    # IMMEDIATELY — e.g. a just-added product appears in the grid at once rather
+    # than after the ~30s background refresh. Since the cache now RETAINS the
+    # prior snapshot across a write (stale-while-revalidate), a plain
+    # invalidate+refresh here would serve the pre-change grid for that whole
+    # window (the "I added a product but it's not showing up" report). The other
+    # editor routes already do this; /master/apply was the gap. Best-effort;
+    # the background refresh below reconciles with authoritative Airtable state.
+    try:
+        publish_patched_snapshot(patch_snapshot_for_change(snap, change, principal.email))
+    except Exception:
+        logger.exception("master apply: snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
     body = master_pages.render_result_page(change, preview, result)
     return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"

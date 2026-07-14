@@ -1147,6 +1147,29 @@ def test_render_master_grid_has_save_changes_button():
             assert 'id="grid-save"' not in rv.text
 
 
+def test_route_apply_add_product_shows_in_grid_immediately():
+    """Adding a brand-new product via /master/apply publishes a patched snapshot
+    so the next grid read shows it AT ONCE, not after the ~30s background refresh.
+    Regression guard for 'added a product but it's not showing up', which appeared
+    once the cache started retaining the pre-change snapshot across a write."""
+    today_iso = date.today().isoformat()
+    with FakeAirtable([_grid_rule()]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/apply", data={
+                "op": "add_rule", "site_id": SITE_ID,
+                "product_code_new": "99990001", "product_desc": "Test Cider 50L",
+                "tenant_price": "145.00", "status": "tenanted",
+                "valid_from": today_iso, "reason": "add",
+                "create_missing_product": "1",
+            })
+            assert r.status_code == 200, r.text[:400]
+            created = _creates(fa)
+            assert any(c["fields"].get("tenant_price") == 145.0 for c in created), created
+            # the grid shows the new product immediately from the patched cache
+            g = client.get("/master", params={"edit": "1"})
+            assert "99990001" in g.text and "Test Cider" in g.text
+
+
 def test_route_site_rename():
     """Grid edit-mode site headers link to /master/site; POST renames the site
     in Airtable (Sites PATCH), the patched cache shows the new name on the
@@ -1658,6 +1681,7 @@ TESTS = [
     test_route_apply_revalidates_tampered_hidden_inputs,
     test_route_cell_editor_ajax_json_mode,
     test_render_master_grid_has_save_changes_button,
+    test_route_apply_add_product_shows_in_grid_immediately,
     test_site_prefix_formula,
     test_route_accept_overwrite_price_change_from_today,
     test_route_accept_overwrite_idempotent_same_price,
