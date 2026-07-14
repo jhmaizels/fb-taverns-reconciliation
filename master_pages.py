@@ -449,11 +449,15 @@ def render_master_pivot(
     if not is_admin:
         edit_btns = ""
     elif edit:
+        save_reload = base + _qs(saved="1", edit="1", site=site_f, q=q)
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/site/new")}">+ Add site</a>'
             f'<a class="button" style="margin-top:0; background:#7a5c00" href="{ext_url("/master/increase")}">Annual increase</a>'
-            f'<a class="button" style="margin-top:0; background:#666" href="{base}{_qs(site=site_f, q=q)}">Done editing</a>'
+            f'<button type="button" id="grid-save" class="button" style="margin-top:0; background:#1b5e20" '
+            f'data-reload="{escape(save_reload, quote=True)}" disabled>Save changes</button>'
+            f'<a class="button" id="grid-done" style="margin-top:0; background:#666" '
+            f'href="{base}{_qs(site=site_f, q=q)}">Done editing</a>'
         )
     else:
         edit_btns = (
@@ -481,10 +485,12 @@ def render_master_pivot(
         )
     edit_help = (
         '<p class="help" style="margin-top:0">Editing works like the spreadsheet: '
-        '<strong>type in a cell and press Enter</strong> to save the price · '
-        '<strong>clear a cell and press Enter</strong> to remove it · '
-        '<strong>type into an empty cell</strong> to add one · '
+        '<strong>type new prices into as many cells as you like</strong>, then press '
+        '<strong>Save changes</strong> to commit them all · '
+        '<strong>clear a cell</strong> to remove its price · '
         '<strong>+ Add product</strong> for a brand-new line. '
+        '(Pressing Enter in a single cell still saves just that one.) '
+        'Unsaved cells are highlighted; you’ll be warned before leaving with unsaved changes. '
         'Changes take effect from today; history is kept underneath.</p>'
     ) if edit else ""
 
@@ -639,36 +645,44 @@ def render_master_pivot(
         'Blank cell = product not priced at that site.</p>'
     )
 
-    toggle_js = (
-        "<script>(function(){var t=document.getElementById('pivot-tbl'),"
-        "b=document.getElementById('pivot-toggle');if(!t||!b)return;"
-        "b.addEventListener('click',function(){var on=t.classList.toggle('show-margin');"
-        "b.textContent=on?'Show prices':'Show margins';});"
-        # In-grid editing: Enter in a cell submits its one-cell form. Clearing a
-        # priced cell = remove (confirmed); Enter on an empty never-priced cell
-        # is a no-op rather than a round-trip.
-        "t.addEventListener('submit',function(e){"
-        "var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;"
-        "var i=f.querySelector('input[name=tenant_price]');if(!i)return;"
-        "var prev=i.getAttribute('data-prev')||'';"
-        "if(i.value===''){"
-        "if(!prev){e.preventDefault();return;}"
-        "if(!confirm('Remove this price? The product stops billing at this site from today.'))"
-        "{e.preventDefault();i.value=prev;}"
-        "}else if(i.value===prev){e.preventDefault();}"
-        "});"
-        # Top scrollbar mirror: a spacer as wide as the table, scroll synced
-        # both ways. Collapses when the table doesn't overflow.
-        "var w=document.getElementById('pivot-wrap'),tp=document.getElementById('pivot-top'),"
-        "ti=document.getElementById('pivot-top-inner');"
-        "if(w&&tp&&ti){var sync=function(){ti.style.width=t.scrollWidth+'px';"
-        "tp.style.display=(t.scrollWidth>w.clientWidth)?'block':'none';};"
-        "sync();window.addEventListener('resize',sync);"
-        "var lock=false;"
-        "tp.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;w.scrollLeft=tp.scrollLeft;});"
-        "w.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;tp.scrollLeft=w.scrollLeft;});}"
-        "})();</script>"
-    )
+    # In-grid editing. Each cell is its own <form class=cellf> POSTing to
+    # /master/cell/apply. Saving happens via fetch (ajax=1 JSON mode) so the
+    # operator can edit many cells and commit them together with "Save changes"
+    # WITHOUT a per-cell page reload — and can't silently lose edits:
+    #   - dirty cells (value != stored, numeric compare) are highlighted;
+    #   - "Save changes (N)" POSTs every dirty cell SEQUENTIALLY (parallel would
+    #     race the master cache to None between publishes — the back-to-back
+    #     overload the airtable_io cache comments call out);
+    #   - Enter in one cell still saves just that cell (now in place, no reload);
+    #   - "Done editing" flushes pending edits first; a beforeunload guard warns
+    #     if the operator navigates away with unsaved cells.
+    # If JS fails to load, each cell form still submits natively (POST -> 303),
+    # i.e. today's no-JS behaviour.
+    toggle_js = r"""<script>(function(){
+var t=document.getElementById('pivot-tbl');
+var tog=document.getElementById('pivot-toggle');
+if(tog&&t){tog.addEventListener('click',function(){var on=t.classList.toggle('show-margin');tog.textContent=on?'Show prices':'Show margins';});}
+if(!t)return;
+var saveBtn=document.getElementById('grid-save');
+var doneLink=document.getElementById('grid-done');
+function sameNum(a,b){a=(a||'').trim();b=(b||'').trim();if(a===''&&b==='')return true;if(a===''||b==='')return false;var x=parseFloat(a),y=parseFloat(b);if(isNaN(x)||isNaN(y))return a===b;return Math.abs(x-y)<0.005;}
+function dirty(i){return !sameNum(i.value,i.getAttribute('data-prev')||'');}
+function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(saveBtn){saveBtn.textContent=n?('Save changes ('+n+')'):'Save changes';saveBtn.disabled=(n===0);}return n;}
+t.addEventListener('input',function(e){var i=e.target;if(i&&i.classList&&i.classList.contains('cell-input'))refresh();});
+function post(f){var body=new URLSearchParams(new FormData(f));body.set('ajax','1');return fetch(f.getAttribute('action'),{method:'POST',credentials:'same-origin',headers:{'X-Requested-With':'fetch','Content-Type':'application/x-www-form-urlencoded'},body:body.toString()}).then(function(r){return r.json().catch(function(){return{ok:false,errors:['HTTP '+r.status]};}).then(function(j){return{status:r.status,j:j};});});}
+function flash(i){i.classList.add('saved');setTimeout(function(){i.classList.remove('saved');},1000);}
+function errmsg(res){return (res.j&&res.j.errors&&res.j.errors.join('; '))||('HTTP '+res.status);}
+function saveOne(f){var i=f.querySelector('input[name=tenant_price]');if(!i)return Promise.resolve(false);var prev=i.getAttribute('data-prev')||'';var v=i.value.trim();if(v===''){if(prev==='')return Promise.resolve(true);if(!confirm('Remove this price? The product stops billing at this site from today.')){i.value=prev;refresh();return Promise.resolve(false);}}else if(sameNum(v,prev))return Promise.resolve(true);return post(f).then(function(res){if(res.j&&res.j.ok){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');flash(i);refresh();return true;}i.classList.add('err');alert('Could not save that price: '+errmsg(res));return false;});}
+var busy=false;
+function saveAll(){if(busy)return Promise.resolve(false);var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){var i=f.querySelector('input[name=tenant_price]');if(i&&dirty(i))forms.push(f);});if(!forms.length)return Promise.resolve(true);var rem=forms.filter(function(f){return f.querySelector('input[name=tenant_price]').value.trim()==='';});if(rem.length&&!confirm('Remove '+rem.length+' price'+(rem.length>1?'s':'')+'? Those products stop billing at those sites from today.'))return Promise.resolve(false);busy=true;if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…';}var idx=0,ok=true;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var i=f.querySelector('input[name=tenant_price]');return post(f).then(function(res){if(res.j&&res.j.ok){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');return step();}ok=false;i.classList.add('err');i.focus();alert('Could not save that price: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return all;});}
+if(saveBtn){saveBtn.addEventListener('click',function(){saveAll().then(function(all){if(all){location=saveBtn.getAttribute('data-reload')||location.href;}});});}
+if(doneLink){doneLink.addEventListener('click',function(e){if(refresh()>0){e.preventDefault();var href=doneLink.getAttribute('href');saveAll().then(function(all){if(all)location=href;});}});}
+t.addEventListener('submit',function(e){var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;e.preventDefault();saveOne(f);});
+window.addEventListener('beforeunload',function(e){if(refresh()>0){e.preventDefault();e.returnValue='';return '';}});
+refresh();
+var w=document.getElementById('pivot-wrap'),tp=document.getElementById('pivot-top'),ti=document.getElementById('pivot-top-inner');
+if(w&&tp&&ti){var sync=function(){ti.style.width=t.scrollWidth+'px';tp.style.display=(t.scrollWidth>w.clientWidth)?'block':'none';};sync();window.addEventListener('resize',sync);var lock=false;tp.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;w.scrollLeft=tp.scrollLeft;});w.addEventListener('scroll',function(){if(lock){lock=false;return;}lock=true;tp.scrollLeft=w.scrollLeft;});}
+})();</script>"""
 
     # Single-site view stays compact inside the normal page column ("don't
     # spread across the page") — the full estate keeps the wide breakout.

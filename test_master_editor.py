@@ -621,8 +621,9 @@ def test_render_master_pivot_shape_and_winner():
     # Excel column headers + row order by product NAME (Keg < Loss Keg < Zed…)
     assert "Product Code" in html and "Retro P/Keg" in html and "Net price" in html
     assert html.index(">Keg<") < html.index("Loss Keg") < html.index("Zed Retro-Only Keg")
-    # read-only by default: no edit affordances without ?edit=1
-    assert 'class="cellf"' not in html and "cell-input" not in html
+    # read-only by default: no editable cell markup without ?edit=1 (match the
+    # rendered attribute, not the always-present editing JS's string literals)
+    assert 'class="cellf"' not in html and 'class="cell-input"' not in html
     # back-to-LWC link present; upload-provenance banner is NOT rendered here
     assert "Back to LWC" in html
 
@@ -681,7 +682,7 @@ def test_render_master_pivot_cask_section_and_edit_mode():
     assert 'class="pivot-wide"' in html_all
     # edit mode is admin-only: a viewer passing ?edit=1 gets the read-only grid
     html_v = render_master_pivot(snap, {"edit": "1"}, is_admin=False)
-    assert 'class="cellf"' not in html_v and "cell-input" not in html_v
+    assert 'class="cellf"' not in html_v and 'class="cell-input"' not in html_v
     assert "Edit prices" not in html_v
 
 
@@ -1060,6 +1061,90 @@ def test_route_cell_editor_amend_and_remove():
                 "do": "save", "tenant_price": "1.00",
             }, follow_redirects=False)
             assert r6.status_code == 403
+
+
+def test_route_cell_editor_ajax_json_mode():
+    """The in-grid 'Save changes' driver POSTs each cell with ajax=1 and reads
+    JSON instead of following the 303. Success -> 200 {ok:true,saved:true} and
+    the write lands; a same-price POST -> {ok:true,saved:false} with NOTHING
+    written; a bad price -> 400 {ok:false,errors} nothing written; an emptied
+    priced cell -> {ok:true,saved:true} with the live rule closed. Role +
+    cross-origin gates still apply in JSON mode. The native (non-ajax) 303 path
+    is unaffected (see test_route_cell_editor_amend_and_remove)."""
+    # success + same-price no-op (uses the in-memory patched cache between POSTs)
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 200.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "199.50", "ajax": "1",
+            }, follow_redirects=False)
+            assert r.status_code == 200, r.text[:300]
+            assert r.json() == {"ok": True, "saved": True, "price": "199.50"}
+            created = _creates(fa)
+            assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 199.5
+
+            calls_before = len(fa.calls)
+            r2 = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "199.50", "ajax": "1",
+            }, follow_redirects=False)
+            assert r2.status_code == 200 and r2.json() == {"ok": True, "saved": False, "price": "199.50"}
+            assert len(fa.calls) == calls_before, "same-price ajax save must write NOTHING"
+
+    # validation error -> 400 JSON, nothing written
+    with FakeAirtable([_grid_rule()]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "abc", "ajax": "1",
+            }, follow_redirects=False)
+            assert r.status_code == 400
+            j = r.json()
+            assert j.get("ok") is False and j.get("errors")
+            assert not fa.calls, "a rejected ajax save must write NOTHING"
+
+    # removal (empty on a priced cell) -> saved:true + the live rule closed
+    with FakeAirtable([_grid_rule("rec_live")]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "", "ajax": "1",
+            }, follow_redirects=False)
+            assert r.status_code == 200 and r.json().get("ok") is True and r.json().get("saved") is True
+            closes = [u for u in _updates(fa) if "valid_to" in u["fields"]]
+            assert closes and closes[0]["id"] == "rec_live"
+
+    # role + cross-origin gates still enforced in JSON mode
+    with FakeAirtable([_grid_rule()]) as fa:
+        with FakeAuthClient("viewer") as client:
+            r = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "1.00", "ajax": "1",
+            }, follow_redirects=False)
+            assert r.status_code == 403
+        with FakeAuthClient("admin") as client:
+            r = client.post(
+                "/master/cell/apply",
+                data={"site_id": SITE_ID, "product_code": PROD_CODE, "tenant_price": "5.00", "ajax": "1"},
+                headers={"Origin": "https://evil.example"},
+                follow_redirects=False,
+            )
+            assert r.status_code == 403
+    assert not fa.calls, "viewer / cross-origin JSON POSTs must never write"
+
+
+def test_render_master_grid_has_save_changes_button():
+    """Edit mode renders the batch 'Save changes' + 'Done editing' controls and
+    keeps per-cell data-prev for dirty-tracking; view mode has neither."""
+    with FakeAirtable([_grid_rule()]):
+        with FakeAuthClient("admin") as client:
+            r = client.get("/master", params={"edit": "1"})
+            assert 'id="grid-save"' in r.text and 'id="grid-done"' in r.text
+            assert "data-prev=" in r.text and "Save changes" in r.text
+            rv = client.get("/master")
+            assert 'id="grid-save"' not in rv.text
 
 
 def test_route_site_rename():
@@ -1571,6 +1656,8 @@ TESTS = [
     test_route_upload_master_updates_grid_immediately,
     test_route_export_master_from_snapshot,
     test_route_apply_revalidates_tampered_hidden_inputs,
+    test_route_cell_editor_ajax_json_mode,
+    test_render_master_grid_has_save_changes_button,
     test_site_prefix_formula,
     test_route_accept_overwrite_price_change_from_today,
     test_route_accept_overwrite_idempotent_same_price,

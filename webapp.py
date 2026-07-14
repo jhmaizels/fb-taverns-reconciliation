@@ -398,6 +398,10 @@ HEAD_STYLE = """<!doctype html>
   table.pivot form.cellf { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
   table.pivot input.cell-input { width: 84px; text-align: right; font-variant-numeric: tabular-nums; padding: 0.25em 0.4em; margin: 0; border: 1px solid #c9d6e4; border-radius: 3px; font-size: 1em; box-sizing: border-box; display: inline-block; }
   table.pivot input.cell-input:focus { border-color: #2c5aa0; outline: 2px solid #dcebff; background: #fbfdff; }
+  /* unsaved (typed but not yet committed), error, and just-saved cell states */
+  table.pivot input.cell-input.dirty { background: #fff8e1; border-color: #f6c343; box-shadow: 0 0 0 2px #f6c34355; }
+  table.pivot input.cell-input.err { border-color: #b00020; box-shadow: 0 0 0 2px #b0002055; }
+  table.pivot input.cell-input.saved { background: #e8f5e9; border-color: #a5d6a7; transition: background 0.4s; }
   table.pivot td.edit-cell { padding: 0.2em 0.35em; }
   /* single-site view: stay inside the normal page column, table hugs content */
   .pivot-single .pivot-wrap { display: inline-block; max-width: 100%; }
@@ -2231,16 +2235,32 @@ async def master_cell_apply(
     fq = (form.get("fq") or "").strip()
     do = (form.get("do") or "save").strip()
     tp_raw = (form.get("tenant_price") or "").strip()
+    # Opt-in JSON mode (ajax=1): the in-grid "Save changes" driver POSTs each
+    # dirty cell here and reads per-cell ok/errors as JSON, so it can commit a
+    # whole batch without N full-page reloads. STRICTLY opt-in — the native
+    # Enter/303 path (no ajax field) is byte-for-byte unchanged and remains the
+    # no-JS fallback. Only the return points below branch on this; the
+    # derive/validate/apply/close-guard/patch/publish logic is untouched.
+    wants_json = (form.get("ajax") or "").strip() == "1"
 
     try:
         snap = await run_in_threadpool(load_master_snapshot)
     except Exception:
         logger.exception("request failed")
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
         return _error_page(_GENERIC_ERR)
     if site_id not in snap.sites or product_code not in snap.product_ids:
+        if wants_json:
+            return JSONResponse(
+                {"ok": False, "errors": [f"{site_id}/{product_code} is not on the master."]},
+                status_code=404,
+            )
         return _master_not_found_page(principal, f"{site_id}|{product_code}")
 
-    def _rerender(errors: list[str], status_code: int = 400) -> HTMLResponse:
+    def _rerender(errors: list[str], status_code: int = 400):
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": errors}, status_code=status_code)
         body = master_pages.render_cell_page(
             snap, site_id, product_code, fsite=fsite, fq=fq,
             errors=errors, tenant_val=tp_raw,
@@ -2259,7 +2279,9 @@ async def master_cell_apply(
     if fq:
         back.append(("q", fq))
 
-    def _back_to_grid(saved: bool) -> RedirectResponse:
+    def _back_to_grid(saved: bool):
+        if wants_json:
+            return JSONResponse({"ok": True, "saved": saved, "price": tp_raw})
         qs = ([("saved", "1")] if saved else []) + back
         return RedirectResponse(
             ext_url("/master") + "?" + urlencode(qs), status_code=303
@@ -2346,6 +2368,8 @@ async def master_cell_apply(
         return _rerender([f"refused at apply time: {exc}"], status_code=409)
     except Exception:
         logger.exception("grid cell apply failed")
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
         return _error_page(_GENERIC_ERR)
 
     # Instant-grid flow: publish a patched snapshot, then reconcile from
