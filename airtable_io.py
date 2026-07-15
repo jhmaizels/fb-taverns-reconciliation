@@ -1244,14 +1244,21 @@ def upsert_file_record(
     parse_status: str = "ok",
     stored_path: str | None = None,
     file_name_override: str | None = None,
+    extra_fields: dict | None = None,
 ) -> str:
-    """Insert (or look up by hash) a row in Files. Returns Airtable record id."""
+    """Insert (or look up by hash) a row in Files. Returns Airtable record id.
+
+    extra_fields (e.g. Tennents period_month / barrels_total) are merged on
+    create and PATCHed onto a hash-hit, so a re-upload refreshes them.
+    """
     table_id = T["Files"]
     file_name = file_name_override or os.path.basename(file_path)
     raw_hash = _file_hash(file_path)
     existing = _list_all(table_id, fields=["raw_hash"])
     for rec in existing:
         if rec["fields"].get("raw_hash") == raw_hash:
+            if extra_fields:
+                _batch([{"id": rec["id"], "fields": extra_fields}], "update", table_id)
             return rec["id"]
 
     fields = {
@@ -1264,6 +1271,8 @@ def upsert_file_record(
     }
     if stored_path:
         fields["stored_path"] = stored_path
+    if extra_fields:
+        fields.update(extra_fields)
     created = _batch([{"fields": fields}], "create", table_id)
     return created[0]["id"]
 
@@ -1277,93 +1286,251 @@ def _rule_lookup() -> dict[str, str]:
 
 
 # ---------- Tennents Direct I/O ----------
+#
+# The master is the FB_Taverns_Tennents_Master.xlsx workbook, mirrored into
+# three tables (TennentsSkuMaster / TennentsSiteMaster /
+# TennentsSiteSkuExceptions) and replaced wholesale on each upload — the
+# workbook is the editing surface (its README §5). The old per-account
+# TennentsAgreements table is retired: kept in the base as a historical
+# record, no longer read or written.
 
-def load_tennents_agreements():
-    """Load TennentsAgreements rows as Agreement dataclass instances."""
-    from tennents import Agreement  # local import to avoid circular dep
-    out = []
-    for rec in _list_all(T["TennentsAgreements"]):
-        f = rec["fields"]
-        if not f.get("account") or not f.get("sku_code"):
-            continue
-        out.append(Agreement(
-            account=f.get("account", "") or "",
-            customer_name=f.get("customer_name", "") or "",
-            sku_code=f.get("sku_code", "") or "",
-            sku_desc=f.get("sku_desc", "") or "",
-            tenant_invoice=float(f.get("tenant_invoice") or 0),
-            fb_net_price=float(f.get("fb_net_price") or 0),
-            off_invoice_per_brl=float(f.get("off_invoice_per_brl") or 0),
-            retro_per_brl=float(f.get("retro_per_brl") or 0),
-            total_per_brl=float(f.get("total_per_brl") or 0),
-            source=f.get("source", "") or "",
-        ))
-    return out
-
-
-def replace_tennents_master(agreements, source: str) -> tuple[int, int]:
-    """
-    Wipe TennentsAgreements and replace with new master.
-    Returns (deleted, created).
-    """
-    table_id = T["TennentsAgreements"]
-    existing_ids = [rec["id"] for rec in _list_all(table_id, fields=["agreement_key"])]
+def _wipe_table(table_id: str, key_field: str) -> int:
+    """Delete every record in a table. Returns the number deleted."""
+    existing_ids = [rec["id"] for rec in _list_all(table_id, fields=[key_field])]
     deleted = 0
-    if existing_ids:
-        for i in range(0, len(existing_ids), 10):
-            chunk = existing_ids[i:i+10]
-            # Route deletes through _do for consistent backoff/error handling
-            # (was a bare requests.delete + raise_for_status). Throttle between
-            # chunks only — no sleep after the final chunk. idempotent=False so a
-            # 5xx fails fast rather than re-deleting (the whole replace is re-run
-            # safely from the top, which re-lists remaining ids).
-            _do(requests.delete, f"{DATA_URL}/{table_id}", params={"records[]": chunk}, idempotent=False)
-            deleted += len(chunk)
-            if i + 10 < len(existing_ids):
-                time.sleep(0.25)
+    for i in range(0, len(existing_ids), 10):
+        chunk = existing_ids[i:i+10]
+        # Route deletes through _do for consistent backoff/error handling.
+        # Throttle between chunks only. idempotent=False so a 5xx fails fast
+        # rather than re-deleting (the whole replace is re-run safely from the
+        # top, which re-lists remaining ids).
+        _do(requests.delete, f"{DATA_URL}/{table_id}", params={"records[]": chunk}, idempotent=False)
+        deleted += len(chunk)
+        if i + 10 < len(existing_ids):
+            time.sleep(0.25)
+    return deleted
 
+
+def _opt(fields: dict, name: str, value) -> None:
+    """Set a field only when it has a value — creates stay sparse."""
+    if value is not None and value != "":
+        fields[name] = value
+
+
+def load_tennents_master():
+    """Load the Tennents master workbook mirror as a TennentsMaster."""
+    from tennents_master import SkuException, SiteInfo, SkuRate, TennentsMaster
+
+    versions: Counter[str] = Counter()
+    skus: list[SkuRate] = []
+    for rec in _list_all(T["TennentsSkuMaster"]):
+        f = rec["fields"]
+        if not f.get("sku_code"):
+            continue
+        if f.get("version"):
+            versions[f["version"]] += 1
+        skus.append(SkuRate(
+            sku_code=str(f.get("sku_code", "")).strip(),
+            alt_code=str(f.get("alt_code", "") or "").strip(),
+            brand=f.get("brand", "") or "",
+            product=f.get("product", "") or "",
+            container=f.get("container", "") or "",
+            brl_per_unit=f.get("brl_per_unit"),
+            abv=f.get("abv"),
+            wsp_per_brl=f.get("wsp_per_brl"),
+            contract_base_per_brl=f.get("contract_base_per_brl"),
+            on_contract=bool(f.get("on_contract")),
+            supplier_type=f.get("supplier_type", "") or "",
+            hold_per_brl=float(f.get("hold_per_brl") or 0.0),
+            correct_total_per_brl=f.get("correct_total_per_brl"),
+            source=f.get("source", "") or "",
+            notes=f.get("notes", "") or "",
+        ))
+
+    sites = [
+        SiteInfo(
+            account=str(f.get("account", "")).strip(),
+            site_name=f.get("site_name", "") or "",
+            operating_model=f.get("operating_model", "") or "",
+            discount_construct=f.get("discount_construct", "") or "",
+            notes=f.get("notes", "") or "",
+        )
+        for rec in _list_all(T["TennentsSiteMaster"])
+        if (f := rec["fields"]).get("account")
+    ]
+
+    exceptions = [
+        SkuException(
+            site_name=f.get("site_name", "") or "",
+            account=str(f.get("account", "") or "").strip(),
+            sku_code_raw=str(f.get("sku_code", "")).strip(),
+            product=f.get("product", "") or "",
+            loaded_total_per_brl=f.get("loaded_total_per_brl"),
+            correct_total_per_brl=f.get("correct_total_per_brl"),
+            direction=f.get("direction", "") or "",
+            impact_gbp=f.get("impact_gbp"),
+            status=f.get("status", "") or "",
+            # Checkbox ticked in Airtable retires the override without a
+            # workbook re-upload; unticked falls back to the status text.
+            resolved_flag=True if f.get("resolved") else None,
+        )
+        for rec in _list_all(T["TennentsSiteSkuExceptions"])
+        if (f := rec["fields"]).get("sku_code")
+    ]
+
+    version = versions.most_common(1)[0][0] if versions else ""
+    return TennentsMaster(
+        version=version, source="airtable",
+        skus=skus, sites=sites, exceptions=exceptions,
+    )
+
+
+def replace_tennents_master(master, source: str) -> tuple[int, int]:
+    """
+    Wipe the three Tennents master tables and recreate them from a parsed
+    TennentsMaster. Returns (deleted, created) across all three.
+    """
+    deleted = 0
+    created = 0
+
+    deleted += _wipe_table(T["TennentsSkuMaster"], "sku_code")
     payload = []
-    for ag in agreements:
-        payload.append({"fields": {
-            "agreement_key": f"{ag.account}|{ag.sku_code}",
-            "account": ag.account,
-            "customer_name": ag.customer_name,
-            "sku_code": ag.sku_code,
-            "sku_desc": ag.sku_desc,
-            "tenant_invoice": float(ag.tenant_invoice),
-            "fb_net_price": float(ag.fb_net_price),
-            "off_invoice_per_brl": float(ag.off_invoice_per_brl),
-            "retro_per_brl": float(ag.retro_per_brl),
-            "total_per_brl": float(ag.total_per_brl),
-            "source": source,
-        }})
-    created = len(_batch(payload, "create", table_id)) if payload else 0
+    for s in master.skus:
+        fields = {
+            "sku_code": s.sku_code,
+            "on_contract": bool(s.on_contract),
+            "hold_per_brl": float(s.hold_per_brl or 0.0),
+            "version": master.version,
+            "source_file": source,
+        }
+        _opt(fields, "alt_code", s.alt_code)
+        _opt(fields, "brand", s.brand)
+        _opt(fields, "product", s.product)
+        _opt(fields, "container", s.container)
+        _opt(fields, "brl_per_unit", s.brl_per_unit)
+        _opt(fields, "abv", s.abv)
+        _opt(fields, "wsp_per_brl", s.wsp_per_brl)
+        _opt(fields, "contract_base_per_brl", s.contract_base_per_brl)
+        _opt(fields, "supplier_type", s.supplier_type)
+        _opt(fields, "correct_total_per_brl", s.correct_total_per_brl)
+        _opt(fields, "source", s.source)
+        _opt(fields, "notes", s.notes)
+        payload.append({"fields": fields})
+    created += len(_batch(payload, "create", T["TennentsSkuMaster"])) if payload else 0
+
+    deleted += _wipe_table(T["TennentsSiteMaster"], "account")
+    payload = []
+    for st in master.sites:
+        fields = {
+            "account": st.account,
+            "site_name": st.site_name,
+            "version": master.version,
+            "source_file": source,
+        }
+        _opt(fields, "operating_model", st.operating_model)
+        _opt(fields, "discount_construct", st.discount_construct)
+        _opt(fields, "notes", st.notes)
+        payload.append({"fields": fields})
+    created += len(_batch(payload, "create", T["TennentsSiteMaster"])) if payload else 0
+
+    deleted += _wipe_table(T["TennentsSiteSkuExceptions"], "exception_key")
+    payload = []
+    for ex in master.exceptions:
+        fields = {
+            "exception_key": f"{ex.site_name}|{ex.sku_code_raw}",
+            "site_name": ex.site_name,
+            "sku_code": ex.sku_code_raw,
+            "resolved": bool(ex.resolved),
+            "version": master.version,
+            "source_file": source,
+        }
+        _opt(fields, "account", ex.account)
+        _opt(fields, "product", ex.product)
+        _opt(fields, "loaded_total_per_brl", ex.loaded_total_per_brl)
+        _opt(fields, "correct_total_per_brl", ex.correct_total_per_brl)
+        _opt(fields, "direction", ex.direction)
+        _opt(fields, "impact_gbp", ex.impact_gbp)
+        _opt(fields, "status", ex.status)
+        payload.append({"fields": fields})
+    created += len(_batch(payload, "create", T["TennentsSiteSkuExceptions"])) if payload else 0
+
     return deleted, created
 
 
 def get_tennents_master_info() -> dict:
-    """Summary for the Tennents card on the index page."""
-    from collections import Counter
-    sources: Counter[str] = Counter()
-    customers: set = set()
+    """Summary for the Tennents landing banner and the index card."""
+    version = ""
+    source_file = ""
     latest: str | None = None
-    count = 0
-    for rec in _list_all(T["TennentsAgreements"]):
+    sku_count = 0
+    no_rate_count = 0
+    for rec in _list_all(T["TennentsSkuMaster"],
+                         fields=["sku_code", "correct_total_per_brl", "version", "source_file"]):
         f = rec["fields"]
-        count += 1
-        if f.get("source"):
-            sources[f["source"]] += 1
-        if f.get("account"):
-            customers.add(f["account"])
+        if not f.get("sku_code"):
+            continue
+        sku_count += 1
+        if f.get("correct_total_per_brl") is None:
+            no_rate_count += 1
+        version = version or f.get("version", "")
+        source_file = source_file or f.get("source_file", "")
         ct = rec.get("createdTime")
         if ct and (latest is None or ct > latest):
             latest = ct
+
+    site_count = sum(
+        1 for rec in _list_all(T["TennentsSiteMaster"], fields=["account"])
+        if rec["fields"].get("account")
+    )
+    open_exceptions = 0
+    exception_count = 0
+    for rec in _list_all(T["TennentsSiteSkuExceptions"], fields=["sku_code", "status", "resolved"]):
+        f = rec["fields"]
+        if not f.get("sku_code"):
+            continue
+        exception_count += 1
+        resolved = bool(f.get("resolved")) or "resolved" in (f.get("status", "") or "").lower()
+        if not resolved:
+            open_exceptions += 1
+
     return {
-        "sources": [s for s, _ in sources.most_common()],
-        "agreement_count": count,
-        "customer_count": len(customers),
+        "version": version,
+        "source_file": source_file,
+        "sku_count": sku_count,
+        "no_rate_count": no_rate_count,
+        "site_count": site_count,
+        "exception_count": exception_count,
+        "open_exception_count": open_exceptions,
         "latest_uploaded_at": latest,
     }
+
+
+def list_tennents_monthly_volumes() -> list[dict]:
+    """Latest Tennents monthly upload per period, for barrelage tracking.
+
+    Files carry period_month/barrels_total/tlager_barrels (set on Tennents
+    monthly uploads). A corrected re-issue of a month supersedes the earlier
+    upload by received_at, so each period counts once.
+    """
+    best: dict[str, dict] = {}
+    for rec in _list_all(T["Files"], fields=[
+        "file_name", "supplier", "received_at",
+        "period_month", "barrels_total", "tlager_barrels",
+    ]):
+        f = rec["fields"]
+        if f.get("supplier") != "Tennents" or not f.get("period_month"):
+            continue
+        row = {
+            "period": f["period_month"],
+            "received_at": f.get("received_at") or "",
+            "file_name": f.get("file_name", "") or "",
+            "barrels": float(f.get("barrels_total") or 0.0),
+            "tlager_barrels": float(f.get("tlager_barrels") or 0.0),
+        }
+        cur = best.get(row["period"])
+        if cur is None or row["received_at"] > cur["received_at"]:
+            best[row["period"]] = row
+    return [best[k] for k in sorted(best)]
 
 
 def _create_mismatches_deduped(payload: list[dict]) -> int:
@@ -1389,51 +1556,29 @@ def _create_mismatches_deduped(payload: list[dict]) -> int:
 
 
 def write_tennents_findings(summary, file_record_id: str) -> int:
-    """Persist Tennents reconciliation findings to the Mismatches table."""
+    """Persist Tennents reconciliation findings to the Mismatches table.
+
+    NB expected_fb_price / actual_fb_price are REPURPOSED to carry discount
+    £/Brl values for the discount-shaped types (long-standing gotcha).
+    exception-pending rows are persisted at `low` severity so known
+    corrections accrue a monthly £ trail without shouting; wsp-variance and
+    master-arithmetic rows are HTML-only (never persisted).
+    """
     table_id = T["Mismatches"]
     payload = []
 
     def _key(prefix: str, *bits) -> str:
         return f"{file_record_id}|tennents|{prefix}|" + "|".join(str(b) for b in bits)
 
-    for r in summary.invoice_mismatches:
-        payload.append({"fields": {
-            "mismatch_key": _key("invoice", r.account, r.sku_code),
-            "type": "tennents_wrong_invoice",
-            "severity": "high" if abs(r.delta_per_unit * r.kegs) >= 50 else "medium",
-            "file": [file_record_id],
-            "expected_tenant_price": float(r.expected),
-            "actual_tenant_price": float(r.actual),
-            "delta_per_unit": float(r.delta_per_unit),
-            "delta_total": float(r.delta_per_unit * r.kegs),
-            "qty": float(r.kegs),
-            "status": "open",
-            "notes": f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc}",
-        }})
-
-    for r in summary.fb_price_mismatches:
-        payload.append({"fields": {
-            "mismatch_key": _key("fb", r.sku_code, round(r.expected, 4), round(r.actual, 4)),
-            "type": "tennents_wrong_fb_price",
-            "severity": "medium",
-            "file": [file_record_id],
-            "expected_fb_price": float(r.expected),
-            "actual_fb_price": float(r.actual),
-            "delta_per_unit": float(r.delta_per_unit),
-            "delta_total": float(r.delta_per_unit * r.total_kegs),
-            "qty": float(r.total_kegs),
-            "status": "open",
-            "notes": f"Tennents {r.sku_code} {r.sku_desc} across {len(r.sites_affected)} sites",
-        }})
-
     for r in summary.discount_mismatches:
         sev = "high" if abs(r.delta_total) >= 100 else ("medium" if abs(r.delta_total) >= 10 else "low")
         payload.append({"fields": {
-            "mismatch_key": _key("disc", r.account, r.sku_code),
+            "mismatch_key": _key("disc", r.account, r.sku_code,
+                                 f"{r.expected:.2f}", f"{r.actual:.2f}"),
             "type": "tennents_wrong_discount",
             "severity": sev,
             "file": [file_record_id],
-            "expected_fb_price": float(r.expected),  # repurpose for £/Brl
+            "expected_fb_price": float(r.expected),  # £/Brl (repurposed)
             "actual_fb_price": float(r.actual),
             "delta_per_unit": float(r.delta_per_brl),
             "delta_total": float(r.delta_total),
@@ -1441,7 +1586,112 @@ def write_tennents_findings(summary, file_record_id: str) -> int:
             "status": "open",
             "notes": (
                 f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — "
-                f"discount £/Brl: master {r.expected:+.2f}, actual {r.actual:+.2f}"
+                f"total discount £/Brl: expected {r.expected:.2f} ({r.basis}), "
+                f"actual {r.actual:.2f}. Positive Δ = short."
+            ),
+        }})
+
+    for r in summary.exception_pending:
+        payload.append({"fields": {
+            "mismatch_key": _key("excpend", r.account, r.sku_code),
+            "type": "tennents_exception_pending",
+            "severity": "low",
+            "file": [file_record_id],
+            "expected_fb_price": float(r.correct) if r.correct is not None else None,
+            "actual_fb_price": float(r.actual),
+            "delta_total": float(r.short_vs_correct) if r.short_vs_correct is not None else None,
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents KNOWN exception still in effect: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} — loaded "
+                f"{'-' if r.loaded is None else f'{r.loaded:.2f}'} vs correct "
+                f"{'TBC' if r.correct is None else f'{r.correct:.2f}'} £/Brl. "
+                f"{r.status}"
+            ),
+        }})
+
+    for r in summary.exceptions_resolved:
+        payload.append({"fields": {
+            "mismatch_key": _key("excres", r.account, r.sku_code),
+            "type": "tennents_exception_resolved",
+            "severity": "medium",
+            "file": [file_record_id],
+            "expected_fb_price": float(r.correct),
+            "actual_fb_price": float(r.actual),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents exception looks RESOLVED: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} now charged at the correct rate "
+                f"{r.correct:.2f} £/Brl. Mark resolved in the master workbook and re-upload."
+            ),
+        }})
+
+    for r in summary.retro_arithmetic:
+        sev = "high" if abs(r.delta) >= 50 else ("medium" if abs(r.delta) >= 5 else "low")
+        payload.append({"fields": {
+            "mismatch_key": _key("retro", r.account, r.sku_code,
+                                 f"{r.barrels:.4f}", f"{r.retro_due:.2f}"),
+            "type": "tennents_retro_arithmetic",
+            "severity": sev,
+            "file": [file_record_id],
+            "delta_total": float(r.delta),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents retro arithmetic: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} — retro due £{r.retro_due:.2f} vs "
+                f"{r.retro_per_brl:.2f}/Brl × {r.barrels:.4f} Brl = £{r.calc_due:.2f} "
+                f"(must match exactly)."
+            ),
+        }})
+
+    for r in summary.line_arithmetic:
+        payload.append({"fields": {
+            "mismatch_key": _key("linarith", r.account, r.sku_code, f"{r.total_per_brl:.2f}"),
+            "type": "tennents_line_arithmetic",
+            "severity": "medium",
+            "file": [file_record_id],
+            "delta_total": float(r.delta),
+            "status": "open",
+            "notes": (
+                f"Tennents line arithmetic: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} — off {r.off_per_brl:.2f} + retro "
+                f"{r.retro_per_brl:.2f} + AOD {r.aod_per_brl:.2f} ≠ total {r.total_per_brl:.2f} £/Brl."
+            ),
+        }})
+
+    for r in summary.managed_retro:
+        payload.append({"fields": {
+            "mismatch_key": _key("managed", r.account, r.sku_code),
+            "type": "tennents_managed_retro_split",
+            "severity": "medium",
+            "file": [file_record_id],
+            "delta_total": float(r.retro_value),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents managed site on a retro split: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} — retro {r.retro_per_brl:.2f}/Brl on "
+                f"{r.barrels:.2f} Brl (£{r.retro_value:.2f}). Managed sites should be "
+                f"all off-invoice — cash-timing review, not a value error."
+            ),
+        }})
+
+    for r in summary.no_rate:
+        payload.append({"fields": {
+            "mismatch_key": _key("norate", r.account, r.sku_code),
+            "type": "tennents_no_agreed_rate",
+            "severity": "medium",
+            "file": [file_record_id],
+            "actual_fb_price": float(r.actual_total_per_brl),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents delivery with NO agreed rate: {r.account} {r.customer_name} / "
+                f"{r.sku_code} {r.sku_desc} — {r.kegs:g} kegs at "
+                f"{r.actual_total_per_brl:.2f} £/Brl discount. {r.note}"
             ),
         }})
 
@@ -1455,21 +1705,24 @@ def write_tennents_findings(summary, file_record_id: str) -> int:
             "status": "open",
             "notes": (
                 f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — "
-                f"delivered {r.kegs:g} kegs but no master agreement exists. "
+                f"delivered {r.kegs:g} kegs but SKU_Master has no row for this SKU. "
                 f"Avg invoice £{r.avg_invoice:.2f}, avg discount £{r.avg_discount_per_brl:.2f}/Brl."
             ),
         }})
 
-    for r in summary.customers_not_on_master:
-        acct, name = r
+    for acct, name in summary.new_customers:
         payload.append({"fields": {
             "mismatch_key": _key("newcust", acct),
             "type": "tennents_new_customer",
             "severity": "medium",
             "file": [file_record_id],
             "status": "open",
-            "notes": f"Tennents new customer {acct} {name} — needs master entries built.",
+            "notes": f"Tennents new customer {acct} {name} — add to the master workbook's Site_Master.",
         }})
+
+    # Sparse-clean: Airtable rejects explicit nulls on create.
+    for p in payload:
+        p["fields"] = {k: v for k, v in p["fields"].items() if v is not None}
 
     return _create_mismatches_deduped(payload)
 

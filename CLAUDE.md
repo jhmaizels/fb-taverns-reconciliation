@@ -74,11 +74,17 @@ Module map:
 - `airtable_schema.json` — table-id map (generated, committed, never hand-edit).
 - `webapp.py` — FastAPI app, routes, HTML.
 - `retro.py` — LWC monthly retro flow.
-- `tennents.py` — Tennents Direct flow (library, **no CLI**).
+- `tennents.py` — Tennents Direct reconciliation engine + HTML renderer
+  (library, **no CLI**).
+- `tennents_master.py` — parser + rate-resolution for the Tennents master
+  workbook (`FB_Taverns_Tennents_Master.xlsx`), the primary Tennents price file.
 - `support_parser.py` — NL → structured support rule via Claude tool-use.
 - `summary.py` — builder/renderer for the main LWC weekly summary.
 - `master_export.py` — read-only Airtable → wide-form FB cost Excel export.
 - `setup_airtable.py` / `migrate_csv_to_airtable.py` — one-off bootstrap scripts.
+- `setup_tennents_tables.py` / `load_tennents_master.py` — one-off bootstrap:
+  create the three Tennents master tables (+ Files volume fields), then load
+  the workbook from the CLI.
 
 **Join key is `site_id`** throughout LWC (the LWC `SITE ID` column), NOT account
 number. `ACCOUNT_BRIDGE` exists but is empty/diagnostic and is NOT applied in
@@ -92,10 +98,13 @@ Tables (ids from `airtable_schema.json`):
 |---|---|---|
 | Sites | `tblVBCkWzNj1R0Zdz` | site_id, name, status, country, notes |
 | Products | `tblwpqsGjeOi6Tl1y` | product_code, description, supplier, retro_eligible, retro_per_keg |
-| Files | `tblQ5oUQfQgAI2k8s` | file_name, supplier, received_at, line_count, parse_status, raw_hash, stored_path |
+| Files | `tblQ5oUQfQgAI2k8s` | file_name, supplier, received_at, line_count, parse_status, raw_hash, stored_path, period_month, barrels_total, tlager_barrels |
 | PricingRules | `tblBonamwCgnfmX5G` | rule_key, site, product, tenant_price, fb_price, retro_pct, valid_from, valid_to, status, reason, source |
 | Mismatches | `tbl6zLeJSip11hXYa` | mismatch_key, type, severity, file, site, product, rule, invoice_no, invoice_date, qty, delta_per_unit, delta_total, expected/actual_tenant_price, expected/actual_fb_price, status, notes |
-| TennentsAgreements | `tblxTZEY5H7WNfien` | agreement_key, account, customer_name, sku_code, sku_desc, tenant_invoice, fb_net_price, off_invoice_per_brl, retro_per_brl, total_per_brl, source |
+| TennentsSkuMaster | (airtable_schema.json) | sku_code, alt_code, brand, product, container, brl_per_unit, abv, wsp_per_brl, contract_base_per_brl, on_contract, supplier_type, hold_per_brl, correct_total_per_brl, source, notes, version, source_file |
+| TennentsSiteMaster | (airtable_schema.json) | account, site_name, operating_model, discount_construct, notes, version, source_file |
+| TennentsSiteSkuExceptions | (airtable_schema.json) | exception_key, site_name, account, sku_code (raw, may be compound "400751/400557"), product, loaded_total_per_brl, correct_total_per_brl, direction, impact_gbp, status, resolved, version, source_file |
+| TennentsAgreements | `tblxTZEY5H7WNfien` | **RETIRED 2026-07** (historical record only — the master workbook superseded the per-account Commercial Data agreements; nothing reads or writes this table) |
 
 Key facts:
 
@@ -106,9 +115,13 @@ Key facts:
   retro or Tennents findings table. Types: LWC (`wrong_tenant_price`,
   `wrong_fb_price`, `site_should_be_managed`, `unknown_site`,
   `product_not_on_master`, `tenant_price_missing`, `lwc_arithmetic_error`);
-  Tennents (`tennents_wrong_invoice`, `_wrong_fb_price`, `_wrong_discount`,
-  `_not_on_master`, `_new_customer`); retro (`retro_under_paid`, `_over_paid`,
-  `_paid_not_on_master`).
+  Tennents (`tennents_wrong_discount`, `_exception_pending`,
+  `_exception_resolved`, `_retro_arithmetic`, `_line_arithmetic`,
+  `_managed_retro_split`, `_no_agreed_rate`, `_not_on_master`,
+  `_new_customer`); retro (`retro_under_paid`, `_over_paid`,
+  `_paid_not_on_master`). The pre-2026-07 Tennents types
+  (`tennents_wrong_invoice`, `_wrong_fb_price`) are no longer produced but
+  survive on historical rows.
 - **PricingRules.rule_key** = `site|product|YYYY-MM-DD` (or `...|open` when no
   valid_from). This is the upsert/dedupe key.
 - **Files dedupe by `raw_hash`** (sha256). Re-uploading the same file returns
@@ -144,13 +157,22 @@ Key facts:
   only; multi-rate and agreed-not-delivered are diagnostic, NOT persisted).
 
 ### 5c. Tennents Direct monthly — `POST /upload-tennents`
+- Master: the **`FB_Taverns_Tennents_Master.xlsx` workbook is the primary
+  Tennents price file** (operator direction 2026-07-14). `load_tennents_master()`
+  → `TennentsMaster` (SKU rates + sites + exceptions from the three tables).
+  The workbook's own README sheet §4 is the reconciliation spec.
 - Inputs: monthly Draught Pricing Report ("Data" sheet) →
-  `tennents.parse_monthly` → `DeliveryLine` (filters Kegs>0; raises on zero).
-  Master: `load_tennents_agreements()` → `Agreement` keyed `(account, sku_code)`.
-- Match: `tennents.reconcile` aggregates deliveries per `(account, sku)` —
-  **sums kegs/barrels, takes simple MEAN of rates** — then 3 per-key checks
-  (invoice, FB net price, total discount) + 3 set-difference findings.
-- Output: `write_tennents_findings` → Mismatches.
+  `tennents.parse_monthly` → `MonthlyReport` (Kegs>0 lines checkable;
+  Kegs≤0 kept for volume only; raises on zero lines). Report discounts are
+  NEGATIVE — normalised to positive file-wide.
+- Match: `tennents.reconcile` checks **per line** (no mean-averaging):
+  expected total discount from SKU_Master unless a Site_SKU_Exceptions row
+  overrides (see §6), ±£0.50/brl; retro-due exactness; line arithmetic;
+  managed/bespoke constructs. Join is account + raw SKU code (alt codes
+  resolve via the SKU index).
+- Output: `write_tennents_findings` → Mismatches; Files row gets
+  `period_month`/`barrels_total`/`tlager_barrels` for the /tennents
+  barrelage-vs-2,700 panel and the annual-retro claim-window alarm.
 
 ### 5d. Tenant-support override — `POST /add-support` (WRITE-TO-MASTER)
 - Inputs: operator free text. `support_parser.parse_support_request` calls
@@ -166,8 +188,11 @@ Key facts:
 - **`POST /upload-master`** (LWC): `parse_fb_cost_file` → rules stamped
   `valid_from=vf`; `upsert_pricing_rules(rules, close_keys_at_date=vf)` (closes
   prior open rules for reappearing keys) + `upsert_products_with_retros`.
-- **`POST /upload-tennents-master`**: `parse_tennents_master` →
-  `replace_tennents_master` **WIPES ALL TennentsAgreements** then recreates.
+- **`POST /upload-tennents-master`**: `tennents_master.parse_master_workbook`
+  → `replace_tennents_master` **WIPES the three Tennents master tables** then
+  recreates them from the workbook. The workbook is the editing surface (its
+  README §5): edit → bump version → re-upload. Exceptions can also be retired
+  by ticking `resolved` in Airtable (no re-upload needed).
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -224,17 +249,44 @@ appear in BOTH. under total_delta is negative, over positive. If `agreed<=0`
 and `rate>0` → `paid_not_on_master`. multi_rate only triggers on >1 distinct
 NON-ZERO rate.
 
-**Tennents:** two tolerances — `TENNENTS_PRICE_TOLERANCE=0.05` (per-keg unit
-prices: tenant invoice AND FB net), `TENNENTS_DISCOUNT_TOLERANCE=0.50` (per-Brl
-discount). Discount section is the headline: `delta_total = delta_per_brl *
-barrels`; positive Δ = tenant got LESS discount than master. FB-price mismatches
-bucket by `(sku, round(expected,4), round(actual,4))` collapsing identical
-errors across sites. Master arithmetic flags `|total - (off+retro)| > 0.05`.
+**Tennents (per the master workbook's own README §4 — the spec):**
+- **Expected total discount** for a line = SKU_Master `correct_total_per_brl`
+  **unless** an open Site_SKU_Exceptions row overrides it, in which case the
+  exception's **Loaded** value is expected-current until the exception is
+  resolved. Exceptions key on **(account, RAW sku code)** — a mis-load on the
+  30L code says nothing about the 50L; a row covering both containers lists
+  both codes (`"400751/400557"`). SKU-rate lookup, by contrast, resolves alt
+  codes (`09000X` → `090425`).
+- **Exception line outcomes:** actual ≈ Loaded → `tennents_exception_pending`
+  (known state persists; NOT re-flagged as a mismatch; `(correct − actual) ×
+  barrels` accrues as "short vs correct"); actual ≈ Correct →
+  `tennents_exception_resolved` (Tennents' fix landed — mark resolved in the
+  workbook and re-upload); neither → `tennents_wrong_discount` vs the Loaded
+  value.
+- **Tolerance** `TENNENTS_DISCOUNT_TOLERANCE=0.50` £/brl, inclusive (Δ of
+  exactly 0.50 passes). `delta_per_brl = expected − actual` on positive-
+  normalised values; **positive Δ = tenant/FB got LESS discount (short)**.
+- **Retro exactness:** `Retro Due` must equal `retro £/brl × barrels` EXACTLY —
+  `RETRO_EXACT_TOLERANCE=0.005` (to the penny). Only checked when the report
+  has the column.
+- **Line arithmetic:** `off + retro + AOD == total` per line (0.005).
+- **Managed sites** (Site_Master operating model): zero retro + full discount
+  off-invoice is **CORRECT** — never flagged. A retro split at a managed site →
+  `tennents_managed_retro_split` (cash-timing review, not a value error).
+- **Bespoke constructs** (e.g. Gartocher, flat £200/brl retro): only the TOTAL
+  is validated — true for every site, since the master only carries totals; the
+  OID/retro split is never checked against the master.
+- **No agreed rate** (SKU_Master row with blank CURRENT CORRECT) →
+  `tennents_no_agreed_rate` when delivered without an exception.
+- Master data-quality (`base + hold ≠ CURRENT CORRECT`, >0.05) and WSP variance
+  (implied gross vs WSP, >£1/brl) are **HTML-only** — never persisted.
+- Volumes: barrels sum over ALL lines (returns net off); T.Lager identified by
+  brand (`_is_tlager`, apostrophe-insensitive) with the 090425 code fallback.
 
-**Severity (Tennents/retro):** Tennents invoice high if `|delta_per_unit*kegs|
->=50`; discount high `>=100` / medium `>=10` / low; fb-price/not-on-master/
-new-customer medium. Retro under high `>=50` / medium `>=5` / low; over and
-paid-not-on-master medium.
+**Severity (Tennents/retro):** Tennents discount high `>=100` / medium `>=10`
+/ low (£ on delta_total); retro-arithmetic high `>=50` / medium `>=5` / low;
+exception_pending low; everything else medium. Retro under high `>=50` /
+medium `>=5` / low; over and paid-not-on-master medium.
 
 ## 7. Web routes (all auth via HTTP Basic except where noted)
 
@@ -249,8 +301,9 @@ paid-not-on-master medium.
 | `GET /export-master` | yes | Download master as .xlsx (read-only) | — |
 | `POST /upload-master` | yes | **LWC master replace** | **YES** |
 | `POST /add-support` | yes | **NL tenant-support rule** (LLM) | **YES** |
-| `GET /tennents` | yes | Tennents landing | — |
-| `POST /upload-tennents-master` | yes | **Tennents master WIPE+replace** | **YES** |
+| `GET /tennents` | yes | Tennents landing (+ barrelage vs 2,700 + annual-retro claim alarm) | — |
+| `GET /tennents/master` | yes | Read-only browse of the master workbook mirror | — |
+| `POST /upload-tennents-master` | yes | **Tennents master workbook WIPE+replace** (admin) | **YES** |
 | `POST /upload-tennents` | yes | Tennents monthly reconcile | findings only |
 
 Auth: single shared credential, `WEB_USERNAME` (default `admin`) /
@@ -293,8 +346,8 @@ typecast, 0.25s sleeps.
 - **WRITE-TO-MASTER (riskier) flows that MUTATE the pricing master:**
   - `POST /upload-master` — closes + replaces LWC PricingRules.
   - `POST /add-support` — creates a PricingRule from an LLM parse.
-  - `POST /upload-tennents-master` — **DELETES ALL** TennentsAgreements then
-    recreates.
+  - `POST /upload-tennents-master` — **DELETES ALL** rows in the three
+    Tennents master tables then recreates them from the uploaded workbook.
   There is **no dry-run / confirmation step** beyond the form submit. Treat
   these as the high-blast-radius operations.
 - **Findings-only (safer) flows** that write only to the Mismatches table:
@@ -328,7 +381,8 @@ upload blocking the worker.
   the limit.
 - `write_tennents_findings` **repurposes** the `expected_fb_price` /
   `actual_fb_price` columns to carry discount £/Brl values for the
-  discount-mismatch type (not actual FB prices).
+  discount-shaped Tennents types (wrong_discount, exception_pending/resolved,
+  no_agreed_rate) — not actual FB prices.
 - `typecast:True` on every write auto-creates new singleSelect options — typos
   in a `type` value silently create a new option.
 - `parse_fb_cost_file` is **positional**: header row index 1, data from row 2,
@@ -341,10 +395,19 @@ upload blocking the worker.
 - `valid_to` closing only closes rules whose key **reappears** in the new batch
   AND are currently open; products dropped from the new master are NOT closed
   (stay `valid_to=None`, remain "active" for membership).
-- Tennents `reconcile` averages rates as **simple mean** (sum/n), not
-  keg-weighted — blended averages can sit just inside tolerance. Tennents
-  account regex matches ANY parenthesised digits anywhere; SKU regex matches
-  only the LAST parenthesised group at end-of-string — stray parens mis-extract.
+- Tennents `reconcile` is **per line** (the old mean-averaging is gone), but
+  findings are BUCKETED for display/persistence: discount mismatches by
+  `(account, canonical sku, expected, actual)`, exception rows by
+  `(account, exception's raw sku listing)`. Tennents account regex matches ANY
+  parenthesised digits anywhere; SKU regex matches only the LAST parenthesised
+  group at end-of-string — stray parens mis-extract.
+- Tennents monthly reports carry discounts/Retro Due as **NEGATIVE** numbers;
+  `parse_monthly` normalises sign file-wide (sum of totals < 0 → negate), so a
+  future positive-convention export still parses. The master holds positives.
+- The Tennents `version` string lives on every row of the three master tables
+  (from the workbook's README sheet "7. Version" row); `get_tennents_master_info`
+  reads it for the banner. The old TennentsAgreements table still exists but is
+  dead code — do not resurrect `load_tennents_agreements`.
 - LWC `ACCOUNT` column renamed `OUTLET` in Apr-2026+ files; both map to
   `account_name`. Older `Diff. From Master` workbook format unsupported.
 - HTML: filenames in `/upload` and `/upload-retro` success pages are NOT

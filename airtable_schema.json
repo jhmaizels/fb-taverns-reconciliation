@@ -6,6 +6,9 @@
     "Files": "tblQ5oUQfQgAI2k8s",
     "PricingRules": "tblBonamwCgnfmX5G",
     "Mismatches": "tbl6zLeJSip11hXYa",
-    "TennentsAgreements": "tblxTZEY5H7WNfien"
+    "TennentsAgreements": "tblxTZEY5H7WNfien",
+    "TennentsSkuMaster": "tblFor4KIduqI5nmz",
+    "TennentsSiteMaster": "tblQl3pMalOYR1Bx4",
+    "TennentsSiteSkuExceptions": "tblOxsnCpgdUhas7c"
   }
 }

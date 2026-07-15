@@ -93,18 +93,21 @@ from airtable_io import (  # noqa: E402
     get_active_master_info,
     upsert_pricing_rules,
     upsert_products_with_retros,
-    load_tennents_agreements,
+    load_tennents_master,
     replace_tennents_master,
     get_tennents_master_info,
+    list_tennents_monthly_volumes,
     write_tennents_findings,
     BASE_ID,
 )
 from tennents import (  # noqa: E402
-    parse_master as parse_tennents_master,
+    ANNUAL_BARREL_COMMITMENT,
+    TLAGER_ANNUAL_RETRO_PER_BRL,
     parse_monthly as parse_tennents_monthly,
     reconcile as reconcile_tennents,
     render_summary_html as render_tennents_summary_html,
 )
+from tennents_master import parse_master_workbook  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -360,6 +363,10 @@ HEAD_STYLE = """<!doctype html>
   tr.support-note td { background: #fffbe7; color: #4a3f10; border-bottom: 1px solid #eee; padding-top: 0.2em; padding-bottom: 0.4em; font-size: 0.85em; }
   .master-banner { background: #fffbe7; border: 1px solid #e6d480; border-radius: 6px; padding: 0.7em 1em; margin: 0 0 1.5em; font-size: 0.92em; color: #4a3f10; }
   .master-banner .sep { color: #b09d50; margin: 0 0.4em; }
+  .ok { color: #1f7a1f; }
+  .warn { color: #8a6500; }
+  .claim-alarm { background: #fdecea; border: 1px solid #d93025; border-radius: 6px; padding: 0.8em 1em; margin: 0 0 1em; color: #7a1410; font-weight: 600; }
+  .claim-warn { background: #fff4cf; border: 1px solid #d9a520; border-radius: 6px; padding: 0.8em 1em; margin: 0 0 1em; color: #6a4d00; }
   tr.ended td { color: #999; }
   .help { font-size: 0.85em; color: #555; margin: -0.4em 0 1em; line-height: 1.4; }
   .help strong { color: #2c5aa0; }
@@ -645,9 +652,10 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
 
     lwc_master = (lwc_info.get("sources") or ["—"])[0]
     lwc_rules = lwc_info.get("active_rule_count", 0)
-    ten_master = (ten_info.get("sources") or ["—"])[0]
-    ten_count = ten_info.get("agreement_count", 0)
-    ten_customers = ten_info.get("customer_count", 0)
+    ten_master = ten_info.get("source_file") or "—"
+    ten_skus = ten_info.get("sku_count", 0)
+    ten_sites = ten_info.get("site_count", 0)
+    ten_exceptions = ten_info.get("open_exception_count", 0)
 
     # Proxied under the hub: "/" is the Team Hub portal (same origin), the
     # same target as the header logo. Standalone (no base path) there is no
@@ -671,10 +679,10 @@ def index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
   </a>
   <a href="{ext_url('/tennents')}" class="card-link">
     <h2 style="margin-top:0">Tennents Direct <span class="card-tag">Scotland</span></h2>
-    <p>Monthly draught pricing report combining invoice, discount and retro data. Per-(customer, SKU) discount agreements.</p>
+    <p>Monthly draught pricing report reconciled against the Tennents master workbook — estate-wide SKU rates, site constructs and per-(site, SKU) exceptions.</p>
     <p class="card-meta">
       <strong>Master:</strong> <code>{escape(ten_master)}</code><br>
-      <strong>{ten_count}</strong> agreements across <strong>{ten_customers}</strong> customers
+      <strong>{ten_skus}</strong> SKUs · <strong>{ten_sites}</strong> sites · <strong>{ten_exceptions}</strong> open exceptions
     </p>
     <p><span class="card-cta">Open Tennents reconciliation →</span></p>
   </a>
@@ -2546,24 +2554,134 @@ def _tennents_master_banner_html() -> str:
         info = get_tennents_master_info()
     except Exception:
         return ""
-    sources = info.get("sources") or []
-    # sources[0] = uploaded filename (attacker-influenceable) — escape it.
-    src_text = escape(sources[0]) if sources else "<em>none uploaded yet</em>"
-    if len(sources) > 1:
-        src_text += f' <span class="pill">+{len(sources)-1} other source(s)</span>'
+    if not info.get("sku_count"):
+        return (
+            '<div class="master-banner"><strong>Current master:</strong> '
+            '<em>none loaded yet — upload FB_Taverns_Tennents_Master.xlsx below.</em></div>'
+        )
+    # source_file / version come from an uploaded workbook — escape them.
+    src_text = escape(info.get("source_file") or "") or "<em>unknown file</em>"
+    version = escape(info.get("version") or "")
+    version_chip = (
+        f' <span class="sep">·</span> <strong>{version[:60]}</strong>' if version else ""
+    )
     uploaded_at = escape((str(info.get("latest_uploaded_at") or "")).replace("T", " ")[:16])
     upload_chip = (
-        f' <span class="sep">·</span> uploaded <strong>{uploaded_at}</strong>'
+        f' <span class="sep">·</span> loaded <strong>{uploaded_at}</strong>'
         if uploaded_at else ""
     )
     return (
         '<div class="master-banner">'
         f'<strong>Current master:</strong> {src_text}'
+        f'{version_chip}'
         f'{upload_chip}'
-        f' <span class="sep">·</span> {info.get("agreement_count", 0)} agreements'
-        f' <span class="sep">·</span> {info.get("customer_count", 0)} customers'
+        f' <span class="sep">·</span> {info.get("sku_count", 0)} SKUs'
+        f' ({info.get("no_rate_count", 0)} rate TBC)'
+        f' <span class="sep">·</span> {info.get("site_count", 0)} sites'
+        f' <span class="sep">·</span> {info.get("open_exception_count", 0)} open exceptions'
         '</div>'
     )
+
+
+def _add_months(d: date, months: int) -> date:
+    """Same day-of-month `months` later (clamped to month end)."""
+    y, m = divmod(d.month - 1 + months, 12)
+    y += d.year
+    m += 1
+    for day in (d.day, 28):
+        try:
+            return date(y, m, day)
+        except ValueError:
+            continue
+    return date(y, m, 28)
+
+
+# Agreement anniversary: term start 19-Dec-2025 (Agreement_Terms). The
+# year-end definition is still TBC with Tennents (asked 14-Jul-26) — the
+# panel assumes the anniversary and says so.
+_TENNENTS_TERM_START = date(2025, 12, 19)
+
+
+def _agreement_year_window(today: date) -> tuple[date, date]:
+    start_year = today.year if today >= date(today.year, 12, 19) else today.year - 1
+    return date(start_year, 12, 19), date(start_year + 1, 12, 18)
+
+
+def _tennents_volume_panel_html() -> str:
+    """Barrelage vs the 2,700 brl/yr commitment + the ANNUAL retro claim
+    window (workbook README §6 / Pending_Corrections ANN-001)."""
+    try:
+        vols = list_tennents_monthly_volumes()
+    except Exception:
+        logger.exception("tennents volumes unavailable")
+        return ""
+
+    today = date.today()
+    win_start, win_end = _agreement_year_window(today)
+    claim_deadline = _add_months(win_end, 3)
+
+    # Claim-window alarm for the year that has just ENDED (if any).
+    prev_year_end = win_start - timedelta(days=1)
+    banner = ""
+    if prev_year_end > _TENNENTS_TERM_START and today <= _add_months(prev_year_end, 3):
+        banner = (
+            f'<div class="claim-alarm">ANNUAL RETRO CLAIM WINDOW OPEN — year ended '
+            f'{prev_year_end:%d %b %Y}. £{TLAGER_ANNUAL_RETRO_PER_BRL:.0f}/brl on T.Lager '
+            f'+ 2% small pack. Claims LAPSE after {_add_months(prev_year_end, 3):%d %b %Y} '
+            f'— submit with purchase data now.</div>'
+        )
+    elif (win_end - today).days <= 92:
+        banner = (
+            f'<div class="claim-warn">Agreement year ends {win_end:%d %b %Y} — prepare the '
+            f'annual retro claim (£{TLAGER_ANNUAL_RETRO_PER_BRL:.0f}/brl T.Lager + 2% small pack; '
+            f'3-month claim window, lapses {claim_deadline:%d %b %Y}).</div>'
+        )
+
+    def _in_window(period: str) -> bool:
+        try:
+            y, m = period.split("-")
+            probe = date(int(y), int(m), 28)
+        except (ValueError, AttributeError):
+            return False
+        return win_start <= probe <= win_end
+
+    in_year = [v for v in vols if _in_window(v["period"])]
+    total = sum(v["barrels"] for v in in_year)
+    tlager = sum(v["tlager_barrels"] for v in in_year)
+    months = len(in_year)
+
+    rows = "".join(
+        f"<tr><td>{escape(v['period'])}</td>"
+        f"<td class='r'>{v['barrels']:,.2f}</td>"
+        f"<td class='r'>{v['tlager_barrels']:,.2f}</td>"
+        f"<td class='sub'>{escape(v['file_name'])}</td></tr>"
+        for v in in_year
+    ) or "<tr><td colspan='4'><em>No monthly reports uploaded for this agreement year yet.</em></td></tr>"
+
+    if months:
+        annualised = total / months * 12
+        cls = "ok" if annualised >= ANNUAL_BARREL_COMMITMENT else "warn"
+        pace = (
+            f"<div class='summary-row'><span>Annualised run-rate ({months} month(s), unweighted)</span>"
+            f"<strong class='{cls}'>{annualised:,.0f} brl/yr vs {ANNUAL_BARREL_COMMITMENT:,} commitment</strong></div>"
+            f"<div class='summary-row'><span>T.Lager annual retro accruing (£{TLAGER_ANNUAL_RETRO_PER_BRL:.0f}/brl if commitment met)</span>"
+            f"<strong>£{tlager * TLAGER_ANNUAL_RETRO_PER_BRL:,.2f}</strong></div>"
+        )
+    else:
+        pace = ""
+
+    return f"""{banner}
+<h2>Volume vs commitment <span class="pill">agreement year {win_start:%d %b %Y} – {win_end:%d %b %Y}</span></h2>
+<p class="sub">Minimum 2,700 draught barrels per agreement year (cliff-edge — the annual retros
+(£10/brl T.Lager + 2% small pack) are only claimable if it's delivered, within 3 months of year end).
+Year-end definition TBC with Tennents — anniversary assumed. Small-pack purchases aren't in the
+draught report, so the 2% accrual isn't tracked here.</p>
+<div class="result" style="max-width:none">
+  <div class="summary-row"><span>Barrels this agreement year (reports uploaded)</span><strong>{total:,.2f}</strong></div>
+  {pace}
+</div>
+<table style="max-width:720px"><thead><tr><th>Month</th><th class="r">Barrels</th><th class="r">T.Lager brl</th><th>Report</th></tr></thead>
+<tbody>{rows}</tbody></table>"""
 
 
 @app.get("/tennents", response_class=HTMLResponse)
@@ -2571,31 +2689,112 @@ def tennents_home(principal: DrinksPrincipal = Depends(require_drinks_role("view
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>Tennents Direct Reconciliation <span class="estate-tag">Scotland</span></h1>
-<p class="sub">Upload the monthly draught pricing report. Or update the discount-agreement master.</p>
+<p class="sub">Upload the monthly draught pricing report to reconcile it against the master workbook
+(README §4: expected discount from SKU_Master unless an exception overrides; ±£0.50/brl;
+retro due exact; managed sites all off-invoice).</p>
 {_tennents_master_banner_html()}
 
 <h2>Reconcile a monthly file</h2>
 <form action="{ext_url('/upload-tennents')}" method="post" enctype="multipart/form-data" style="max-width: 540px">
   <h3 style="margin-top:0; color: #2c5aa0">Monthly draught pricing report</h3>
-  <p class="sub">e.g. <code>FB Taverns Draught Pricing Report - January.xlsx</code>. The <code>Data</code> tab is the per-delivery line items.</p>
+  <p class="sub">e.g. <code>FB Taverns Draught Pricing Report - June26.xlsx</code>. The <code>Data</code> tab is the per-delivery line items.</p>
   <label for="ten-file">Monthly file (.xlsx)</label>
   <input type="file" name="file" id="ten-file" accept=".xlsx" required>
   <button type="submit">Upload &amp; reconcile</button>
 </form>
 
-<h2>Discount-agreement master</h2>
+<h2>Master price file</h2>
 <div class="result" style="max-width: none">
-  <p style="margin-top:0">The <strong>FB Taverns - Commercial Data</strong> Excel is the master. The <code>FB Taverns Discount</code> tab holds (Customer, SKU) discount agreements. Re-upload to replace the master wholesale.</p>
+  <p style="margin-top:0"><strong>FB_Taverns_Tennents_Master.xlsx</strong> is the primary price file:
+  estate-wide SKU rates (<code>SKU_Master</code>), site operating models and discount constructs
+  (<code>Site_Master</code>), and per-(site, SKU) exceptions (<code>Site_SKU_Exceptions</code>).
+  The workbook is the editing surface — update it, bump the version on its README sheet, and
+  re-upload; the stored master is replaced wholesale (its README §5).</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}" style="margin-top:0">Browse current master</a></p>
 </div>
 <form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
-  <h3 style="margin-top:0; color: #2c5aa0">Upload new master</h3>
-  <p class="sub">Replaces every Tennents agreement currently in the system. Old agreements are deleted; the new file's rows take their place.</p>
-  <label for="ten-master-file">Commercial Data file (.xlsx)</label>
+  <h3 style="margin-top:0; color: #2c5aa0">Upload master workbook</h3>
+  <p class="sub">Replaces the stored SKU rates, sites and exceptions. Requires the admin role.</p>
+  <label for="ten-master-file">FB_Taverns_Tennents_Master.xlsx</label>
   <input type="file" name="file" id="ten-master-file" accept=".xlsx" required>
   <button type="submit">Replace master</button>
 </form>
 
+{_tennents_volume_panel_html()}
+
 <p style="margin-top:2em"><a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable base</a></p>
+{PAGE_FOOT}"""
+
+
+@app.get("/tennents/master", response_class=HTMLResponse)
+def tennents_master_view(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    """Read-only browse of the stored master (the workbook mirror)."""
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+
+    def m(v, dash="—"):
+        return f"£{v:,.2f}" if v is not None else dash
+
+    sku_rows = "".join(
+        f"<tr><td>{escape(s.sku_code)}{(' / ' + escape(s.alt_code)) if s.alt_code else ''}</td>"
+        f"<td>{escape(s.product)}</td><td>{escape(s.container)}</td>"
+        f"<td>{escape(s.supplier_type)}</td>"
+        f"<td>{'Y' if s.on_contract else 'N'}</td>"
+        f"<td class='r'>{m(s.wsp_per_brl)}</td>"
+        f"<td class='r'>{m(s.contract_base_per_brl)}</td>"
+        f"<td class='r'>{m(s.hold_per_brl)}</td>"
+        f"<td class='r'><strong>{m(s.correct_total_per_brl, 'RATE TBC')}</strong></td>"
+        f"<td class='sub'>{escape(s.notes)}</td></tr>"
+        for s in master.skus
+    )
+    site_rows = "".join(
+        f"<tr><td>{escape(st.account)}</td><td>{escape(st.site_name)}</td>"
+        f"<td>{escape(st.operating_model)}</td>"
+        f"<td>{escape(st.discount_construct)}</td>"
+        f"<td class='sub'>{escape(st.notes)}</td></tr>"
+        for st in master.sites
+    )
+    exc_rows = "".join(
+        f"<tr{' class=ended' if ex.resolved else ''}>"
+        f"<td>{escape(ex.site_name)}</td><td>{escape(ex.sku_code_raw)}</td>"
+        f"<td>{escape(ex.product)}</td>"
+        f"<td class='r'>{m(ex.loaded_total_per_brl)}</td>"
+        f"<td class='r'>{m(ex.correct_total_per_brl, 'TBC')}</td>"
+        f"<td>{escape(ex.direction)}</td>"
+        f"<td class='r'>{m(ex.impact_gbp)}</td>"
+        f"<td>{'RESOLVED' if ex.resolved else 'open'}</td>"
+        f"<td class='sub'>{escape(ex.status)}</td></tr>"
+        for ex in master.exceptions
+    )
+
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
+<h1>Tennents master <span class="estate-tag">read-only</span></h1>
+<p class="sub">Mirror of <strong>FB_Taverns_Tennents_Master.xlsx</strong> — to change anything, edit the
+workbook, bump its version and re-upload it on the Tennents page. (Exceptions can also be retired by
+ticking <code>resolved</code> in Airtable once Tennents confirm a fix.)</p>
+{_tennents_master_banner_html()}
+
+<h2>SKU rates <span class="pill">{len(master.skus)}</span></h2>
+<table><thead><tr><th>SKU / alt</th><th>Product</th><th>Container</th><th>C&amp;C/3rd</th><th>Contract?</th>
+<th class="r">WSP £/brl</th><th class="r">Base £/brl</th><th class="r">Hold £/brl</th><th class="r">CURRENT CORRECT £/brl</th><th>Notes</th></tr></thead>
+<tbody>{sku_rows}</tbody></table>
+
+<h2>Sites <span class="pill">{len(master.sites)}</span></h2>
+<table><thead><tr><th>Account</th><th>Site</th><th>Operating model</th><th>Discount construct</th><th>Notes</th></tr></thead>
+<tbody>{site_rows}</tbody></table>
+
+<h2>Site/SKU exceptions <span class="pill">{len(master.exceptions)}</span></h2>
+<p class="sub">Open exceptions override the SKU rate: the <strong>Loaded</strong> value is expected-current
+until Tennents' fix lands (README §4). Resolved rows are greyed.</p>
+<table><thead><tr><th>Site</th><th>SKU</th><th>Product</th><th class="r">Loaded £/brl</th><th class="r">Correct £/brl</th>
+<th>Direction</th><th class="r">£ impact</th><th>State</th><th>Status</th></tr></thead>
+<tbody>{exc_rows}</tbody></table>
 {PAGE_FOOT}"""
 
 
@@ -2614,10 +2813,11 @@ def upload_tennents_master(
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
-        agreements = parse_tennents_master(tmp_path)
-        if not agreements:
-            return _error_page("Master file produced zero agreements after parsing.")
-        deleted, created = replace_tennents_master(agreements, source=original_name)
+        try:
+            master = parse_master_workbook(tmp_path, source_name=original_name)
+        except ValueError as e:
+            return _error_page(escape(str(e)))
+        deleted, created = replace_tennents_master(master, source=original_name)
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
@@ -2628,18 +2828,31 @@ def upload_tennents_master(
             except OSError:
                 pass
 
-    customer_count = len({a.account for a in agreements})
+    no_rate = [s.sku_code for s in master.skus if s.correct_total_per_brl is None]
+    open_exceptions = sum(1 for ex in master.exceptions if not ex.resolved)
+    arith = master.arithmetic_errors()
+    arith_warning = (
+        f"<div class='result err'><strong>{len(arith)} SKU row(s) where base + hold ≠ CURRENT CORRECT:</strong> "
+        + "; ".join(escape(f"{s.sku_code} ({s.implied_total:.2f} vs {s.correct_total_per_brl:.2f})") for s in arith)
+        + "</div>"
+        if arith else ""
+    )
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents master replaced</h1>
 {_tennents_master_banner_html()}
+{arith_warning}
 <div class="result">
   <div class="summary-row"><span>File</span><code>{escape(original_name)}</code></div>
-  <div class="summary-row"><span>Agreements deleted</span><strong>{deleted}</strong></div>
-  <div class="summary-row"><span>Agreements created</span><strong>{created}</strong></div>
-  <div class="summary-row"><span>Distinct customers</span><strong>{customer_count}</strong></div>
+  <div class="summary-row"><span>Version</span><code>{escape(master.version or "—")}</code></div>
+  <div class="summary-row"><span>Rows deleted</span><strong>{deleted}</strong></div>
+  <div class="summary-row"><span>Rows created</span><strong>{created}</strong></div>
+  <div class="summary-row"><span>SKUs</span><strong>{len(master.skus)}</strong> ({len(no_rate)} rate TBC)</div>
+  <div class="summary-row"><span>Sites</span><strong>{len(master.sites)}</strong></div>
+  <div class="summary-row"><span>Exceptions</span><strong>{len(master.exceptions)}</strong> ({open_exceptions} open)</div>
 </div>
 <p style="margin-top:1.5em">
+  <a class="button" href="{ext_url('/tennents/master')}">Browse master</a>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="{ext_url('/tennents')}" style="background:#666">Back to Tennents</a>
 </p>
@@ -2662,16 +2875,26 @@ def upload_tennents(
             tmp.write(_read_upload_capped(file))
             tmp_path = tmp.name
 
-        agreements = load_tennents_agreements()
-        if not agreements:
-            return _error_page("No Tennents master loaded yet — upload Commercial Data first.")
-        lines = parse_tennents_monthly(tmp_path)
-        summary = reconcile_tennents(original_name, agreements, lines)
+        master = load_tennents_master()
+        if not master.skus:
+            return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+        try:
+            report = parse_tennents_monthly(tmp_path)
+        except ValueError as e:
+            return _error_page(escape(str(e)))
+        summary = reconcile_tennents(original_name, master, report)
+        extra = {
+            "barrels_total": round(summary.barrels_total, 2),
+            "tlager_barrels": round(summary.tlager_barrels, 2),
+        }
+        if report.period:
+            extra["period_month"] = report.period
         file_rec_id = upsert_file_record(
             tmp_path,
             supplier="Tennents",
-            line_count=len(lines),
+            line_count=summary.line_count,
             file_name_override=original_name,
+            extra_fields=extra,
         )
         n_findings = write_tennents_findings(summary, file_rec_id)
     except Exception:
