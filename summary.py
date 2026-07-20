@@ -339,6 +339,22 @@ def _margin_cls(gbp: float, pct: float) -> str:
 CASK_FIXED_MARGIN_GBP = 35.0
 DRAUGHT_TARGET_GP = 0.40
 
+# White-labelled house products (operator, 2026-07-15): FIXED tenant prices per
+# keg, overriding the cask/GP policy entirely. Keyed by LWC product code.
+# These are also rolled out to every site's master where no price exists
+# (rollout_whitelabel_prices.py) — the suggested-price path covers new sites
+# and any site the rollout couldn't price.
+WHITE_LABEL_PRICES: dict[str, tuple[str, float]] = {
+    "17910010": ("FB Cider", 145.0),   # Appleshed Premium Cider 50L
+    "15621274": ("FB Bitter", 135.0),  # Black Sheep Smooth 50L Keg
+    "19100003": ("FB Lager", 135.0),   # Pilsner 11G
+}
+
+
+def white_label(code) -> tuple[str, float] | None:
+    """(label, fixed tenant price) for a white-labelled product code, else None."""
+    return WHITE_LABEL_PRICES.get(str(code or "").strip())
+
 
 def _policy_get(policy, key, default):
     if policy and policy.get(key) is not None:
@@ -370,24 +386,54 @@ def _is_cask(desc: str) -> bool:
     return "cask" in d or bool(_CASK_SIZE_RE.search(d))
 
 
-def _suggested_price(desc: str, cost: float, policy=None) -> float | None:
-    """Tenant price to instruct LWC to set, per policy. None with no cost basis."""
+# A 4.5-gallon pin carries HALF the cask margin (operator, 2026-07-15): the
+# blanket £/keg cask margin assumes a 9G (or 10G) firkin; a pin is half the
+# beer, so £35 becomes £17.50. Detected by size only — a cask marked "CASK"
+# with no size stays on the full margin.
+_PIN_SIZE_RE = re.compile(r"\b4\.5\s*g(?:al(?:lon)?s?)?\b", re.IGNORECASE)
+
+
+def _is_pin(desc: str) -> bool:
+    return bool(_PIN_SIZE_RE.search((desc or "").lower()))
+
+
+def _cask_margin_gbp(desc: str, policy=None) -> float:
+    full = _policy_cask(policy)
+    return full / 2.0 if _is_pin(desc) else full
+
+
+def _suggested_price(desc: str, cost: float, policy=None, code: str | None = None) -> float | None:
+    """Tenant price to instruct LWC to set, per policy. None with no cost basis.
+
+    White-labelled products (FB Cider/Bitter/Lager) take their FIXED price —
+    even with no cost basis, since the price doesn't derive from cost.
+    """
+    wl = white_label(code)
+    if wl:
+        return wl[1]
     if not cost or cost <= 0:
         return None
     if _is_cask(desc):
-        return cost + _policy_cask(policy)
+        return cost + _cask_margin_gbp(desc, policy)
     gp = _policy_gp(policy)
     return cost / (1.0 - gp) if 0 <= gp < 1 else None
 
 
-def _sug_round(desc: str, cost: float, policy=None):
-    v = _suggested_price(desc, cost, policy)
+def _sug_round(desc: str, cost: float, policy=None, code: str | None = None):
+    v = _suggested_price(desc, cost, policy, code)
     return round(v, 2) if v is not None else None
 
 
-def _suggest_basis(desc: str, policy=None) -> str:
+def _suggest_basis(desc: str, policy=None, code: str | None = None) -> str:
+    wl = white_label(code)
+    if wl:
+        return f"white-labelled {wl[0]}: fixed £{wl[1]:.2f}/keg"
     if _is_cask(desc):
-        return f"cask: FB cost + £{_policy_cask(policy):.0f}/keg"
+        margin = _cask_margin_gbp(desc, policy)
+        if _is_pin(desc):
+            return (f"cask 4.5G pin: FB cost + £{margin:.2f}/keg "
+                    f"(half the £{_policy_cask(policy):.0f} cask margin)")
+        return f"cask: FB cost + £{margin:.0f}/keg"
     gp = _policy_gp(policy)
     return f"{gp * 100:.0f}% gross margin (pre-retro): FB cost ÷ {1 - gp:.2f}"
 
@@ -414,25 +460,32 @@ def _policy_banner_html(policy, policy_url: str, can_accept: bool) -> str:
             "and <strong>inform LWC that the cask margin rises across the board by the inflation "
             f"amount</strong>.{link}</div>"
         )
+    wl_note = " / ".join(f"{label} £{price:.0f}" for label, price in WHITE_LABEL_PRICES.values())
     return (
-        f"<p class='sub policy-note'>Suggested prices use cask FB cost + £{cask:.0f}/keg and "
-        f"{gp * 100:.0f}% gross margin (pre-retro) for other draught. Effective {escape(str(eff))}; "
-        f"next review {escape(str(review))}.{link}</p>"
+        f"<p class='sub policy-note'>Suggested prices use cask FB cost + £{cask:.0f}/keg "
+        f"(9/10G; a 4.5G pin takes half, £{cask / 2:.2f}) and {gp * 100:.0f}% gross margin "
+        f"(pre-retro) for other draught. White-labelled {escape(wl_note)} are fixed. "
+        f"Effective {escape(str(eff))}; next review {escape(str(review))}.{link}</p>"
     )
 
 
 def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool, policy=None) -> str:
     """Table for the two actionable 'other' buckets: charged price, FB cost,
-    margin £ and %, suggested price (policy), plus (admins only) an 'Add to
-    master' button that writes the charged price for that (site, product)."""
+    margin £ and %, suggested price (policy) with ITS margin %, plus (admins
+    only) two accept actions per row — 'Add at charged' writes the charged
+    price for that (site, product); 'Add at this price' writes the suggested
+    price after the operator has had the chance to amend it in the inline box
+    (the LWC email then instructs them to set the amended price)."""
     head_action = "<th></th>" if can_accept else ""
     _mtitle = "Pre-retro gross margin: (charged − FB cost) ÷ charged. A rebate only widens it."
     _cask = _policy_cask(policy)
     _gp = _policy_gp(policy)
     _stitle = (
-        f"Price to instruct LWC to set — cask: FB cost + £{_cask:.0f}/keg; "
-        f"other draught: {_gp * 100:.0f}% gross margin pre-retro (FB cost ÷ {1 - _gp:.2f})"
+        f"Price to instruct LWC to set — cask: FB cost + £{_cask:.0f}/keg "
+        f"(half for a 4.5G pin); other draught: {_gp * 100:.0f}% gross margin pre-retro "
+        f"(FB cost ÷ {1 - _gp:.2f}); white-labelled FB products: fixed price"
     )
+    _smtitle = "Gross margin of the SUGGESTED price over FB cost: (suggested − cost) ÷ suggested."
     out = [
         "<table><thead><tr>"
         "<th>Site</th><th>Name</th><th>Code</th><th>Description</th>"
@@ -440,6 +493,7 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool, policy=None
         f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin/unit *</th>"
         f"<th class='r' title=\"{escape(_mtitle, quote=True)}\">Margin % *</th>"
         f"<th class='r' title=\"{escape(_stitle, quote=True)}\">Suggested</th>"
+        f"<th class='r' title=\"{escape(_smtitle, quote=True)}\">Sug. margin %</th>"
         f"{head_action}</tr></thead><tbody>"
     ]
     for r in rows:
@@ -448,34 +502,58 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool, policy=None
         charged_cell = _money_neutral(r.charged)
         if r.mixed:
             charged_cell += " <span class='mixed-note'>(varied)</span>"
-        sug = _suggested_price(r.product_desc, r.cost, policy)
+        sug = _suggested_price(r.product_desc, r.cost, policy, r.product_code)
         if sug is not None:
+            basis = _suggest_basis(r.product_desc, policy, r.product_code)
             sug_cell = (
-                f"<td class='r' title=\"{escape(_suggest_basis(r.product_desc, policy), quote=True)}\">"
+                f"<td class='r' title=\"{escape(basis, quote=True)}\">"
                 f"<strong>{_money_neutral(sug)}</strong></td>"
             )
         else:
             sug_cell = "<td class='r'>&mdash;</td>"
+        if sug and sug > 0 and r.cost > 0:
+            smg, smp = _margin(sug, r.cost)
+            sug_m_cell = f"<td class='r {_margin_cls(smg, smp)}'>{smp:.1f}%</td>"
+        else:
+            sug_m_cell = "<td class='r'>&mdash;</td>"
         btn = ""
         if can_accept:
             if r.mixed:
                 # Differing prices across this file's lines: the weighted figure
                 # matches no single invoice, so don't offer a one-click write —
                 # route to the editor to pick a specific price.
-                btn = (
-                    "<td><span class='mixed-note' title='This product was charged at more "
-                    "than one price in this file — set it in the master editor'>use editor</span></td>"
+                charged_action = (
+                    "<span class='mixed-note' title='This product was charged at more "
+                    "than one price in this file — set it in the master editor'>use editor</span>"
                 )
             else:
-                btn = (
-                    "<td><button type='button' class='accept-btn'"
+                charged_action = (
+                    "<button type='button' class='accept-btn'"
                     f" data-site=\"{escape(r.site_id, quote=True)}\""
                     f" data-sitename=\"{escape(r.site_name, quote=True)}\""
                     f" data-product=\"{escape(r.product_code, quote=True)}\""
                     f" data-desc=\"{escape(r.product_desc, quote=True)}\""
                     f" data-charged=\"{r.charged:.2f}\" data-cost=\"{r.cost:.2f}\""
-                    f" data-qty=\"{r.qty:g}\">Add to master</button></td>"
+                    f" data-qty=\"{r.qty:g}\">Add at charged</button>"
                 )
+            sug_action = ""
+            if sug is not None:
+                # Suggested-price accept: the price box is amendable; whatever is
+                # in it gets written to the master AND becomes the price the LWC
+                # email instructs them to set (the row stays in the email).
+                sug_action = (
+                    "<span class='sug-accept'>"
+                    f"<input type='number' class='sug-input' step='0.01' min='0.01'"
+                    f" value=\"{sug:.2f}\" aria-label='Price to add to master'>"
+                    "<button type='button' class='accept-sug-btn'"
+                    f" data-site=\"{escape(r.site_id, quote=True)}\""
+                    f" data-sitename=\"{escape(r.site_name, quote=True)}\""
+                    f" data-product=\"{escape(r.product_code, quote=True)}\""
+                    f" data-desc=\"{escape(r.product_desc, quote=True)}\""
+                    f" data-cost=\"{r.cost:.2f}\">Add at this price</button>"
+                    "</span>"
+                )
+            btn = f"<td class='action-cell'>{charged_action}{sug_action}</td>"
         out.append(
             f"<tr data-key=\"{escape(r.site_id + '|' + r.product_code, quote=True)}\">"
             f"<td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td>"
@@ -486,6 +564,7 @@ def _acceptable_table(rows: list[OtherFindingRow], can_accept: bool, policy=None
             f"<td class='r {mcls}'>{_money(gbp)}</td>"
             f"<td class='r {mcls}'>{pct:.1f}%</td>"
             f"{sug_cell}"
+            f"{sug_m_cell}"
             f"{btn}</tr>"
         )
     out.append("</tbody></table>")
@@ -511,6 +590,14 @@ _FINDINGS_STYLE = """<style>
   .eff-date-bar { max-width:none; }
   .eff-date-bar input[type=date] { display:inline; width:auto; margin:0 0 0 0.3em; }
   .mixed-note { color:#8a6500; font-size:0.85em; font-style:italic; }
+  td.action-cell { white-space:nowrap; }
+  .sug-accept { display:flex; gap:0.3em; align-items:center; margin-top:0.3em; }
+  .sug-input { width:82px; padding:0.25em 0.4em; margin:0; font-size:0.85em; text-align:right;
+               border:1px solid #c9d6e4; border-radius:3px; box-sizing:border-box; display:inline-block; }
+  .accept-sug-btn { background:#2c5aa0; color:#fff; border:0; padding:0.3em 0.7em; border-radius:4px;
+                    font-size:0.82em; cursor:pointer; white-space:nowrap; }
+  .accept-sug-btn:hover { background:#1d3f74; }
+  .accept-sug-btn:disabled { opacity:0.6; cursor:default; }
   #email-dirty-note { color:#8a6500; font-size:0.85em; }
   .policy-banner.due { background:#fff4cf; border:1px solid #e6c34d; border-radius:6px; padding:0.7em 1em; margin:0.6em 0; color:#6b4e00; font-size:0.92em; }
   .policy-note { font-size:0.85em; color:#666; margin:0.3em 0 0.6em; }
@@ -538,6 +625,18 @@ def _findings_script(cfg: dict) -> str:
         f'<script id="findings-config" type="application/json">{cfg_json}</script>'
         + _FINDINGS_JS
     )
+
+
+def _email_missing_row(r: OtherFindingRow, policy) -> dict:
+    wl = white_label(r.product_code)
+    return {
+        "site": r.site_id, "site_name": r.site_name, "product": r.product_code,
+        "desc": r.product_desc, "charged": round(r.charged, 2),
+        "cost": round(r.cost, 2), "qty": r.qty,
+        "suggested": _sug_round(r.product_desc, r.cost, policy, r.product_code),
+        "is_cask": _is_cask(r.product_desc),
+        "wl": wl[0] if wl else None,
+    }
 
 
 def render_summary_html(
@@ -708,8 +807,10 @@ def render_summary_html(
     else:
         parts.append(
             "<p class='sub'>Charged price, margin over FB cost, and our <strong>suggested</strong> "
-            "price to set (per the policy shown above). Healthy charged margin &rarr; add it at the "
-            "charged price; otherwise the email below instructs LWC to set our suggested price.</p>"
+            "price to set (per the policy shown above). Healthy charged margin &rarr; "
+            "<strong>Add at charged</strong>; otherwise amend the suggested price if needed and "
+            "<strong>Add at this price</strong> &mdash; the master takes it and the email below "
+            "instructs LWC to set it.</p>"
         )
         parts.append(_acceptable_table(s.products_not_on_master, can_accept, policy))
 
@@ -720,9 +821,10 @@ def render_summary_html(
         parts.append("<p><em>None.</em></p>")
     else:
         parts.append(
-            "<p class='sub'>Product is on the master but this site has no tenant price. Charged price, "
-            "margin, and our suggested price are shown &mdash; accept the charged price into the master, "
-            "or let the email below instruct LWC to set our suggested price.</p>"
+            "<p class='sub'>Product is on the master but this site has no tenant price. "
+            "<strong>Add at charged</strong> accepts the charged price into the master (and drops the "
+            "item from the email); <strong>Add at this price</strong> writes the suggested price "
+            "&mdash; amendable in the box first &mdash; and the email instructs LWC to set it.</p>"
         )
         parts.append(_acceptable_table(s.tenant_price_missing, can_accept, policy))
 
@@ -756,20 +858,8 @@ def render_summary_html(
                  "qty": r.qty}
                 for b in s.tenant_blocks for r in b.rows
             ],
-            "missing_products": [
-                {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
-                 "desc": r.product_desc, "charged": round(r.charged, 2),
-                 "cost": round(r.cost, 2), "qty": r.qty,
-                 "suggested": _sug_round(r.product_desc, r.cost, policy), "is_cask": _is_cask(r.product_desc)}
-                for r in s.products_not_on_master
-            ],
-            "missing_prices": [
-                {"site": r.site_id, "site_name": r.site_name, "product": r.product_code,
-                 "desc": r.product_desc, "charged": round(r.charged, 2),
-                 "cost": round(r.cost, 2), "qty": r.qty,
-                 "suggested": _sug_round(r.product_desc, r.cost, policy), "is_cask": _is_cask(r.product_desc)}
-                for r in s.tenant_price_missing
-            ],
+            "missing_products": [_email_missing_row(r, policy) for r in s.products_not_on_master],
+            "missing_prices": [_email_missing_row(r, policy) for r in s.tenant_price_missing],
         }
         parts.append("<h2>5. Draft email to LWC</h2>")
         parts.append(
@@ -812,7 +902,8 @@ _FINDINGS_JS = """<script>
   if (!el) return;
   var CFG;
   try { CFG = JSON.parse(el.textContent); } catch (e) { return; }
-  var accepted = new Set();
+  var accepted = new Set();     // accepted at the CHARGED price -> drop from the email
+  var amended = {};             // accepted at a (possibly amended) SUGGESTED price -> email instructs that price
   var bodyDirty = false;
   var subject = document.getElementById('email-subject');
   var body = document.getElementById('email-body');
@@ -857,8 +948,12 @@ _FINDINGS_JS = """<script>
       L.push('2) Please set the following tenant prices on your system:');
       missing.forEach(function (x) {
         var line = '   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc + ': ';
-        if (x.suggested != null) {
-          line += 'set to ' + money(x.suggested) + ' (currently charged ' + money(x.charged) + ')';
+        var amendedPrice = amended[x.site + '|' + x.product];
+        var sug = (amendedPrice != null) ? amendedPrice : x.suggested;
+        if (sug != null) {
+          line += 'set to ' + money(sug);
+          if (x.wl) line += ' (white-labelled as ' + x.wl + ')';
+          line += ' (currently charged ' + money(x.charged) + ')';
         } else {
           line += 'please confirm the agreed tenant price (currently charged ' + money(x.charged) + ')';
         }
@@ -895,6 +990,20 @@ _FINDINGS_JS = """<script>
   function acceptRule(btn) {
     var d = btn.dataset;
     var overwrite = d.overwrite === '1';
+    // Suggested-price accept: the price comes from the amendable input beside
+    // the button; the row stays in the LWC email with that price instructed.
+    var suggestedMode = btn.classList.contains('accept-sug-btn');
+    var price = d.charged;
+    if (suggestedMode) {
+      var wrap = btn.closest('.sug-accept');
+      var inp = wrap ? wrap.querySelector('.sug-input') : null;
+      price = inp ? parseFloat(inp.value) : NaN;
+      if (!isFinite(price) || price <= 0) {
+        window.alert('Enter a valid price to add.');
+        return;
+      }
+      price = price.toFixed(2);
+    }
     var msg;
     if (overwrite) {
       // A tenant-mismatch line already has a live agreed price; this OVERWRITES
@@ -904,6 +1013,14 @@ _FINDINGS_JS = """<script>
         'Product ' + d.product + ' ' + d.desc + '\\n' +
         'From ' + money(d.expected) + ' to ' + money(d.charged) + '\\n' +
         'Effective today \\u2014 past invoices are unaffected.';
+    } else if (suggestedMode) {
+      msg = 'Add to the live pricing master at this price?\\n\\n' +
+        'Site ' + d.site + ' ' + d.sitename + '\\n' +
+        'Product ' + d.product + ' ' + d.desc + '\\n' +
+        'Tenant price: ' + money(price) + '\\n' +
+        'FB cost: ' + money(d.cost) + '\\n' +
+        'Effective from: ' + effDate() + '\\n\\n' +
+        'The LWC email keeps this item and instructs them to set ' + money(price) + '.';
     } else {
       msg = 'Add to the live pricing master?\\n\\n' +
         'Site ' + d.site + ' ' + d.sitename + '\\n' +
@@ -920,7 +1037,7 @@ _FINDINGS_JS = """<script>
     params.set('site_id', d.site);
     params.set('product_code', d.product);
     params.set('product_desc', d.desc);
-    params.set('tenant_price', d.charged);
+    params.set('tenant_price', price);
     params.set('source_file', CFG.sourceFile);
     if (overwrite) {
       params.set('overwrite', '1');   // server forces valid_from = today
@@ -940,13 +1057,23 @@ _FINDINGS_JS = """<script>
       if (res.ok) {
         var row = btn.closest('tr');
         if (row) row.classList.add('accepted');
-        var td = btn.parentNode;
+        var td = btn.closest('td');
         td.textContent = '';
         var tag = document.createElement('span');
         tag.className = 'accepted-tag';
-        tag.textContent = overwrite ? '\\u2713 updated' : '\\u2713 added';
+        if (overwrite) {
+          tag.textContent = '\\u2713 updated';
+        } else if (suggestedMode) {
+          tag.textContent = '\\u2713 added at ' + money(price) + ' \\u2014 LWC instructed below';
+        } else {
+          tag.textContent = '\\u2713 added';
+        }
         td.appendChild(tag);
-        accepted.add(d.site + '|' + d.product);
+        if (suggestedMode) {
+          amended[d.site + '|' + d.product] = Number(price);
+        } else {
+          accepted.add(d.site + '|' + d.product);
+        }
         if (bodyDirty) {
           var note = document.getElementById('email-dirty-note');
           if (note) note.style.display = 'inline';
@@ -964,7 +1091,7 @@ _FINDINGS_JS = """<script>
     });
   }
 
-  Array.prototype.forEach.call(document.querySelectorAll('.accept-btn'), function (b) {
+  Array.prototype.forEach.call(document.querySelectorAll('.accept-btn, .accept-sug-btn'), function (b) {
     b.addEventListener('click', function () { acceptRule(b); });
   });
   if (body) body.addEventListener('input', function () { bodyDirty = true; updateMailto(); });

@@ -243,6 +243,21 @@ high. unknown_site / product_not_on_master / tenant_price_missing are hardcoded
 **"On the master" membership** counts only currently-active rules (`valid_to is
 None`), so superseded/dropped products don't look present.
 
+**Suggested prices (LWC findings page, `summary._suggested_price`):** the price
+we INSTRUCT LWC to set for products-not-on-master / tenant-price-missing rows.
+Policy (editable Config record via `load_pricing_policy`; defaults in
+`summary.py`): cask → FB cost + £35/keg, **halved to £17.50 for a 4.5G pin**
+(size-detected — a "CASK" with no stated size stays full); other draught → 40%
+GP pre-retro (cost ÷ 0.6). **White-labelled products override the policy with
+FIXED prices** (`summary.WHITE_LABEL_PRICES`): 17910010 FB Cider £145,
+15621274 FB Bitter £135, 19100003 FB Lager £135 — the fixed price applies even
+with no cost basis; rolled out estate-wide by `rollout_whitelabel_prices.py`
+(add-only, skips managed sites). Each row shows the suggested price's own
+margin % and offers two admin accepts: **Add at charged** (accepts LWC's
+price; row drops from the email draft) and **Add at this price** (writes the
+amendable suggested price; the row STAYS in the email instructing LWC to set
+it — keyed in JS `amended`, not `accepted`). Both POST `/accept-master-rule`.
+
 **Retro logic:** per-LINE classification — `under` where `(agreed-rate) >
 threshold`, `over` where `(rate-agreed) > threshold`; the same product can
 appear in BOTH. under total_delta is negative, over positive. If `agreed<=0`
