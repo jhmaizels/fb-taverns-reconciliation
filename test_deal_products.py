@@ -38,6 +38,11 @@ def main() -> int:
     check("token: missing header rejected", not token_ok(None, "s3cret"))
     check("token: non-bearer rejected", not token_ok("Basic s3cret", "s3cret"))
     check("token: unconfigured server matches nothing", not token_ok("Bearer ", ""))
+    try:
+        rejected_not_crashed = not token_ok("Bearer café\U0001f37a", "s3cret")
+    except TypeError:
+        rejected_not_crashed = False
+    check("token: non-ASCII header is a 401, not a TypeError 500", rejected_not_crashed)
 
     # --- payload ------------------------------------------------------------
     rules = [

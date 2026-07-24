@@ -19,12 +19,15 @@ from datetime import date
 
 
 def token_ok(authorization_header: str | None, expected: str | None) -> bool:
-    """Constant-time bearer check. No token configured => nothing matches."""
+    """Constant-time bearer check. No token configured => nothing matches.
+    Compared as bytes: compare_digest raises TypeError on non-ASCII str, which
+    would turn a hostile header into a 500 instead of a 401."""
     if not expected or not authorization_header:
         return False
     if not authorization_header.startswith("Bearer "):
         return False
-    return secrets.compare_digest(authorization_header[len("Bearer "):], expected)
+    supplied = authorization_header[len("Bearer "):]
+    return secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
 def build_deal_products_payload(snap) -> dict:
