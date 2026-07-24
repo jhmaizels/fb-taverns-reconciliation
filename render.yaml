@@ -35,3 +35,9 @@ services:
       # Non-secret: unified admin area linked from the no-access page (tenancy enforces its own gate).
       - key: TENANCY_ADMIN_URL
         value: https://tenancy-master.onrender.com/admin
+      # Shared bearer token for GET /api/deal-products (the tenancy hub's Deal
+      # Generator price feed). Set the SAME value on the tenancy-master
+      # service; unset = the endpoint answers 503 and the hub falls back to
+      # Excel import / manual lines.
+      - key: DEAL_PRODUCTS_TOKEN
+        sync: false

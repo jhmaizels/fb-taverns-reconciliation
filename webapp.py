@@ -70,6 +70,7 @@ from reconcile import (  # noqa: E402
 # master_export (which imports openpyxl) is imported lazily inside /export-master
 # so it stays off the cold-start / health-check readiness path.
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
+from deal_products import build_deal_products_payload, token_ok  # noqa: E402
 from airtable_io import (  # noqa: E402
     create_site,
     delete_product,
@@ -1313,6 +1314,25 @@ def export_master(principal: DrinksPrincipal = Depends(require_drinks_role("view
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/deal-products")
+def api_deal_products(request: Request):
+    """JSON product/cost feed for the tenancy hub's Deal Generator (server-to-
+    server: the hub calls with a shared bearer token, DEAL_PRODUCTS_TOKEN in
+    both Render services — NOT a browser/session route, so it bypasses the
+    Supabase principal). Read-only, served from the cached master snapshot."""
+    expected = os.environ.get("DEAL_PRODUCTS_TOKEN", "")
+    if not expected:
+        return JSONResponse({"detail": "feed not configured"}, status_code=503)
+    if not token_ok(request.headers.get("authorization"), expected):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    try:
+        snap = load_master_snapshot()
+        return JSONResponse(build_deal_products_payload(snap))
+    except Exception:
+        logger.exception("deal-products feed failed")
+        return JSONResponse({"detail": "snapshot unavailable"}, status_code=503)
 
 
 @app.post("/upload-master", response_class=HTMLResponse)
