@@ -152,6 +152,16 @@ def run():
     _check("master workbook: a tab per site", len(wb.sheetnames) == 3, str(wb.sheetnames))
     _check("master workbook: tab named for site", "STANDARD ARMS" in wb.sheetnames)
 
+    # grouping: products separated into labelled sections, in canonical order,
+    # and the per-row Category column is gone (SKU Code is now first).
+    ws = wb["STANDARD ARMS"]
+    _check("header drops Category col (SKU Code first)",
+           ws.cell(row=5, column=1).value == "SKU Code", str(ws.cell(row=5, column=1).value))
+    colA = [ws.cell(row=rr, column=1).value for rr in range(6, ws.max_row + 1)]
+    bands = [v for v in colA if v in set(tpe._CATEGORY_ORDER) | {tpe._OTHER}]
+    _check("sections grouped in canonical order",
+           bands == ["Standard Lager", "Premium Lager", "Ales & Stout"], str(bands))
+
     sb = tpe.build_single_site_bytes(m, tpe.find_site(m, "MANAGED HOUSE"))
     wb1 = load_workbook(io.BytesIO(sb))
     _check("single-site workbook: one tab", len(wb1.sheetnames) == 1)

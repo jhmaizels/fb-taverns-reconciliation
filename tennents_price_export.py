@@ -37,29 +37,75 @@ from tennents_master import (
     keg_brl_factor,
 )
 
-# Column layout — mirrors the team's familiar "Net & Invoice" price file.
+# Column layout — mirrors the team's familiar "Net & Invoice" price file. Products
+# are GROUPED into the sections below with a labelled header row + blank spacer,
+# the way Nick's file reads, so the per-row Category column is not needed.
 HEADERS = [
-    "Category", "SKU Code", "Brand", "ABV %", "WSP £/Brl",
+    "SKU Code", "Brand", "ABV %", "WSP £/Brl",
     "FB Taverns Total Discount", "New Net Price £/Brl",
     "Net Price £/Keg", "Net Price £/Pint",
     "Tenant Off-Invoice £/Brl", "Iona Retro £/Brl", "Notes",
 ]
-_MONEY_COLS = {5, 6, 7, 8, 9, 10, 11}   # 1-indexed columns to format as currency
-_CATEGORY_RULES = [
-    ("Standard Lager", ("tennent's lager", "tennents lager", "jeffrey", "carlsberg")),
-    ("Premium Lager",  ("heverlee", "menabrea", "bavarian", "stella", "mahou", "san miguel", "estrella")),
-    ("Craft",          ("drygate", "gladeye", "seven peaks", "disco", "innis", "i&g", "jubel", "kingfisher")),
-    ("Ales & Stout",   ("ember", "special", "light", "guinness", "mcewan", "80/-", "70/-", "60/-")),
-    ("Cider",          ("magners", "outcider", "blackthorn", "gaymers", "olde english", "orchard", "cider")),
+_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10}   # 1-indexed columns to format as currency
+_ABV_COL = 3
+
+# Section order, matching the team's price file. Uncategorised SKUs fall into a
+# trailing "Other" section (never hidden).
+_CATEGORY_ORDER = ["Standard Lager", "Premium Lager", "Craft", "Ales & Stout", "Cider"]
+_OTHER = "Other"
+
+# Authoritative SKU -> section, taken from the team's file (correcting its
+# off-by-one label placement: Caledonia Best is an ale, Drygate Pilsner is craft,
+# Magners Ice Cold / Outcider are ciders). Keyed by primary AND alt codes so a
+# lookup works whichever the master stored. Blackthorn (401176/401175) is mapped
+# ahead of being added to the master.
+_SKU_CATEGORY = {
+    # Standard Lager
+    "090425": "Standard Lager", "400889": "Standard Lager", "T00045238": "Standard Lager",
+    # Premium Lager
+    "401136": "Premium Lager", "400217": "Premium Lager", "400751": "Premium Lager",
+    "400557": "Premium Lager", "401211": "Premium Lager", "STE025": "Premium Lager",
+    "T00048477": "Premium Lager", "SAN002": "Premium Lager", "EST002": "Premium Lager",
+    "T00043388": "Premium Lager", "KIN003": "Premium Lager",
+    # Craft
+    "401080": "Craft", "401079": "Craft", "DRY025": "Craft", "DIS009": "Craft",
+    "T00044490": "Craft", "INN008": "Craft", "400248": "Craft", "INN005": "Craft",
+    "JUB002": "Craft", "JUB003": "Craft",
+    # Ales & Stout
+    "400076": "Ales & Stout", "400745": "Ales & Stout", "004723": "Ales & Stout",
+    "401152": "Ales & Stout", "004790": "Ales & Stout", "GUI002": "Ales & Stout",
+    "GUI003": "Ales & Stout", "MCE005": "Ales & Stout", "MCE015": "Ales & Stout",
+    "MCE008": "Ales & Stout", "T00045771": "Ales & Stout",
+    # Cider
+    "401172": "Cider", "401219": "Cider", "401173": "Cider", "401224": "Cider",
+    "401178": "Cider", "401223": "Cider", "401174": "Cider", "401222": "Cider",
+    "401188": "Cider", "401218": "Cider", "401176": "Cider", "401175": "Cider",
+}
+
+# Best-effort fallback for a SKU not in the map above (a future addition), so it
+# still lands in a sensible section rather than "Other" where possible.
+_CATEGORY_KEYWORDS = [
+    ("Cider",         ("cider", "magners", "blackthorn", "outcider", "gaymers", "orchard", "olde english")),
+    ("Ales & Stout",  ("stout", "guinness", "mcewan", "80/-", "70/-", "60/-", "bitter", "smooth", " ale")),
+    ("Craft",         ("ipa", "pale", "drygate", "gladeye", "innis", "i&g", "jubel", "craft")),
+    ("Premium Lager", ("heverlee", "menabrea", "bavarian", "stella", "mahou", "san miguel", "estrella", "kingfisher")),
+    ("Standard Lager", ("lager", "pilsner")),
 ]
 
 
 def _category(sku: SkuRate) -> str:
+    for code in (sku.sku_code, sku.alt_code):
+        if not code:
+            continue
+        u = str(code).strip().upper()
+        for cand in (u, u.zfill(6), u.lstrip("0")):
+            if cand in _SKU_CATEGORY:
+                return _SKU_CATEGORY[cand]
     hay = f"{sku.brand} {sku.product}".lower()
-    for label, keys in _CATEGORY_RULES:
+    for label, keys in _CATEGORY_KEYWORDS:
         if any(k in hay for k in keys):
             return label
-    return ""
+    return _OTHER
 
 
 def _sanitize_tab(name: str, used: set[str]) -> str:
@@ -156,25 +202,47 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
         cell.alignment = centre
         cell.border = border
 
-    r = header_row + 1
+    # Group price lines by section (Standard Lager, Premium Lager, …) and write
+    # each under a labelled band row with a blank spacer between, so the file
+    # reads like the team's — products separated by type.
+    lines_by_cat: dict[str, list[dict]] = {}
     for sku in master.skus:
         line = _price_line(master, site, sku)
-        values = [
-            line["category"], line["code"], line["brand"], line["abv"], line["wsp"],
-            line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
-            line["off"], line["retro"], line["note"],
-        ]
-        is_tbc = line["total"] is None
-        for c, v in enumerate(values, start=1):
-            cell = ws.cell(row=r, column=c, value=v)
-            cell.border = border
-            if c in _MONEY_COLS and isinstance(v, (int, float)):
-                cell.number_format = '"£"#,##0.00'
-            if c == 4 and isinstance(v, (int, float)):     # ABV
-                cell.number_format = '0.0"%"'
-            if is_tbc:
-                cell.fill = tbc_fill
+        lines_by_cat.setdefault(line["category"] or _OTHER, []).append(line)
+    ordered = [c for c in _CATEGORY_ORDER if c in lines_by_cat]
+    ordered += [c for c in lines_by_cat if c not in _CATEGORY_ORDER]   # trailing "Other"
+
+    section_fill = PatternFill("solid", fgColor="1F3B57")
+    section_font = Font(bold=True, size=11, color="FFFFFF")
+
+    r = header_row + 1
+    for si, cat in enumerate(ordered):
+        if si:                                    # blank spacer row between sections
+            r += 1
+        band = ws.cell(row=r, column=1, value=cat)
+        band.font = section_font
+        band.fill = section_fill
+        for c in range(2, len(HEADERS) + 1):      # colour the whole band row
+            ws.cell(row=r, column=c).fill = section_fill
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(HEADERS))
         r += 1
+        for line in lines_by_cat[cat]:
+            values = [
+                line["code"], line["brand"], line["abv"], line["wsp"],
+                line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
+                line["off"], line["retro"], line["note"],
+            ]
+            is_tbc = line["total"] is None
+            for c, v in enumerate(values, start=1):
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.border = border
+                if c in _MONEY_COLS and isinstance(v, (int, float)):
+                    cell.number_format = '"£"#,##0.00'
+                if c == _ABV_COL and isinstance(v, (int, float)):
+                    cell.number_format = '0.0"%"'
+                if is_tbc:
+                    cell.fill = tbc_fill
+            r += 1
 
     warn = ("" if master.site_prices else
             "WARNING: the per-site off-invoice layer (Site_Prices) is NOT loaded — every site is "
@@ -190,7 +258,7 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
     note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
 
-    widths = [16, 12, 24, 7, 12, 16, 14, 13, 13, 15, 14, 40]
+    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = f"A{header_row + 1}"
