@@ -83,8 +83,12 @@ Module map:
 - `master_export.py` — read-only Airtable → wide-form FB cost Excel export.
 - `setup_airtable.py` / `migrate_csv_to_airtable.py` — one-off bootstrap scripts.
 - `setup_tennents_tables.py` / `load_tennents_master.py` — one-off bootstrap:
-  create the three Tennents master tables (+ Files volume fields), then load
-  the workbook from the CLI.
+  create the Tennents master tables (four, incl. `TennentsSitePrices`; + Files
+  volume fields), then load the workbook from the CLI.
+- `tennents_price_export.py` — read-only builder for the team-facing per-site
+  Tennents price file (master workbook / single site / zip), master-driven.
+- `seed_tennents_site_prices.py` — one-off: seed the per-site off-invoice
+  `Site_Prices` layer into the master workbook from the team's price files.
 
 **Join key is `site_id`** throughout LWC (the LWC `SITE ID` column), NOT account
 number. `ACCOUNT_BRIDGE` exists but is empty/diagnostic and is NOT applied in
@@ -104,6 +108,7 @@ Tables (ids from `airtable_schema.json`):
 | TennentsSkuMaster | (airtable_schema.json) | sku_code, alt_code, brand, product, container, brl_per_unit, abv, wsp_per_brl, contract_base_per_brl, on_contract, supplier_type, hold_per_brl, correct_total_per_brl, source, notes, version, source_file |
 | TennentsSiteMaster | (airtable_schema.json) | account, site_name, operating_model, discount_construct, notes, version, source_file |
 | TennentsSiteSkuExceptions | (airtable_schema.json) | exception_key, site_name, account, sku_code (raw, may be compound "400751/400557"), product, loaded_total_per_brl, correct_total_per_brl, direction, impact_gbp, status, resolved, version, source_file |
+| TennentsSitePrices | (airtable_schema.json) | price_key (`account\|sku_code`), account, site_name, sku_code (canonical), product, off_invoice_per_brl, notes, version, source_file — per-site tenant OFF-INVOICE £/brl (FB-internal split; drives the team price file). Optional/guarded until its migration runs. |
 | TennentsAgreements | `tblxTZEY5H7WNfien` | **RETIRED 2026-07** (historical record only — the master workbook superseded the per-account Commercial Data agreements; nothing reads or writes this table) |
 
 Key facts:
@@ -159,8 +164,9 @@ Key facts:
 ### 5c. Tennents Direct monthly — `POST /upload-tennents`
 - Master: the **`FB_Taverns_Tennents_Master.xlsx` workbook is the primary
   Tennents price file** (operator direction 2026-07-14). `load_tennents_master()`
-  → `TennentsMaster` (SKU rates + sites + exceptions from the three tables).
-  The workbook's own README sheet §4 is the reconciliation spec.
+  → `TennentsMaster` (SKU rates + sites + exceptions from the master tables,
+  plus the optional per-site off-invoice `Site_Prices` layer). The workbook's
+  own README sheet §4 is the reconciliation spec.
 - Inputs: monthly Draught Pricing Report ("Data" sheet) →
   `tennents.parse_monthly` → `MonthlyReport` (Kegs>0 lines checkable;
   Kegs≤0 kept for volume only; raises on zero lines). Report discounts are
@@ -189,10 +195,20 @@ Key facts:
   `valid_from=vf`; `upsert_pricing_rules(rules, close_keys_at_date=vf)` (closes
   prior open rules for reappearing keys) + `upsert_products_with_retros`.
 - **`POST /upload-tennents-master`**: `tennents_master.parse_master_workbook`
-  → `replace_tennents_master` **WIPES the three Tennents master tables** then
-  recreates them from the workbook. The workbook is the editing surface (its
-  README §5): edit → bump version → re-upload. Exceptions can also be retired
-  by ticking `resolved` in Airtable (no re-upload needed).
+  → `replace_tennents_master` **WIPES the Tennents master tables** (four:
+  SkuMaster / SiteMaster / SiteSkuExceptions, plus the per-site off-invoice
+  `TennentsSitePrices` — only when the schema has it AND the uploaded workbook
+  carried a `Site_Prices` sheet; a workbook without that sheet PRESERVES the
+  stored off-invoice layer) then recreates them from the workbook. The workbook
+  is the editing surface (its README §5): edit → bump version → re-upload.
+  Exceptions can also be retired by ticking `resolved` in Airtable (no re-upload
+  needed).
+- **`GET /tennents/export-prices`** (+ `/tennents/prices` index): read-only —
+  generates the team-facing per-site price file live from the master (master
+  workbook = a tab per site; `?site=` = one site; `?format=zip` = all as a zip).
+  Rates/WSP from `SKU_Master`; per-site off-invoice from `TennentsSitePrices`
+  (`tennents_price_export.py`). Managed sites = all off-invoice; bespoke split
+  is not modelled (total only). NOT a master write.
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -361,8 +377,10 @@ typecast, 0.25s sleeps.
 - **WRITE-TO-MASTER (riskier) flows that MUTATE the pricing master:**
   - `POST /upload-master` — closes + replaces LWC PricingRules.
   - `POST /add-support` — creates a PricingRule from an LLM parse.
-  - `POST /upload-tennents-master` — **DELETES ALL** rows in the three
-    Tennents master tables then recreates them from the uploaded workbook.
+  - `POST /upload-tennents-master` — **DELETES ALL** rows in the Tennents
+    master tables (four incl. the per-site `TennentsSitePrices` off-invoice
+    layer; that one is wiped only when the uploaded workbook carries a
+    `Site_Prices` sheet, else preserved) then recreates them from the workbook.
   There is **no dry-run / confirmation step** beyond the form submit. Treat
   these as the high-blast-radius operations.
 - **Findings-only (safer) flows** that write only to the Mismatches table:

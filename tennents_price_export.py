@@ -1,0 +1,264 @@
+"""
+Generate the team-facing Tennents per-site price file from the master.
+
+Nick Madigan's manual task (Jul-2026) was: for each site, copy the off-invoice
+discount per brl into the "Pricer" tab, recompute the net keg price, build one
+master workbook (a tab per site) and save an individual copy into each site's
+folder. This module does all of that from the reconciliation master, so it
+stays in sync: WSP + agreed total discount come from SKU_Master (a PINC flows
+straight through) and the per-site off-invoice comes from the Site_Prices
+layer (TennentsMaster.site_prices). See [[tennents-pricing-position]].
+
+Three outputs, all built from a single TennentsMaster:
+  build_master_workbook_bytes(master)   -> one .xlsx, a tab per site
+  build_single_site_bytes(master, site) -> one .xlsx, that site only
+  build_all_sites_zip_bytes(master)     -> a .zip of the single-site files
+
+Per line the price shown is the AGREED (correct) rate from SKU_Master — NOT any
+mis-loaded exception value — because the price file tells the tenant what they
+SHOULD pay; open exceptions are surfaced in the Notes column instead.
+"""
+from __future__ import annotations
+
+import io
+import re
+import zipfile
+from datetime import date
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+from tennents_master import (
+    PINTS_PER_BRL,
+    SiteInfo,
+    SkuRate,
+    TennentsMaster,
+    keg_brl_factor,
+)
+
+# Column layout — mirrors the team's familiar "Net & Invoice" price file.
+HEADERS = [
+    "Category", "SKU Code", "Brand", "ABV %", "WSP £/Brl",
+    "FB Taverns Total Discount", "New Net Price £/Brl",
+    "Net Price £/Keg", "Net Price £/Pint",
+    "Tenant Off-Invoice £/Brl", "Iona Retro £/Brl", "Notes",
+]
+_MONEY_COLS = {5, 6, 7, 8, 9, 10, 11}   # 1-indexed columns to format as currency
+_CATEGORY_RULES = [
+    ("Standard Lager", ("tennent's lager", "tennents lager", "jeffrey", "carlsberg")),
+    ("Premium Lager",  ("heverlee", "menabrea", "bavarian", "stella", "mahou", "san miguel", "estrella")),
+    ("Craft",          ("drygate", "gladeye", "seven peaks", "disco", "innis", "i&g", "jubel", "kingfisher")),
+    ("Ales & Stout",   ("ember", "special", "light", "guinness", "mcewan", "80/-", "70/-", "60/-")),
+    ("Cider",          ("magners", "outcider", "blackthorn", "gaymers", "olde english", "orchard", "cider")),
+]
+
+
+def _category(sku: SkuRate) -> str:
+    hay = f"{sku.brand} {sku.product}".lower()
+    for label, keys in _CATEGORY_RULES:
+        if any(k in hay for k in keys):
+            return label
+    return ""
+
+
+def _sanitize_tab(name: str, used: set[str]) -> str:
+    """Excel tab name: ≤31 chars, none of []:*?/\\, unique."""
+    clean = re.sub(r"[\[\]:*?/\\]", " ", name).strip()[:31] or "Site"
+    base = clean
+    i = 2
+    while clean.upper() in used:
+        suffix = f" {i}"
+        clean = base[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(clean.upper())
+    return clean
+
+
+def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
+    """Compute the price row for (site, sku). off-invoice/retro split follows the
+    site construct: managed = all off-invoice (zero retro); bespoke flat retro =
+    fixed retro; standard = the stored per-site off-invoice. Rate is the AGREED
+    correct total from SKU_Master."""
+    total = sku.correct_total_per_brl
+    wsp = sku.wsp_per_brl
+    note_bits: list[str] = []
+
+    if total is None:
+        note_bits.append("RATE TBC — no agreed Tennents rate")
+        return {
+            "category": _category(sku), "code": sku.sku_code, "brand": sku.product or sku.brand,
+            "abv": sku.abv, "wsp": wsp, "total": None, "net_brl": None,
+            "net_keg": None, "net_pint": None, "off": None, "retro": None,
+            "note": "; ".join(note_bits),
+        }
+
+    total = float(total)
+    # off-invoice / retro split. Managed sites take the whole discount
+    # off-invoice, zero retro (README §4 — a documented rule). Every other site
+    # (incl. bespoke, whose split the master deliberately does NOT model — "flat
+    # £200/brl retro: validate the total, not the split") uses the stored
+    # per-site off-invoice, defaulting to 0 (tenant pays full WSP, all retro).
+    if site.is_managed:
+        off = total
+    else:
+        off = master.off_invoice(site.account, sku.sku_code)
+    off = min(max(off, 0.0), total)      # never negative retro / over-100% off
+    retro = total - off
+
+    bpu = keg_brl_factor(sku)
+    invoice_net_brl = (wsp - off) if wsp is not None else None
+    row = {
+        "category": _category(sku), "code": sku.sku_code, "brand": sku.product or sku.brand,
+        "abv": sku.abv, "wsp": wsp, "total": total,
+        "net_brl": (wsp - total) if wsp is not None else None,
+        "net_keg": (invoice_net_brl * bpu) if invoice_net_brl is not None else None,
+        "net_pint": (invoice_net_brl / PINTS_PER_BRL) if invoice_net_brl is not None else None,
+        "off": off, "retro": retro,
+        "note": "",
+    }
+
+    ex = master._exception_index.get((site.account, sku.sku_code.strip().upper()))
+    if ex is None and sku.alt_code:
+        ex = master._exception_index.get((site.account, sku.alt_code.strip().upper()))
+    if ex is not None and ex.loaded_total_per_brl is not None:
+        note_bits.append(f"Correction pending — currently loaded £{ex.loaded_total_per_brl:,.2f}/brl")
+    if site.is_managed:
+        note_bits.append("Managed: full discount off-invoice")
+    elif site.is_bespoke:
+        note_bits.append("Bespoke construct — retro per agreement; total validated")
+    row["note"] = "; ".join(note_bits)
+    return row
+
+
+def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -> None:
+    bold = Font(bold=True)
+    title_font = Font(bold=True, size=13, color="1F3B57")
+    sub_font = Font(size=9, color="555555")
+    header_fill = PatternFill("solid", fgColor="DDE6F2")
+    tbc_fill = PatternFill("solid", fgColor="FBE9D6")
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    centre = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws["A1"] = "FB Taverns — Tennents Scotland Price File"
+    ws["A1"].font = title_font
+    ws["A2"] = f"Site: {site.site_name}    |    Tennents account: {site.account}    |    Prices effective: {as_of.isoformat()}"
+    ws["A2"].font = sub_font
+    ws["A3"] = f"Operating model: {site.operating_model or '—'}    |    Discount construct: {site.discount_construct or '—'}"
+    ws["A3"].font = sub_font
+
+    header_row = 5
+    for c, label in enumerate(HEADERS, start=1):
+        cell = ws.cell(row=header_row, column=c, value=label)
+        cell.font = bold
+        cell.fill = header_fill
+        cell.alignment = centre
+        cell.border = border
+
+    r = header_row + 1
+    for sku in master.skus:
+        line = _price_line(master, site, sku)
+        values = [
+            line["category"], line["code"], line["brand"], line["abv"], line["wsp"],
+            line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
+            line["off"], line["retro"], line["note"],
+        ]
+        is_tbc = line["total"] is None
+        for c, v in enumerate(values, start=1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = border
+            if c in _MONEY_COLS and isinstance(v, (int, float)):
+                cell.number_format = '"£"#,##0.00'
+            if c == 4 and isinstance(v, (int, float)):     # ABV
+                cell.number_format = '0.0"%"'
+            if is_tbc:
+                cell.fill = tbc_fill
+        r += 1
+
+    warn = ("" if master.site_prices else
+            "WARNING: the per-site off-invoice layer (Site_Prices) is NOT loaded — every site is "
+            "shown at FULL WSP with no off-invoice applied. Seed/upload Site_Prices before using "
+            "these figures. ")
+    note = ws.cell(
+        row=r + 1, column=1,
+        value=(warn + f"Generated {as_of.isoformat()} from the Tennents master "
+               f"({master.version or 'version n/a'}). WSP & agreed total discount from SKU_Master; "
+               f"per-site off-invoice split from Site_Prices. Net £/Keg is on the invoice basis "
+               f"(WSP − off-invoice); New Net £/Brl is after the Iona retro. RATE TBC = no agreed "
+               f"Tennents rate yet — not priced."))
+    note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
+    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
+
+    widths = [16, 12, 24, 7, 12, 16, 14, 13, 13, 15, 14, 40]
+    for c, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
+def _sites_in_scope(master: TennentsMaster) -> list[SiteInfo]:
+    """Estate sites with a real account, alphabetical."""
+    seen: set[str] = set()
+    out: list[SiteInfo] = []
+    for s in master.sites:
+        if not s.account or s.account.upper() == "TBC" or s.account in seen:
+            continue
+        seen.add(s.account)
+        out.append(s)
+    return sorted(out, key=lambda s: s.site_name.upper())
+
+
+def list_site_choices(master: TennentsMaster) -> list[tuple[str, str]]:
+    """(account, site_name) for the per-site download picker."""
+    return [(s.account, s.site_name) for s in _sites_in_scope(master)]
+
+
+def find_site(master: TennentsMaster, account_or_name: str) -> SiteInfo | None:
+    key = str(account_or_name).strip().upper()
+    for s in _sites_in_scope(master):
+        if s.account.upper() == key or s.site_name.strip().upper() == key:
+            return s
+    return None
+
+
+def build_master_workbook_bytes(master: TennentsMaster, as_of: date | None = None) -> bytes:
+    """One workbook, a tab per site (the 'master which has everything')."""
+    as_of = as_of or date.today()
+    wb = Workbook()
+    wb.remove(wb.active)
+    used: set[str] = set()
+    for site in _sites_in_scope(master):
+        ws = wb.create_sheet(_sanitize_tab(site.site_name, used))
+        _write_site_sheet(ws, master, site, as_of)
+    if not wb.sheetnames:                          # never leave an empty workbook
+        wb.create_sheet("No sites")
+    return _to_bytes(wb)
+
+
+def build_single_site_bytes(master: TennentsMaster, site: SiteInfo, as_of: date | None = None) -> bytes:
+    """One workbook, one site — the individual copy for a site folder."""
+    as_of = as_of or date.today()
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet(_sanitize_tab(site.site_name, set()))
+    _write_site_sheet(ws, master, site, as_of)
+    return _to_bytes(wb)
+
+
+def build_all_sites_zip_bytes(master: TennentsMaster, as_of: date | None = None) -> bytes:
+    """A .zip of one single-site workbook per site, named for the site — ready
+    to drop into each site's 'Price Lists and Bar Plans' folder."""
+    as_of = as_of or date.today()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for site in _sites_in_scope(master):
+            safe = re.sub(r'[\\/:*?"<>|]', " ", site.site_name).strip()
+            fname = f"{safe} - Tennents Price File {as_of.isoformat()}.xlsx"
+            zf.writestr(fname, build_single_site_bytes(master, site, as_of))
+    return buf.getvalue()
+
+
+def _to_bytes(wb: Workbook) -> bytes:
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

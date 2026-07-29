@@ -104,6 +104,24 @@ def exceptions_spec():
     }
 
 
+def site_prices_spec():
+    return {
+        "name": "TennentsSitePrices",
+        "description": "Per-(site, SKU) tenant OFF-INVOICE discount £/brl (the discount passed to the tenant on the invoice; the rest is monthly retro). Drives the team price file. Rates/WSP still come from SKU_Master; this is only the split. Replaced wholesale on each master upload.",
+        "fields": [
+            f_text("price_key"),                       # "account|sku_code"
+            f_text("account"),
+            f_text("site_name"),
+            f_text("sku_code"),                        # canonical SKU code
+            f_text("product"),
+            f_currency("off_invoice_per_brl"),
+            f_long("notes"),
+            f_text("version"),
+            f_text("source_file"),
+        ],
+    }
+
+
 def files_extra_fields_spec():
     return {
         "name": "Files",
@@ -121,6 +139,7 @@ def main() -> int:
     sku_t = upsert_table(sku_master_spec(), tables)
     site_t = upsert_table(site_master_spec(), tables)
     exc_t = upsert_table(exceptions_spec(), tables)
+    price_t = upsert_table(site_prices_spec(), tables)
 
     files_t = find_table("Files", tables)
     if files_t is None:
@@ -132,6 +151,7 @@ def main() -> int:
     schema["tables"]["TennentsSkuMaster"] = sku_t["id"]
     schema["tables"]["TennentsSiteMaster"] = site_t["id"]
     schema["tables"]["TennentsSiteSkuExceptions"] = exc_t["id"]
+    schema["tables"]["TennentsSitePrices"] = price_t["id"]
     SCHEMA_OUT.write_text(json.dumps(schema, indent=2))
     print(f"\nMerged table ids into {SCHEMA_OUT}")
     print("Next: python load_tennents_master.py <FB_Taverns_Tennents_Master.xlsx>")

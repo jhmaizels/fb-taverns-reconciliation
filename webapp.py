@@ -15,13 +15,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from html import escape
 from pathlib import Path
 
 from datetime import date, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -2732,6 +2733,19 @@ retro due exact; managed sites all off-invoice).</p>
   re-upload; the stored master is replaced wholesale (its README §5).</p>
   <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}" style="margin-top:0">Browse current master</a></p>
 </div>
+
+<h2>Team price file <span class="pill">per site</span></h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0">Site price files generated live from the master — WSP &amp; agreed total discount from
+  <code>SKU_Master</code>, per-site off-invoice from <code>Site_Prices</code>. Always in sync: change the master
+  and these change with it. <code>RATE TBC</code> = no agreed Tennents rate yet.</p>
+  <p style="margin-bottom:0">
+    <a class="button" href="{ext_url('/tennents/export-prices')}" style="margin-top:0">Download master (all sites)</a>
+    <a class="button" href="{ext_url('/tennents/export-prices?format=zip')}" style="margin-top:0">Download all as .zip</a>
+    <a class="button" href="{ext_url('/tennents/prices')}" style="margin-top:0; background:#555">Individual site files &rarr;</a>
+  </p>
+</div>
+
 <form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
   <h3 style="margin-top:0; color: #2c5aa0">Upload master workbook</h3>
   <p class="sub">Replaces the stored SKU rates, sites and exceptions. Requires the admin role.</p>
@@ -2816,6 +2830,114 @@ until Tennents' fix lands (README §4). Resolved rows are greyed.</p>
 <th>Direction</th><th class="r">£ impact</th><th>State</th><th>Status</th></tr></thead>
 <tbody>{exc_rows}</tbody></table>
 {PAGE_FOOT}"""
+
+
+def _attachment_disposition(filename: str) -> str:
+    """RFC 5987 Content-Disposition with an ASCII fallback + a UTF-8 filename*,
+    so a site name carrying a smart apostrophe / en-dash (common from Excel)
+    can't raise a latin-1 UnicodeEncodeError building the header → bare 500."""
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii").strip() or "download.xlsx"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+@app.get("/tennents/prices", response_class=HTMLResponse)
+def tennents_prices_index(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    """Index of per-site price-file downloads — one row per site, for saving
+    an individual copy into each site's folder."""
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    from tennents_price_export import list_site_choices
+    choices = list_site_choices(master)
+    layer_warning = "" if master.site_prices else (
+        '<div class="result" style="max-width:none; border-left:4px solid #b00020; background:#fdecea">'
+        '<strong>Per-site off-invoice layer not loaded.</strong> These files currently show every site at '
+        '<strong>full WSP</strong> (no off-invoice applied). Seed/upload the <code>Site_Prices</code> layer '
+        'to apply tenant off-invoices.</div>'
+    )
+    rows = "".join(
+        f"<tr><td>{escape(name)}</td><td>{escape(acct)}</td>"
+        f'<td><a class="button" style="margin:0" '
+        f'href="{ext_url("/tennents/export-prices?site=" + quote(acct))}">Download</a></td></tr>'
+        for acct, name in choices
+    )
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
+<h1>Tennents site price files <span class="estate-tag">per site</span></h1>
+<p class="sub">One price file per site, built live from the master. Download and drop into the site's
+&ldquo;Price Lists and Bar Plans&rdquo; folder — or grab them all at once as a
+<a href="{ext_url('/tennents/export-prices?format=zip')}">.zip</a>, or the
+<a href="{ext_url('/tennents/export-prices')}">single master workbook</a> (a tab per site).</p>
+{_tennents_master_banner_html()}
+{layer_warning}
+<table><thead><tr><th>Site</th><th>Tennents account</th><th>Price file</th></tr></thead>
+<tbody>{rows}</tbody></table>
+{PAGE_FOOT}"""
+
+
+@app.get("/tennents/export-prices")
+def tennents_export_prices(
+    site: str | None = None,
+    format: str | None = None,
+    principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
+):
+    """Team-facing Tennents price file, built live from the master so it's
+    always in sync. No query -> master workbook (a tab per site);
+    ?site=<account|name> -> that site only; ?format=zip -> a .zip of every
+    single-site file. Mirrors the LWC /export-master download pattern."""
+    from tennents_price_export import (  # lazy: keep openpyxl off the boot path
+        build_all_sites_zip_bytes,
+        build_master_workbook_bytes,
+        build_single_site_bytes,
+        find_site,
+    )
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+
+    today = date.today().isoformat()
+    xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    # Resolve a single-site target before the build, so a bad ?site= gets its
+    # own message rather than the generic build error.
+    target = None
+    if site and format != "zip":
+        target = find_site(master, site)
+        if target is None:
+            return _error_page(f"No Tennents site matches {escape(site)!r}.")
+
+    try:  # wrap the build like /export-master, so an openpyxl failure renders
+          # the friendly page rather than a bare 500.
+        if format == "zip":
+            return Response(
+                content=build_all_sites_zip_bytes(master),
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="FB_Taverns_Tennents_Price_Files_{today}.zip"'},
+            )
+        if target is not None:
+            safe = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', " ", target.site_name).strip() or "Site"
+            fname = f"{safe} - Tennents Price File {today}.xlsx"
+            return Response(
+                content=build_single_site_bytes(master, target),
+                media_type=xlsx,
+                headers={"Content-Disposition": _attachment_disposition(fname)},
+            )
+        return Response(
+            content=build_master_workbook_bytes(master),
+            media_type=xlsx,
+            headers={"Content-Disposition": f'attachment; filename="FB_Taverns_Tennents_Master_Price_File_{today}.xlsx"'},
+        )
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Something went wrong processing this request — the details have been logged.")
 
 
 @app.post("/upload-tennents-master", response_class=HTMLResponse)

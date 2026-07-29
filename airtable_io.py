@@ -1288,9 +1288,10 @@ def _rule_lookup() -> dict[str, str]:
 # ---------- Tennents Direct I/O ----------
 #
 # The master is the FB_Taverns_Tennents_Master.xlsx workbook, mirrored into
-# three tables (TennentsSkuMaster / TennentsSiteMaster /
-# TennentsSiteSkuExceptions) and replaced wholesale on each upload — the
-# workbook is the editing surface (its README §5). The old per-account
+# four tables (TennentsSkuMaster / TennentsSiteMaster /
+# TennentsSiteSkuExceptions, plus the per-site off-invoice TennentsSitePrices —
+# the last guarded/optional until its migration runs) and replaced wholesale on
+# each upload — the workbook is the editing surface (its README §5). The old per-account
 # TennentsAgreements table is retired: kept in the base as a historical
 # record, no longer read or written.
 
@@ -1319,7 +1320,7 @@ def _opt(fields: dict, name: str, value) -> None:
 
 def load_tennents_master():
     """Load the Tennents master workbook mirror as a TennentsMaster."""
-    from tennents_master import SkuException, SiteInfo, SkuRate, TennentsMaster
+    from tennents_master import SkuException, SiteInfo, SitePrice, SkuRate, TennentsMaster
 
     versions: Counter[str] = Counter()
     skus: list[SkuRate] = []
@@ -1378,17 +1379,40 @@ def load_tennents_master():
         if (f := rec["fields"]).get("sku_code")
     ]
 
+    # Per-site tenant off-invoice layer (optional table — absent until the
+    # Site_Prices migration runs; the app still loads without it).
+    site_prices = []
+    if "TennentsSitePrices" in T:
+        site_prices = [
+            SitePrice(
+                account=str(f.get("account", "") or "").strip(),
+                site_name=f.get("site_name", "") or "",
+                sku_code=str(f.get("sku_code", "")).strip(),
+                product=f.get("product", "") or "",
+                off_invoice_per_brl=float(f.get("off_invoice_per_brl") or 0.0),
+                notes=f.get("notes", "") or "",
+            )
+            for rec in _list_all(T["TennentsSitePrices"])
+            if (f := rec["fields"]).get("sku_code")
+        ]
+
     version = versions.most_common(1)[0][0] if versions else ""
     return TennentsMaster(
         version=version, source="airtable",
         skus=skus, sites=sites, exceptions=exceptions,
+        site_prices=site_prices,
+        site_prices_present="TennentsSitePrices" in T,
     )
 
 
 def replace_tennents_master(master, source: str) -> tuple[int, int]:
     """
-    Wipe the three Tennents master tables and recreate them from a parsed
-    TennentsMaster. Returns (deleted, created) across all three.
+    Wipe the Tennents master tables and recreate them from a parsed
+    TennentsMaster. Covers four tables — TennentsSkuMaster / TennentsSiteMaster /
+    TennentsSiteSkuExceptions, plus TennentsSitePrices (the per-site off-invoice
+    layer), which is touched ONLY when the schema has it AND the parsed workbook
+    carried a Site_Prices sheet (else the stored layer is preserved). Returns
+    (deleted, created) across all tables written.
     """
     deleted = 0
     created = 0
@@ -1453,6 +1477,28 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
         _opt(fields, "status", ex.status)
         payload.append({"fields": fields})
     created += len(_batch(payload, "create", T["TennentsSiteSkuExceptions"])) if payload else 0
+
+    # Per-site tenant off-invoice layer. Guarded twice: the table may not exist
+    # yet (pre-migration), AND we only touch it when the uploaded workbook
+    # actually carried a Site_Prices sheet — re-uploading an OLDER workbook
+    # without that sheet must PRESERVE the seeded layer, not silently wipe it.
+    if "TennentsSitePrices" in T and getattr(master, "site_prices_present", False):
+        deleted += _wipe_table(T["TennentsSitePrices"], "price_key")
+        payload = []
+        for sp in master.site_prices:
+            fields = {
+                "price_key": f"{sp.account}|{sp.sku_code}",
+                "account": sp.account,
+                "site_name": sp.site_name,
+                "sku_code": sp.sku_code,
+                "off_invoice_per_brl": float(sp.off_invoice_per_brl or 0.0),
+                "version": master.version,
+                "source_file": source,
+            }
+            _opt(fields, "product", sp.product)
+            _opt(fields, "notes", sp.notes)
+            payload.append({"fields": fields})
+        created += len(_batch(payload, "create", T["TennentsSitePrices"])) if payload else 0
 
     return deleted, created
 

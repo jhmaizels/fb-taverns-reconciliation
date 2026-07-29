@@ -33,11 +33,21 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 REQUIRED_SHEETS = ("SKU_Master", "Site_Master", "Site_SKU_Exceptions")
+# Site_Prices is OPTIONAL — the per-site tenant off-invoice layer that drives
+# the team price file. Absent in the original v1.0 workbook; added by the
+# seed. Parsing tolerates its absence so old workbooks still load.
+SITE_PRICES_SHEET = "Site_Prices"
 
 # SKU_Master internal consistency: base + hold should equal the CURRENT CORRECT
 # total. £0.05 — tighter picks up spreadsheet float artefacts (same threshold
 # as the old per-agreement master arithmetic check).
 MASTER_ARITH_TOLERANCE = 0.05
+
+# A brewers' barrel = 36 imperial gallons = 288 pints (36 × 8). Used to turn a
+# £/brl figure into per-keg / per-pint prices for the team price file.
+PINTS_PER_BRL = 288.0
+LITRES_PER_BRL = 163.659            # 36 imp gal × 4.54609 L/gal
+_LITRES_PER_GALLON = 4.54609
 
 
 # ---------- row shapes ----------
@@ -118,6 +128,26 @@ class SkuException:
 
 
 @dataclass
+class SitePrice:
+    """Per-(site, SKU) tenant OFF-INVOICE discount £/brl — FB's internal
+    decision on how much of the agreed total discount is passed to the tenant
+    on the invoice (the remainder is claimed back as the monthly Iona retro).
+
+    Independent of the Tennents rate: the agreed WSP + total discount always
+    come from SKU_Master, so a PINC flows straight through. This layer only
+    carries the split. 0.0 (or a missing row) = tenant pays full WSP on invoice
+    and the whole discount is retro. Managed sites store off = total (all
+    off-invoice, zero retro). Sourced from each site's "Net & Invoice Pricing".
+    """
+    account: str
+    site_name: str
+    sku_code: str                         # canonical SKU code
+    product: str = ""
+    off_invoice_per_brl: float = 0.0
+    notes: str = ""
+
+
+@dataclass
 class RateBasis:
     """Outcome of an expected-rate lookup for one (account, sku) pair."""
     basis: str                            # 'sku_master' | 'exception' | 'no_rate' | 'unknown_sku'
@@ -133,10 +163,18 @@ class TennentsMaster:
     skus: list[SkuRate]
     sites: list[SiteInfo]
     exceptions: list[SkuException]
+    site_prices: list[SitePrice] = field(default_factory=list)
+    # True only when a Site_Prices sheet was actually present in the parsed
+    # workbook. Lets replace_tennents_master preserve the stored off-invoice
+    # layer when an OLDER workbook (no Site_Prices sheet) is re-uploaded, rather
+    # than silently wiping it. site_prices=[] with this True means "explicitly
+    # empty" (wipe); this False means "not provided" (leave the table alone).
+    site_prices_present: bool = False
 
     _sku_index: dict[str, SkuRate] = field(default_factory=dict, repr=False)
     _site_by_account: dict[str, SiteInfo] = field(default_factory=dict, repr=False)
     _exception_index: dict[tuple[str, str], SkuException] = field(default_factory=dict, repr=False)
+    _site_price_index: dict[tuple[str, str], SitePrice] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         self.reindex()
@@ -170,12 +208,38 @@ class TennentsMaster:
             for code in ex.sku_codes:
                 self._exception_index[(ex.account, str(code).strip().upper())] = ex
 
+        # Site prices keyed (account, CANONICAL sku upper) — the file lists one
+        # row per product, so alt/compound codes are canonicalised on the way in.
+        self._site_price_index = {}
+        for sp in self.site_prices:
+            if not sp.account:
+                site = site_by_name.get(sp.site_name.strip().upper())
+                if site:
+                    sp.account = site.account
+            if sp.account:
+                key = (sp.account, self.canonical_sku(sp.sku_code).strip().upper())
+                self._site_price_index[key] = sp
+
+    def off_invoice(self, account: str, sku_code: str) -> float:
+        """Tenant off-invoice discount £/brl for (account, sku). 0.0 when none
+        is stored — tenant pays full WSP on invoice, the whole discount is retro."""
+        sp = self._site_price_index.get(
+            (str(account).strip(), self.canonical_sku(sku_code).strip().upper()))
+        return float(sp.off_invoice_per_brl or 0.0) if sp else 0.0
+
     def canonical_sku(self, code: str) -> str:
-        sku = self._sku_index.get(str(code).strip().upper())
+        sku = self.find_sku(code)
         return sku.sku_code if sku else str(code).strip().upper()
 
     def find_sku(self, code: str) -> SkuRate | None:
-        return self._sku_index.get(str(code).strip().upper())
+        c = str(code).strip().upper()
+        sku = self._sku_index.get(c)
+        if sku is None and c.isdigit():
+            # Tolerate leading-zero drift: Excel/pandas read "090425" as 90425,
+            # so a code and its zero-stripped form must resolve to the same SKU
+            # (the Site_Prices ↔ SKU_Master join depends on it).
+            sku = self._sku_index.get(c.zfill(6)) or self._sku_index.get(c.lstrip("0"))
+        return sku
 
     def site_for_account(self, account: str) -> SiteInfo | None:
         return self._site_by_account.get(str(account).strip())
@@ -201,6 +265,24 @@ class TennentsMaster:
             if abs(float(s.correct_total_per_brl) - s.implied_total) > MASTER_ARITH_TOLERANCE:
                 out.append(s)
         return out
+
+
+# ---------- price maths ----------
+
+def keg_brl_factor(sku: SkuRate) -> float:
+    """Barrels per keg for a SKU. Uses the master's brl_per_unit when set;
+    otherwise, for a multi-container SKU, picks the container CLOSEST to the
+    standard 50L keg — the one the price file quotes (e.g. '30L / 50L' Disco is
+    quoted on 50L, '11G / 22G' Lager on the 11G ≈ 50L keg). Falls back to a 50L
+    keg for a bare 'keg' with no stated size."""
+    if sku.brl_per_unit:
+        return float(sku.brl_per_unit)
+    litres_opts = [
+        float(val) if unit == "L" else float(val) * _LITRES_PER_GALLON
+        for val, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(L|G)\b", (sku.container or "").upper())
+    ]
+    litres = min(litres_opts, key=lambda l: abs(l - 50.0)) if litres_opts else 50.0
+    return litres / LITRES_PER_BRL
 
 
 # ---------- parsing helpers ----------
@@ -385,10 +467,41 @@ def parse_master_workbook(path: str, source_name: str = "") -> TennentsMaster:
             status=_text(row[c_status]) if c_status else "",
         ))
 
+    # --- Site_Prices (OPTIONAL — the per-site tenant off-invoice layer) ---
+    site_prices: list[SitePrice] = []
+    site_prices_present = SITE_PRICES_SHEET in book
+    if SITE_PRICES_SHEET in book:
+        df = book[SITE_PRICES_SHEET]
+        df.columns = [str(c).strip() for c in df.columns]
+        c_site = _find_col(df, "Site")
+        c_acct = _find_col(df, "Tennents Account", "Account")
+        c_sku = _find_col(df, "SKU")
+        c_prod = _find_col(df, "Product")
+        c_off = _find_col(df, "Off-Invoice", "Off Invoice", "Tenant Off")
+        c_note = _find_col(df, "Notes")
+        _require_cols(df, SITE_PRICES_SHEET, {
+            "Site": c_site, "SKU": c_sku, "Off-Invoice Discount": c_off,
+        })
+        for _, row in df.iterrows():
+            site_name = _text(row[c_site])
+            sku = _text(row[c_sku])
+            if not site_name or not sku:
+                continue
+            site_prices.append(SitePrice(
+                account=_account_str(row[c_acct]) if c_acct else "",
+                site_name=site_name,
+                sku_code=sku,
+                product=_text(row[c_prod]) if c_prod else "",
+                off_invoice_per_brl=_num(row[c_off]) or 0.0,
+                notes=_text(row[c_note]) if c_note else "",
+            ))
+
     return TennentsMaster(
         version=version,
         source=source_name,
         skus=skus,
         sites=sites,
         exceptions=exceptions,
+        site_prices=site_prices,
+        site_prices_present=site_prices_present,
     )
