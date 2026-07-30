@@ -118,12 +118,12 @@ def run():
     _check("open exception surfaces as a note", "Correction pending" in lj["note"], lj["note"])
     _check("priced rate is AGREED not loaded", _near(lj["total"], 302.97))
 
-    # ---- in-range = a Site_Prices row exists (site's range), independent of the
-    # £0 default: 400889 is stored at £0 off but IS in range; 401211 has no row ----
-    _check("in range: stored SKU (090425)", m.has_site_price("11110001", "090425") is True)
-    _check("in range: £0-off SKU still in range (400889)", m.has_site_price("11110001", "400889") is True)
-    _check("in range: via alt code (GUI002 stored as GUI003)", m.has_site_price("11110001", "GUI002") is True)
-    _check("not in range: unpriced SKU (401211)", m.has_site_price("11110001", "401211") is False)
+    # ---- "sold" = a live off-invoice DEAL (off > £0), NOT mere row-presence:
+    # 090425 has a £105 off (sold); 400889 has a row but £0 off (no deal) ----
+    _check("has_deal True for off>0 (090425)", line(m, "STANDARD ARMS", "090425")["has_deal"] is True)
+    _check("has_deal False for £0-off row (400889)", line(m, "STANDARD ARMS", "400889")["has_deal"] is False)
+    _check("has_deal True via alt code (GUI002)", line(m, "STANDARD ARMS", "GUI002")["has_deal"] is True)
+    _check("has_deal False for unpriced SKU (401211)", line(m, "STANDARD ARMS", "401211")["has_deal"] is False)
 
     # ---- managed site: all off-invoice, zero retro ----
     lm = line(m, "MANAGED HOUSE", "GUI002")
@@ -159,79 +159,91 @@ def run():
     _check("master workbook: a tab per site", len(wb.sheetnames) == 3, str(wb.sheetnames))
     _check("master workbook: tab named for site", "STANDARD ARMS" in wb.sheetnames)
 
-    # grouping: products separated into labelled sections, in canonical order,
-    # and the per-row Category column is gone (SKU Code is now first).
+    # Two purpose-built sections: "Currently sold" (products with an off-invoice
+    # deal) then "Substitution pricing" (the rest), each grouped by beer type.
     ws = wb["STANDARD ARMS"]
-    _check("header drops Category col (SKU Code first)",
-           ws.cell(row=5, column=1).value == "SKU Code", str(ws.cell(row=5, column=1).value))
-    colA = [ws.cell(row=rr, column=1).value for rr in range(6, ws.max_row + 1)]
-    bands = [v for v in colA if v in set(tpe._CATEGORY_ORDER) | {tpe._OTHER}]
-    _check("sections grouped in canonical order",
-           bands == ["Standard Lager", "Premium Lager", "Ales & Stout"], str(bands))
+    colA = [str(ws.cell(row=rr, column=1).value or "") for rr in range(1, ws.max_row + 1)]
+    sold_title = next((i for i, v in enumerate(colA) if v.startswith("Currently sold")), None)
+    sub_title = next((i for i, v in enumerate(colA) if v.startswith("Substitution pricing")), None)
+    _check("two sections, sold before substitution",
+           sold_title is not None and sub_title is not None and sold_title < sub_title,
+           f"sold@{sold_title} sub@{sub_title}")
 
-    # ---- live formulas: editing Tenant Off-Invoice (I) recalculates Net Keg (G),
-    # Net Pint (H) and the FB retro (J) in-sheet; New Net/Brl (F) tracks WSP/Total;
-    # the retro column is now labelled "FB Retro" (Nick Madigan, Jul-2026). ----
-    _check("retro column renamed to FB Retro",
-           ws.cell(row=5, column=10).value == "FB Retro £/Brl", str(ws.cell(row=5, column=10).value))
+    hdr_rows = [rr for rr in range(1, ws.max_row + 1) if ws.cell(row=rr, column=1).value == "SKU Code"]
+    _check("two section header rows", len(hdr_rows) == 2, str(hdr_rows))
+    sold_h, sub_h = (hdr_rows + [None, None])[:2]
 
     def _row_for(code):
-        for rr in range(6, ws.max_row + 1):
+        for rr in range(1, ws.max_row + 1):
             if ws.cell(row=rr, column=1).value == code:
                 return rr
         return None
 
-    rlag = _row_for("090425")                      # a priced row (off-invoice 105.02)
-    _check("priced row located", rlag is not None, str(rlag))
-    if rlag:
-        g = ws.cell(row=rlag, column=7).value      # Net £/Keg
-        h = ws.cell(row=rlag, column=8).value      # Net £/Pint
-        jr = ws.cell(row=rlag, column=10).value    # FB Retro
-        fb = ws.cell(row=rlag, column=6).value     # New Net £/Brl
-        off = ws.cell(row=rlag, column=9).value    # Tenant Off-Invoice (input)
-        _check("G Net/Keg is a live formula of D & I",
-               isinstance(g, str) and g.startswith(f"=(D{rlag}-I{rlag})*"), str(g))
-        _check("H Net/Pint is a live formula of D & I",
-               isinstance(h, str) and h.startswith(f"=(D{rlag}-I{rlag})/"), str(h))
-        _check("J FB retro = total - off (E-I)", jr == f"=E{rlag}-I{rlag}", str(jr))
-        _check("F Net/Brl = WSP - total (D-E)", fb == f"=D{rlag}-E{rlag}", str(fb))
-        _check("I off-invoice stays a numeric input", isinstance(off, (int, float)), str(off))
-        _check("in-range marker ticked on a ranged product (090425)",
-               ws.cell(row=rlag, column=11).value == "✓", str(ws.cell(row=rlag, column=11).value))
-        # substitution guidance block (cols 12-15): FB cost/keg + tenant £/keg per RPB
-        cost = ws.cell(row=rlag, column=12).value
-        glo = ws.cell(row=rlag, column=13).value
-        ghi = ws.cell(row=rlag, column=15).value
-        _check("FB net cost/keg = (D-E)*bpu formula",
-               isinstance(cost, str) and cost.startswith(f"=(D{rlag}-E{rlag})*"), str(cost))
-        _check("guide @£150 = (D-E+150)*bpu formula",
-               isinstance(glo, str) and glo.startswith(f"=(D{rlag}-E{rlag}+150)*"), str(glo))
-        _check("guide @£250 = (D-E+250)*bpu (shown as-is, even above WSP)",
-               isinstance(ghi, str) and ghi.startswith(f"=(D{rlag}-E{rlag}+250)*"), str(ghi))
+    r_sold = _row_for("090425")   # £105 off -> a deal -> Currently sold
+    r_sub = _row_for("400889")    # £0 off -> no deal -> Substitution candidate
+    if sold_h and sub_h and r_sold and r_sub:
+        _check("off>0 product in Currently-sold", sold_h < r_sold < sub_h, f"{sold_h}<{r_sold}<{sub_h}")
+        _check("£0-off product in Substitution", r_sub > sub_h, f"{r_sub}>{sub_h}")
 
-    r0 = _row_for("400889")   # stored at £0 off-invoice, but IS in range -> ticked
-    if r0:
-        _check("in-range: £0-off product still ticked (400889)",
-               ws.cell(row=r0, column=11).value == "✓", str(ws.cell(row=r0, column=11).value))
+        # SOLD columns: Off-Invoice=F(6) input; Net Keg=G(7)=(D-F)*bpu; FB Retro=I(9)=E-F
+        _check("sold header: Off-Invoice at F", ws.cell(row=sold_h, column=6).value == "Tenant Off-Invoice £/Brl")
+        _check("sold header: FB Retro at I", ws.cell(row=sold_h, column=9).value == "FB Retro £/Brl")
+        _check("sold: off-invoice is a numeric input", isinstance(ws.cell(row=r_sold, column=6).value, (int, float)))
+        _check("sold: Net Keg = (D-F)*bpu live",
+               str(ws.cell(row=r_sold, column=7).value).startswith(f"=(D{r_sold}-F{r_sold})*"),
+               str(ws.cell(row=r_sold, column=7).value))
+        _check("sold: FB Retro = E-F live", ws.cell(row=r_sold, column=9).value == f"=E{r_sold}-F{r_sold}",
+               str(ws.cell(row=r_sold, column=9).value))
 
-    _check("In Range header at col 11", ws.cell(row=5, column=11).value == "In Range",
-           str(ws.cell(row=5, column=11).value))
-    ghdr = [ws.cell(row=5, column=c).value for c in range(12, 17)]
-    _check("guidance headers present + Notes shifted to col 16",
-           ghdr == ["FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
-                    "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB", "Notes"], str(ghdr))
+        # SUBSTITUTION columns: FB cost=F(6); per RPB an off-invoice AND a net keg
+        _check("sub header: FB Net Cost at F", ws.cell(row=sub_h, column=6).value == "FB Net Cost £/Keg")
+        _check("sub header: Off-Inv @£150 at G", ws.cell(row=sub_h, column=7).value == "Off-Inv £/Brl @£150")
+        _check("sub header: Net @£150 at H", ws.cell(row=sub_h, column=8).value == "Net £/Keg @£150")
+        _check("sub: FB net cost = (D-E)*bpu",
+               str(ws.cell(row=r_sub, column=6).value).startswith(f"=(D{r_sub}-E{r_sub})*"),
+               str(ws.cell(row=r_sub, column=6).value))
+        _check("sub: off-invoice @£150 = Total - 150", ws.cell(row=r_sub, column=7).value == f"=E{r_sub}-150",
+               str(ws.cell(row=r_sub, column=7).value))
+        _check("sub: net @£150 = (D-E+150)*bpu",
+               str(ws.cell(row=r_sub, column=8).value).startswith(f"=(D{r_sub}-E{r_sub}+150)*"),
+               str(ws.cell(row=r_sub, column=8).value))
 
-    rtbc = _row_for("401211")                      # RATE TBC row -> no formula, stays blank
-    _check("TBC row located", rtbc is not None, str(rtbc))
+        _check("Notes at col 13 in both sections",
+               ws.cell(row=sold_h, column=13).value == "Notes" and ws.cell(row=sub_h, column=13).value == "Notes")
+
+        # beer-type grouping kept within each section
+        def _band_above(rr):
+            cats = set(tpe._CATEGORY_ORDER) | {tpe._OTHER}
+            for k in range(rr - 1, 0, -1):
+                v = ws.cell(row=k, column=1).value
+                if v in cats:
+                    return v
+                if v == "SKU Code":
+                    return None
+            return None
+        _check("sold product grouped by beer type", _band_above(r_sold) == "Standard Lager", str(_band_above(r_sold)))
+        _check("sub product grouped by beer type", _band_above(r_sub) == "Standard Lager", str(_band_above(r_sub)))
+
+    # TBC product (401211) has no deal -> substitution section, unpriced -> blank
+    rtbc = _row_for("401211")
+    _check("TBC product in substitution section", rtbc is not None and sub_h and rtbc > sub_h, str(rtbc))
     if rtbc:
-        _check("TBC row: Net/Keg blank (no formula)",
-               ws.cell(row=rtbc, column=7).value in (None, ""), str(ws.cell(row=rtbc, column=7).value))
-        _check("TBC row: FB retro blank (no formula)",
-               ws.cell(row=rtbc, column=10).value in (None, ""), str(ws.cell(row=rtbc, column=10).value))
-        _check("TBC row: guidance block blank",
-               all(ws.cell(row=rtbc, column=c).value in (None, "") for c in range(12, 16)), "not blank")
-        _check("not-in-range product unticked (401211)",
-               ws.cell(row=rtbc, column=11).value in (None, ""), str(ws.cell(row=rtbc, column=11).value))
+        _check("TBC row: FB cost blank", ws.cell(row=rtbc, column=6).value in (None, ""),
+               str(ws.cell(row=rtbc, column=6).value))
+        _check("TBC row: net @£150 blank", ws.cell(row=rtbc, column=8).value in (None, ""),
+               str(ws.cell(row=rtbc, column=8).value))
+
+    # managed site: no split, a single section
+    wsm = wb["MANAGED HOUSE"]
+    mh_hdrs = [rr for rr in range(1, wsm.max_row + 1) if wsm.cell(row=rr, column=1).value == "SKU Code"]
+    _check("managed site: single section (no split)", len(mh_hdrs) == 1, str(mh_hdrs))
+
+    # page break so the substitution list prints as a second page
+    try:
+        n_breaks = len(ws.row_breaks.brk)
+    except Exception:
+        n_breaks = -1
+    _check("page break set between sections", n_breaks >= 1, str(n_breaks))
 
     sb = tpe.build_single_site_bytes(m, tpe.find_site(m, "MANAGED HOUSE"))
     wb1 = load_workbook(io.BytesIO(sb))

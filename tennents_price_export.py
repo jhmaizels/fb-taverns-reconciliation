@@ -28,6 +28,8 @@ from datetime import date
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.pagebreak import Break
+from openpyxl.worksheet.properties import PageSetupProperties
 
 from tennents_master import (
     PINTS_PER_BRL,
@@ -37,23 +39,42 @@ from tennents_master import (
     keg_brl_factor,
 )
 
-# Column layout — mirrors the team's familiar "Net & Invoice" price file. Products
-# are GROUPED into the sections below with a labelled header row + blank spacer,
-# the way Nick's file reads, so the per-row Category column is not needed.
-HEADERS = [
-    "SKU Code", "Brand", "ABV %", "WSP £/Brl",
-    "FB Taverns Total Discount", "New Net Price £/Brl",
-    "Net Price £/Keg", "Net Price £/Pint",
-    "Tenant Off-Invoice £/Brl", "FB Retro £/Brl",
-    "In Range",
-    # Substitution guidance (L..O): quick-price a product this site doesn't stock.
-    "FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
-    "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB",
-    "Notes",
-]
-_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15}   # 1-indexed columns to format as currency
+# Column layout. Each site sheet stacks TWO purpose-built sections that share
+# column widths: "Currently sold" (the site's live deals — current pricing) and
+# "Substitution pricing" (products it doesn't sell, priced across a margin band).
+# Cols A-E are common (identity + WSP + agreed total discount); Notes sits at the
+# same far column in both so its width doesn't clash with a price column.
 _ABV_COL = 3
-_INRANGE_COL = 11   # "✓" when the site holds a Site_Prices row for the SKU (its range)
+_NOTES_COL = 13
+_LASTCOL = _NOTES_COL
+
+# "Currently sold" — what the tenant pays today. Editing the Tenant Off-Invoice
+# (F) recalculates Net Keg/Pint (G/H) and FB Retro (I) live.
+SOLD_HEADERS = {
+    1: "SKU Code", 2: "Brand", 3: "ABV %", 4: "WSP £/Brl",
+    5: "FB Taverns Total Discount", 6: "Tenant Off-Invoice £/Brl",
+    7: "Net Price £/Keg", 8: "Net Price £/Pint", 9: "FB Retro £/Brl",
+    _NOTES_COL: "Notes",
+}
+_SOLD_MONEY = {4, 5, 6, 7, 8, 9}
+
+# "Substitution pricing" — for a product the site doesn't sell, at £150/£200/£250
+# retained margin (RPB): the off-invoice to enter (Total Discount − RPB) AND the
+# resulting tenant Net £/Keg, side by side.
+SUB_HEADERS = {
+    1: "SKU Code", 2: "Brand", 3: "ABV %", 4: "WSP £/Brl",
+    5: "FB Taverns Total Discount", 6: "FB Net Cost £/Keg",
+    7: "Off-Inv £/Brl @£150", 8: "Net £/Keg @£150",
+    9: "Off-Inv £/Brl @£200", 10: "Net £/Keg @£200",
+    11: "Off-Inv £/Brl @£250", 12: "Net £/Keg @£250",
+    _NOTES_COL: "Notes",
+}
+_SUB_MONEY = {4, 5, 6, 7, 8, 9, 10, 11, 12}
+
+_COL_WIDTHS = {
+    1: 12, 2: 26, 3: 7, 4: 12, 5: 16,
+    6: 15, 7: 14, 8: 14, 9: 15, 10: 14, 11: 15, 12: 14, _NOTES_COL: 44,
+}
 
 # Section order, matching the team's price file. Uncategorised SKUs fall into a
 # trailing "Other" section (never hidden).
@@ -135,10 +156,11 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
     total = sku.correct_total_per_brl
     wsp = sku.wsp_per_brl
     note_bits: list[str] = []
-    # In-range marker: does this site hold a Site_Prices row for the SKU? Presence
-    # of the row = the product is on the site's Net & Invoice Pricing (its range),
-    # independent of the £0-off default. Blank when the Site_Prices layer is absent.
-    in_range = "✓" if (master.site_prices and master.has_site_price(site.account, sku.sku_code)) else ""
+    # Is there a live off-invoice DEAL for this (site, SKU)? A stored off-invoice
+    # above £0 = a negotiated discount in place = the product is being sold here
+    # (James, Jul-2026). Row-presence alone isn't it — the seed defaults unconfirmed
+    # lines to £0, and a £0 line is full WSP, not a deal. Managed sites aren't split.
+    has_deal = master.off_invoice(site.account, sku.sku_code) > 0.0
 
     if total is None:
         note_bits.append("RATE TBC — no agreed Tennents rate")
@@ -146,7 +168,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
             "category": _category(sku), "code": sku.sku_code, "brand": sku.product or sku.brand,
             "abv": sku.abv, "wsp": wsp, "total": None, "net_brl": None,
             "net_keg": None, "net_pint": None, "off": None, "retro": None, "bpu": None,
-            "in_range": in_range,
+            "has_deal": has_deal,
             "note": "; ".join(note_bits),
         }
 
@@ -172,7 +194,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         "net_keg": (invoice_net_brl * bpu) if invoice_net_brl is not None else None,
         "net_pint": (invoice_net_brl / PINTS_PER_BRL) if invoice_net_brl is not None else None,
         "off": off, "retro": retro, "bpu": bpu,
-        "in_range": in_range,
+        "has_deal": has_deal,
         "note": "",
     }
 
@@ -187,6 +209,45 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         note_bits.append("Bespoke construct — retro per agreement; total validated")
     row["note"] = "; ".join(note_bits)
     return row
+
+
+def _by_category(lines: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Group rows into beer-type sections, canonical order (Other trailing)."""
+    grouped: dict[str, list[dict]] = {}
+    for ln in lines:
+        grouped.setdefault(ln["category"] or _OTHER, []).append(ln)
+    order = [c for c in _CATEGORY_ORDER if c in grouped]
+    order += [c for c in grouped if c not in _CATEGORY_ORDER]
+    return [(c, grouped[c]) for c in order]
+
+
+def _row_cells(r: int, line: dict, kind: str) -> tuple[dict, dict]:
+    """(values, formulas) keyed by 1-indexed column for one product row. kind
+    'sold' = current-deal columns (editing Off-Invoice F drives Net Keg/Pint G/H
+    and FB Retro I live); 'sub' = substitution pricing (FB cost + the off-invoice
+    to enter AND the resulting tenant net keg at each £150/£200/£250 RPB). Cols
+    A-E (identity, WSP, total) and Notes are common to both."""
+    vals = {1: line["code"], 2: line["brand"], 3: line["abv"],
+            4: line["wsp"], 5: line["total"], _NOTES_COL: line["note"]}
+    forms: dict[int, str] = {}
+    bpu = line["bpu"]
+    priceable = line["total"] is not None and line["net_keg"] is not None
+    if kind == "sold":
+        vals[6] = line["off"]                                    # F  Tenant Off-Invoice (input)
+        if line["total"] is not None:
+            forms[9] = f"=E{r}-F{r}"                             # I  FB Retro = total - off
+            if priceable:                                       # WSP present
+                forms[7] = f"=(D{r}-F{r})*{bpu!r}"             # G  Net £/Keg  = (WSP - off) * keg factor
+                forms[8] = f"=(D{r}-F{r})/{PINTS_PER_BRL!r}"   # H  Net £/Pint = (WSP - off) / pints per brl
+    elif priceable:                                             # kind == "sub"
+        forms[6]  = f"=(D{r}-E{r})*{bpu!r}"                     # F  FB net cost £/keg = (WSP - total) * keg
+        forms[7]  = f"=E{r}-150"                                # G  off-invoice to enter for a £150 retro
+        forms[8]  = f"=(D{r}-E{r}+150)*{bpu!r}"                # H  resulting tenant net £/keg
+        forms[9]  = f"=E{r}-200"
+        forms[10] = f"=(D{r}-E{r}+200)*{bpu!r}"
+        forms[11] = f"=E{r}-250"
+        forms[12] = f"=(D{r}-E{r}+250)*{bpu!r}"
+    return vals, forms
 
 
 def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -> None:
@@ -206,107 +267,94 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
     ws["A3"] = f"Operating model: {site.operating_model or '—'}    |    Discount construct: {site.discount_construct or '—'}"
     ws["A3"].font = sub_font
 
-    header_row = 5
-    for c, label in enumerate(HEADERS, start=1):
-        cell = ws.cell(row=header_row, column=c, value=label)
-        cell.font = bold
-        cell.fill = header_fill
-        cell.alignment = centre
-        cell.border = border
-
-    # Group price lines by section (Standard Lager, Premium Lager, …) and write
-    # each under a labelled band row with a blank spacer between, so the file
-    # reads like the team's — products separated by type.
-    lines_by_cat: dict[str, list[dict]] = {}
-    for sku in master.skus:
-        line = _price_line(master, site, sku)
-        lines_by_cat.setdefault(line["category"] or _OTHER, []).append(line)
-    ordered = [c for c in _CATEGORY_ORDER if c in lines_by_cat]
-    ordered += [c for c in lines_by_cat if c not in _CATEGORY_ORDER]   # trailing "Other"
-
     section_fill = PatternFill("solid", fgColor="1F3B57")
     section_font = Font(bold=True, size=11, color="FFFFFF")
+    cat_fill = PatternFill("solid", fgColor="4A6A8A")
+    cat_font = Font(bold=True, size=10, color="FFFFFF")
 
-    r = header_row + 1
-    for si, cat in enumerate(ordered):
-        if si:                                    # blank spacer row between sections
-            r += 1
-        band = ws.cell(row=r, column=1, value=cat)
-        band.font = section_font
-        band.fill = section_fill
-        for c in range(2, len(HEADERS) + 1):      # colour the whole band row
-            ws.cell(row=r, column=c).fill = section_fill
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(HEADERS))
-        r += 1
-        for line in lines_by_cat[cat]:
-            values = [
-                line["code"], line["brand"], line["abv"], line["wsp"],
-                line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
-                line["off"], line["retro"],
-                line["in_range"],                # K In Range
-                None, None, None, None,          # L..O substitution guidance (written as formulas)
-                line["note"],
-            ]
-            is_tbc = line["total"] is None
-            # Write the derived money columns as LIVE Excel formulas of the input
-            # cells (WSP=D, Total Discount=E, Tenant Off-Invoice=I) so the team can
-            # edit the off-invoice in-sheet and have Net Keg/Pint and the FB retro
-            # recalculate — Nick Madigan's bar-plan / new-site workflow (Jul-2026).
-            # The K..N "substitution guidance" block prices a product this site
-            # doesn't stock: FB net cost/keg, then the tenant keg price at a
-            # £150/£200/£250 retained margin (RPB). Where the RPB exceeds the
-            # product's total discount (E) the implied tenant price runs above WSP;
-            # shown as-is (kept simple — James, Jul-2026). TBC rows stay blank.
-            formulas: dict[int, str] = {}
-            if not is_tbc:
-                bpu = line["bpu"]
-                formulas[10] = f"=E{r}-I{r}"                          # J  FB Retro = total - off-invoice
-                if line["net_keg"] is not None:                      # WSP present -> all WSP-derived cols
-                    formulas[6] = f"=D{r}-E{r}"                       # F  Net/Brl  = WSP - total discount
-                    formulas[7] = f"=(D{r}-I{r})*{bpu!r}"            # G  Net/Keg  = (WSP - off) * keg factor
-                    formulas[8] = f"=(D{r}-I{r})/{PINTS_PER_BRL!r}"  # H  Net/Pint = (WSP - off) / pints per brl
-                    formulas[12] = f"=(D{r}-E{r})*{bpu!r}"           # L  FB net cost £/keg
-                    formulas[13] = f"=(D{r}-E{r}+150)*{bpu!r}"       # M  tenant £/keg @ £150 RPB
-                    formulas[14] = f"=(D{r}-E{r}+200)*{bpu!r}"       # N  tenant £/keg @ £200 RPB
-                    formulas[15] = f"=(D{r}-E{r}+250)*{bpu!r}"       # O  tenant £/keg @ £250 RPB
-            for c, v in enumerate(values, start=1):
-                cell = ws.cell(row=r, column=c, value=formulas.get(c, v))
-                cell.border = border
-                if c in _MONEY_COLS and (isinstance(v, (int, float)) or c in formulas):
-                    cell.number_format = '"£"#,##0.00'
-                if c == _ABV_COL and isinstance(v, (int, float)):
-                    cell.number_format = '0.0"%"'
-                if c == _INRANGE_COL:
-                    cell.alignment = centre
-                if is_tbc:
-                    cell.fill = tbc_fill
-            r += 1
+    def _band(row, text, fill, font):
+        ws.cell(row=row, column=1, value=text).font = font
+        for c in range(1, _LASTCOL + 1):
+            ws.cell(row=row, column=c).fill = fill
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=_LASTCOL)
+
+    def _section(row, title, headers, money, rows, kind):
+        _band(row, title, section_fill, section_font)
+        row += 1
+        for c in headers:                              # header cells (this section's columns)
+            hc = ws.cell(row=row, column=c, value=headers[c])
+            hc.font = bold
+            hc.fill = header_fill
+            hc.alignment = centre
+            hc.border = border
+        row += 1
+        if not rows:
+            ws.cell(row=row, column=1, value="— none —").font = Font(italic=True, color="888888")
+            return row + 1
+        for si, (cat, cat_rows) in enumerate(_by_category(rows)):
+            if si:
+                row += 1                               # blank spacer between beer types
+            _band(row, cat, cat_fill, cat_font)
+            row += 1
+            for line in cat_rows:
+                is_tbc = line["total"] is None
+                vals, forms = _row_cells(row, line, kind)
+                for c in headers:
+                    v = vals.get(c)
+                    cell = ws.cell(row=row, column=c, value=forms.get(c, v))
+                    cell.border = border
+                    if c in money and (isinstance(v, (int, float)) or c in forms):
+                        cell.number_format = '"£"#,##0.00'
+                    if c == _ABV_COL and isinstance(v, (int, float)):
+                        cell.number_format = '0.0"%"'
+                    if is_tbc:
+                        cell.fill = tbc_fill
+                row += 1
+        return row
+
+    lines = [_price_line(master, site, sku) for sku in master.skus]
+
+    r = 5
+    if site.is_managed:
+        # Managed: FB runs the site — whole discount is off-invoice, no tenant
+        # "deal vs not" split. One current-pricing list of everything.
+        r = _section(r, "All products — managed site (whole discount off-invoice)",
+                     SOLD_HEADERS, _SOLD_MONEY, lines, "sold")
+    else:
+        sold = [ln for ln in lines if ln["has_deal"]]
+        rest = [ln for ln in lines if not ln["has_deal"]]
+        r = _section(r, "Currently sold at this site — off-invoice deal in place",
+                     SOLD_HEADERS, _SOLD_MONEY, sold, "sold")
+        r += 1                                         # spacer, then a page break
+        ws.row_breaks.append(Break(id=r - 1))          # substitution list prints as page 2
+        r = _section(r, "Substitution pricing — products not currently sold (£150 / £200 / £250 RPB)",
+                     SUB_HEADERS, _SUB_MONEY, rest, "sub")
 
     warn = ("" if master.site_prices else
-            "WARNING: the per-site off-invoice layer (Site_Prices) is NOT loaded — every site is "
-            "shown at FULL WSP with no off-invoice applied. Seed/upload Site_Prices before using "
-            "these figures. ")
-    note = ws.cell(
+            "WARNING: the per-site off-invoice layer (Site_Prices) is NOT loaded — every product shows "
+            "as NOT sold and at full WSP. Seed/upload Site_Prices before using these figures. ")
+    foot = ws.cell(
         row=r + 1, column=1,
         value=(warn + f"Generated {as_of.isoformat()} from the Tennents master "
                f"({master.version or 'version n/a'}). WSP & agreed total discount from SKU_Master; "
-               f"per-site off-invoice split from Site_Prices. Net £/Keg is on the invoice basis "
-               f"(WSP − off-invoice); New Net £/Brl is after the FB retro. Net £/Brl, Net £/Keg, "
-               f"Net £/Pint and FB Retro are live formulas — edit WSP, Total Discount or Tenant "
-               f"Off-Invoice in-sheet and they recalculate. In Range (✓) = the product is on this "
-               f"site's Net & Invoice Pricing (its current range as at the last master upload); "
-               f"unticked rows are catalogue products the site doesn't currently buy. Substitution "
-               f"guidance (right-hand block): FB Net Cost £/Keg is what FB pays; the @£150/£200/£250 RPB columns give the "
-               f"tenant keg price at that retained margin. Typical RPB £150-250; when switching a "
-               f"product the replacement's FB Retro must beat the retired product's — every switch "
-               f"accretive. RATE TBC = no agreed Tennents rate yet — not priced."))
-    note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
-    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
+               f"per-site off-invoice from Site_Prices. TWO sections — 'Currently sold' = products with "
+               f"an off-invoice deal in place (edit the Tenant Off-Invoice and Net Keg/Pint & FB Retro "
+               f"recalculate); 'Substitution pricing' = products not currently sold, priced at £150 / "
+               f"£200 / £250 retained margin (RPB), showing the off-invoice to enter (Total Discount − "
+               f"RPB) and the resulting tenant Net £/Keg side by side. When switching a product the "
+               f"replacement's margin must beat the retired product's — every switch accretive. A "
+               f"negative off-invoice = the RPB is above the product's total discount (a price above "
+               f"WSP). RATE TBC = no agreed Tennents rate yet — not priced."))
+    foot.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
+    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=_LASTCOL)
 
-    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 9, 15, 16, 16, 16, 40]
-    for c, w in enumerate(widths, start=1):
+    for c, w in _COL_WIDTHS.items():
         ws.column_dimensions[get_column_letter(c)].width = w
-    ws.freeze_panes = f"A{header_row + 1}"
+    ws.freeze_panes = "A7"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
 
 def _sites_in_scope(master: TennentsMaster) -> list[SiteInfo]:

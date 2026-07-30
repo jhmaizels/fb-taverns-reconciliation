@@ -227,15 +227,6 @@ class TennentsMaster:
             (str(account).strip(), self.canonical_sku(sku_code).strip().upper()))
         return float(sp.off_invoice_per_brl or 0.0) if sp else 0.0
 
-    def has_site_price(self, account: str, sku_code: str) -> bool:
-        """True when this site holds a Site_Prices row for the SKU — i.e. the
-        product is on the site's Net & Invoice Pricing (its current range).
-        Distinct from off_invoice(), which returns 0.0 whether the row is absent
-        OR a real £0, so it's the presence of the row that's the range signal, not
-        the price — a genuinely-stocked line can sit at £0 off-invoice."""
-        return (str(account).strip(),
-                self.canonical_sku(sku_code).strip().upper()) in self._site_price_index
-
     def canonical_sku(self, code: str) -> str:
         sku = self.find_sku(code)
         return sku.sku_code if sku else str(code).strip().upper()
