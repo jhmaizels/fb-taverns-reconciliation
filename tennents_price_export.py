@@ -45,13 +45,15 @@ HEADERS = [
     "FB Taverns Total Discount", "New Net Price £/Brl",
     "Net Price £/Keg", "Net Price £/Pint",
     "Tenant Off-Invoice £/Brl", "FB Retro £/Brl",
-    # Substitution guidance (K..N): quick-price a product this site doesn't stock.
+    "In Range",
+    # Substitution guidance (L..O): quick-price a product this site doesn't stock.
     "FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
     "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB",
     "Notes",
 ]
-_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}   # 1-indexed columns to format as currency
+_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15}   # 1-indexed columns to format as currency
 _ABV_COL = 3
+_INRANGE_COL = 11   # "✓" when the site holds a Site_Prices row for the SKU (its range)
 
 # Section order, matching the team's price file. Uncategorised SKUs fall into a
 # trailing "Other" section (never hidden).
@@ -133,6 +135,10 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
     total = sku.correct_total_per_brl
     wsp = sku.wsp_per_brl
     note_bits: list[str] = []
+    # In-range marker: does this site hold a Site_Prices row for the SKU? Presence
+    # of the row = the product is on the site's Net & Invoice Pricing (its range),
+    # independent of the £0-off default. Blank when the Site_Prices layer is absent.
+    in_range = "✓" if (master.site_prices and master.has_site_price(site.account, sku.sku_code)) else ""
 
     if total is None:
         note_bits.append("RATE TBC — no agreed Tennents rate")
@@ -140,6 +146,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
             "category": _category(sku), "code": sku.sku_code, "brand": sku.product or sku.brand,
             "abv": sku.abv, "wsp": wsp, "total": None, "net_brl": None,
             "net_keg": None, "net_pint": None, "off": None, "retro": None, "bpu": None,
+            "in_range": in_range,
             "note": "; ".join(note_bits),
         }
 
@@ -165,6 +172,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         "net_keg": (invoice_net_brl * bpu) if invoice_net_brl is not None else None,
         "net_pint": (invoice_net_brl / PINTS_PER_BRL) if invoice_net_brl is not None else None,
         "off": off, "retro": retro, "bpu": bpu,
+        "in_range": in_range,
         "note": "",
     }
 
@@ -235,7 +243,8 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                 line["code"], line["brand"], line["abv"], line["wsp"],
                 line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
                 line["off"], line["retro"],
-                None, None, None, None,          # K..N substitution guidance (written as formulas)
+                line["in_range"],                # K In Range
+                None, None, None, None,          # L..O substitution guidance (written as formulas)
                 line["note"],
             ]
             is_tbc = line["total"] is None
@@ -256,10 +265,10 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                     formulas[6] = f"=D{r}-E{r}"                       # F  Net/Brl  = WSP - total discount
                     formulas[7] = f"=(D{r}-I{r})*{bpu!r}"            # G  Net/Keg  = (WSP - off) * keg factor
                     formulas[8] = f"=(D{r}-I{r})/{PINTS_PER_BRL!r}"  # H  Net/Pint = (WSP - off) / pints per brl
-                    formulas[11] = f"=(D{r}-E{r})*{bpu!r}"           # FB net cost £/keg
-                    formulas[12] = f"=(D{r}-E{r}+150)*{bpu!r}"       # tenant £/keg @ £150 RPB
-                    formulas[13] = f"=(D{r}-E{r}+200)*{bpu!r}"       # tenant £/keg @ £200 RPB
-                    formulas[14] = f"=(D{r}-E{r}+250)*{bpu!r}"       # tenant £/keg @ £250 RPB
+                    formulas[12] = f"=(D{r}-E{r})*{bpu!r}"           # L  FB net cost £/keg
+                    formulas[13] = f"=(D{r}-E{r}+150)*{bpu!r}"       # M  tenant £/keg @ £150 RPB
+                    formulas[14] = f"=(D{r}-E{r}+200)*{bpu!r}"       # N  tenant £/keg @ £200 RPB
+                    formulas[15] = f"=(D{r}-E{r}+250)*{bpu!r}"       # O  tenant £/keg @ £250 RPB
             for c, v in enumerate(values, start=1):
                 cell = ws.cell(row=r, column=c, value=formulas.get(c, v))
                 cell.border = border
@@ -267,6 +276,8 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                     cell.number_format = '"£"#,##0.00'
                 if c == _ABV_COL and isinstance(v, (int, float)):
                     cell.number_format = '0.0"%"'
+                if c == _INRANGE_COL:
+                    cell.alignment = centre
                 if is_tbc:
                     cell.fill = tbc_fill
             r += 1
@@ -282,15 +293,17 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                f"per-site off-invoice split from Site_Prices. Net £/Keg is on the invoice basis "
                f"(WSP − off-invoice); New Net £/Brl is after the FB retro. Net £/Brl, Net £/Keg, "
                f"Net £/Pint and FB Retro are live formulas — edit WSP, Total Discount or Tenant "
-               f"Off-Invoice in-sheet and they recalculate. Substitution guidance (right-hand "
-               f"block): FB Net Cost £/Keg is what FB pays; the @£150/£200/£250 RPB columns give the "
+               f"Off-Invoice in-sheet and they recalculate. In Range (✓) = the product is on this "
+               f"site's Net & Invoice Pricing (its current range as at the last master upload); "
+               f"unticked rows are catalogue products the site doesn't currently buy. Substitution "
+               f"guidance (right-hand block): FB Net Cost £/Keg is what FB pays; the @£150/£200/£250 RPB columns give the "
                f"tenant keg price at that retained margin. Typical RPB £150-250; when switching a "
                f"product the replacement's FB Retro must beat the retired product's — every switch "
                f"accretive. RATE TBC = no agreed Tennents rate yet — not priced."))
     note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
 
-    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 15, 16, 16, 16, 40]
+    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 9, 15, 16, 16, 16, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = f"A{header_row + 1}"

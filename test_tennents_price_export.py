@@ -118,6 +118,13 @@ def run():
     _check("open exception surfaces as a note", "Correction pending" in lj["note"], lj["note"])
     _check("priced rate is AGREED not loaded", _near(lj["total"], 302.97))
 
+    # ---- in-range = a Site_Prices row exists (site's range), independent of the
+    # £0 default: 400889 is stored at £0 off but IS in range; 401211 has no row ----
+    _check("in range: stored SKU (090425)", m.has_site_price("11110001", "090425") is True)
+    _check("in range: £0-off SKU still in range (400889)", m.has_site_price("11110001", "400889") is True)
+    _check("in range: via alt code (GUI002 stored as GUI003)", m.has_site_price("11110001", "GUI002") is True)
+    _check("not in range: unpriced SKU (401211)", m.has_site_price("11110001", "401211") is False)
+
     # ---- managed site: all off-invoice, zero retro ----
     lm = line(m, "MANAGED HOUSE", "GUI002")
     _check("managed: off = total", _near(lm["off"], 249.00))
@@ -189,10 +196,12 @@ def run():
         _check("J FB retro = total - off (E-I)", jr == f"=E{rlag}-I{rlag}", str(jr))
         _check("F Net/Brl = WSP - total (D-E)", fb == f"=D{rlag}-E{rlag}", str(fb))
         _check("I off-invoice stays a numeric input", isinstance(off, (int, float)), str(off))
-        # substitution guidance block (cols 11-14): FB cost/keg + tenant £/keg per RPB
-        cost = ws.cell(row=rlag, column=11).value
-        glo = ws.cell(row=rlag, column=12).value
-        ghi = ws.cell(row=rlag, column=14).value
+        _check("in-range marker ticked on a ranged product (090425)",
+               ws.cell(row=rlag, column=11).value == "✓", str(ws.cell(row=rlag, column=11).value))
+        # substitution guidance block (cols 12-15): FB cost/keg + tenant £/keg per RPB
+        cost = ws.cell(row=rlag, column=12).value
+        glo = ws.cell(row=rlag, column=13).value
+        ghi = ws.cell(row=rlag, column=15).value
         _check("FB net cost/keg = (D-E)*bpu formula",
                isinstance(cost, str) and cost.startswith(f"=(D{rlag}-E{rlag})*"), str(cost))
         _check("guide @£150 = (D-E+150)*bpu formula",
@@ -200,8 +209,15 @@ def run():
         _check("guide @£250 = (D-E+250)*bpu (shown as-is, even above WSP)",
                isinstance(ghi, str) and ghi.startswith(f"=(D{rlag}-E{rlag}+250)*"), str(ghi))
 
-    ghdr = [ws.cell(row=5, column=c).value for c in range(11, 16)]
-    _check("guidance headers present + Notes shifted to col 15",
+    r0 = _row_for("400889")   # stored at £0 off-invoice, but IS in range -> ticked
+    if r0:
+        _check("in-range: £0-off product still ticked (400889)",
+               ws.cell(row=r0, column=11).value == "✓", str(ws.cell(row=r0, column=11).value))
+
+    _check("In Range header at col 11", ws.cell(row=5, column=11).value == "In Range",
+           str(ws.cell(row=5, column=11).value))
+    ghdr = [ws.cell(row=5, column=c).value for c in range(12, 17)]
+    _check("guidance headers present + Notes shifted to col 16",
            ghdr == ["FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
                     "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB", "Notes"], str(ghdr))
 
@@ -213,7 +229,9 @@ def run():
         _check("TBC row: FB retro blank (no formula)",
                ws.cell(row=rtbc, column=10).value in (None, ""), str(ws.cell(row=rtbc, column=10).value))
         _check("TBC row: guidance block blank",
-               all(ws.cell(row=rtbc, column=c).value in (None, "") for c in range(11, 15)), "not blank")
+               all(ws.cell(row=rtbc, column=c).value in (None, "") for c in range(12, 16)), "not blank")
+        _check("not-in-range product unticked (401211)",
+               ws.cell(row=rtbc, column=11).value in (None, ""), str(ws.cell(row=rtbc, column=11).value))
 
     sb = tpe.build_single_site_bytes(m, tpe.find_site(m, "MANAGED HOUSE"))
     wb1 = load_workbook(io.BytesIO(sb))
