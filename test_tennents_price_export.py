@@ -162,6 +162,42 @@ def run():
     _check("sections grouped in canonical order",
            bands == ["Standard Lager", "Premium Lager", "Ales & Stout"], str(bands))
 
+    # ---- live formulas: editing Tenant Off-Invoice (I) recalculates Net Keg (G),
+    # Net Pint (H) and the FB retro (J) in-sheet; New Net/Brl (F) tracks WSP/Total;
+    # the retro column is now labelled "FB Retro" (Nick Madigan, Jul-2026). ----
+    _check("retro column renamed to FB Retro",
+           ws.cell(row=5, column=10).value == "FB Retro £/Brl", str(ws.cell(row=5, column=10).value))
+
+    def _row_for(code):
+        for rr in range(6, ws.max_row + 1):
+            if ws.cell(row=rr, column=1).value == code:
+                return rr
+        return None
+
+    rlag = _row_for("090425")                      # a priced row (off-invoice 105.02)
+    _check("priced row located", rlag is not None, str(rlag))
+    if rlag:
+        g = ws.cell(row=rlag, column=7).value      # Net £/Keg
+        h = ws.cell(row=rlag, column=8).value      # Net £/Pint
+        jr = ws.cell(row=rlag, column=10).value    # FB Retro
+        fb = ws.cell(row=rlag, column=6).value     # New Net £/Brl
+        off = ws.cell(row=rlag, column=9).value    # Tenant Off-Invoice (input)
+        _check("G Net/Keg is a live formula of D & I",
+               isinstance(g, str) and g.startswith(f"=(D{rlag}-I{rlag})*"), str(g))
+        _check("H Net/Pint is a live formula of D & I",
+               isinstance(h, str) and h.startswith(f"=(D{rlag}-I{rlag})/"), str(h))
+        _check("J FB retro = total - off (E-I)", jr == f"=E{rlag}-I{rlag}", str(jr))
+        _check("F Net/Brl = WSP - total (D-E)", fb == f"=D{rlag}-E{rlag}", str(fb))
+        _check("I off-invoice stays a numeric input", isinstance(off, (int, float)), str(off))
+
+    rtbc = _row_for("401211")                      # RATE TBC row -> no formula, stays blank
+    _check("TBC row located", rtbc is not None, str(rtbc))
+    if rtbc:
+        _check("TBC row: Net/Keg blank (no formula)",
+               ws.cell(row=rtbc, column=7).value in (None, ""), str(ws.cell(row=rtbc, column=7).value))
+        _check("TBC row: FB retro blank (no formula)",
+               ws.cell(row=rtbc, column=10).value in (None, ""), str(ws.cell(row=rtbc, column=10).value))
+
     sb = tpe.build_single_site_bytes(m, tpe.find_site(m, "MANAGED HOUSE"))
     wb1 = load_workbook(io.BytesIO(sb))
     _check("single-site workbook: one tab", len(wb1.sheetnames) == 1)

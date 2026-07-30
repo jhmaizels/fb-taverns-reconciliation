@@ -44,7 +44,7 @@ HEADERS = [
     "SKU Code", "Brand", "ABV %", "WSP £/Brl",
     "FB Taverns Total Discount", "New Net Price £/Brl",
     "Net Price £/Keg", "Net Price £/Pint",
-    "Tenant Off-Invoice £/Brl", "Iona Retro £/Brl", "Notes",
+    "Tenant Off-Invoice £/Brl", "FB Retro £/Brl", "Notes",
 ]
 _MONEY_COLS = {4, 5, 6, 7, 8, 9, 10}   # 1-indexed columns to format as currency
 _ABV_COL = 3
@@ -135,7 +135,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         return {
             "category": _category(sku), "code": sku.sku_code, "brand": sku.product or sku.brand,
             "abv": sku.abv, "wsp": wsp, "total": None, "net_brl": None,
-            "net_keg": None, "net_pint": None, "off": None, "retro": None,
+            "net_keg": None, "net_pint": None, "off": None, "retro": None, "bpu": None,
             "note": "; ".join(note_bits),
         }
 
@@ -160,7 +160,7 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         "net_brl": (wsp - total) if wsp is not None else None,
         "net_keg": (invoice_net_brl * bpu) if invoice_net_brl is not None else None,
         "net_pint": (invoice_net_brl / PINTS_PER_BRL) if invoice_net_brl is not None else None,
-        "off": off, "retro": retro,
+        "off": off, "retro": retro, "bpu": bpu,
         "note": "",
     }
 
@@ -233,8 +233,23 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                 line["off"], line["retro"], line["note"],
             ]
             is_tbc = line["total"] is None
+            # Write the derived money columns as LIVE Excel formulas of the input
+            # cells (WSP=D, Total Discount=E, Tenant Off-Invoice=I) so the team can
+            # edit the off-invoice in-sheet and have Net Keg/Pint and the FB retro
+            # recalculate — Nick Madigan's bar-plan / new-site workflow (Jul-2026).
+            # Formulas evaluate to the same figures on first open; TBC rows carry
+            # no numbers, so they stay blank.
+            formulas: dict[int, str] = {}
+            if not is_tbc:
+                formulas[10] = f"=E{r}-I{r}"                         # J  FB Retro  = total - off-invoice
+                if line["net_brl"] is not None:
+                    formulas[6] = f"=D{r}-E{r}"                      # F  Net/Brl  = WSP - total discount
+                if line["net_keg"] is not None:
+                    formulas[7] = f"=(D{r}-I{r})*{line['bpu']!r}"    # G  Net/Keg  = (WSP - off) * keg factor
+                if line["net_pint"] is not None:
+                    formulas[8] = f"=(D{r}-I{r})/{PINTS_PER_BRL!r}"  # H  Net/Pint = (WSP - off) / pints per brl
             for c, v in enumerate(values, start=1):
-                cell = ws.cell(row=r, column=c, value=v)
+                cell = ws.cell(row=r, column=c, value=formulas.get(c, v))
                 cell.border = border
                 if c in _MONEY_COLS and isinstance(v, (int, float)):
                     cell.number_format = '"£"#,##0.00'
@@ -253,7 +268,9 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
         value=(warn + f"Generated {as_of.isoformat()} from the Tennents master "
                f"({master.version or 'version n/a'}). WSP & agreed total discount from SKU_Master; "
                f"per-site off-invoice split from Site_Prices. Net £/Keg is on the invoice basis "
-               f"(WSP − off-invoice); New Net £/Brl is after the Iona retro. RATE TBC = no agreed "
+               f"(WSP − off-invoice); New Net £/Brl is after the FB retro. Net £/Brl, Net £/Keg, "
+               f"Net £/Pint and FB Retro are live formulas — edit WSP, Total Discount or Tenant "
+               f"Off-Invoice in-sheet and they recalculate. RATE TBC = no agreed "
                f"Tennents rate yet — not priced."))
     note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
@@ -327,6 +344,10 @@ def build_all_sites_zip_bytes(master: TennentsMaster, as_of: date | None = None)
 
 
 def _to_bytes(wb: Workbook) -> bytes:
+    # openpyxl writes formulas without a cached result, so tell Excel to
+    # recalculate on open — otherwise the live Net/Retro cells read blank/0 until
+    # the sheet is touched.
+    wb.calculation.fullCalcOnLoad = True
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
