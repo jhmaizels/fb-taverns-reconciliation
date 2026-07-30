@@ -189,6 +189,21 @@ def run():
         _check("J FB retro = total - off (E-I)", jr == f"=E{rlag}-I{rlag}", str(jr))
         _check("F Net/Brl = WSP - total (D-E)", fb == f"=D{rlag}-E{rlag}", str(fb))
         _check("I off-invoice stays a numeric input", isinstance(off, (int, float)), str(off))
+        # substitution guidance block (cols 11-14): FB cost/keg + tenant £/keg per RPB
+        cost = ws.cell(row=rlag, column=11).value
+        glo = ws.cell(row=rlag, column=12).value
+        ghi = ws.cell(row=rlag, column=14).value
+        _check("FB net cost/keg = (D-E)*bpu formula",
+               isinstance(cost, str) and cost.startswith(f"=(D{rlag}-E{rlag})*"), str(cost))
+        _check("guide @£150 = (D-E+150)*bpu formula",
+               isinstance(glo, str) and glo.startswith(f"=(D{rlag}-E{rlag}+150)*"), str(glo))
+        _check("guide @£250 = (D-E+250)*bpu (shown as-is, even above WSP)",
+               isinstance(ghi, str) and ghi.startswith(f"=(D{rlag}-E{rlag}+250)*"), str(ghi))
+
+    ghdr = [ws.cell(row=5, column=c).value for c in range(11, 16)]
+    _check("guidance headers present + Notes shifted to col 15",
+           ghdr == ["FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
+                    "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB", "Notes"], str(ghdr))
 
     rtbc = _row_for("401211")                      # RATE TBC row -> no formula, stays blank
     _check("TBC row located", rtbc is not None, str(rtbc))
@@ -197,6 +212,8 @@ def run():
                ws.cell(row=rtbc, column=7).value in (None, ""), str(ws.cell(row=rtbc, column=7).value))
         _check("TBC row: FB retro blank (no formula)",
                ws.cell(row=rtbc, column=10).value in (None, ""), str(ws.cell(row=rtbc, column=10).value))
+        _check("TBC row: guidance block blank",
+               all(ws.cell(row=rtbc, column=c).value in (None, "") for c in range(11, 15)), "not blank")
 
     sb = tpe.build_single_site_bytes(m, tpe.find_site(m, "MANAGED HOUSE"))
     wb1 = load_workbook(io.BytesIO(sb))

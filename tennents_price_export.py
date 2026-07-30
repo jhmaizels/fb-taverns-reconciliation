@@ -44,9 +44,13 @@ HEADERS = [
     "SKU Code", "Brand", "ABV %", "WSP £/Brl",
     "FB Taverns Total Discount", "New Net Price £/Brl",
     "Net Price £/Keg", "Net Price £/Pint",
-    "Tenant Off-Invoice £/Brl", "FB Retro £/Brl", "Notes",
+    "Tenant Off-Invoice £/Brl", "FB Retro £/Brl",
+    # Substitution guidance (K..N): quick-price a product this site doesn't stock.
+    "FB Net Cost £/Keg", "Tenant £/Keg @£150 RPB",
+    "Tenant £/Keg @£200 RPB", "Tenant £/Keg @£250 RPB",
+    "Notes",
 ]
-_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10}   # 1-indexed columns to format as currency
+_MONEY_COLS = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}   # 1-indexed columns to format as currency
 _ABV_COL = 3
 
 # Section order, matching the team's price file. Uncategorised SKUs fall into a
@@ -230,28 +234,36 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
             values = [
                 line["code"], line["brand"], line["abv"], line["wsp"],
                 line["total"], line["net_brl"], line["net_keg"], line["net_pint"],
-                line["off"], line["retro"], line["note"],
+                line["off"], line["retro"],
+                None, None, None, None,          # K..N substitution guidance (written as formulas)
+                line["note"],
             ]
             is_tbc = line["total"] is None
             # Write the derived money columns as LIVE Excel formulas of the input
             # cells (WSP=D, Total Discount=E, Tenant Off-Invoice=I) so the team can
             # edit the off-invoice in-sheet and have Net Keg/Pint and the FB retro
             # recalculate — Nick Madigan's bar-plan / new-site workflow (Jul-2026).
-            # Formulas evaluate to the same figures on first open; TBC rows carry
-            # no numbers, so they stay blank.
+            # The K..N "substitution guidance" block prices a product this site
+            # doesn't stock: FB net cost/keg, then the tenant keg price at a
+            # £150/£200/£250 retained margin (RPB). Where the RPB exceeds the
+            # product's total discount (E) the implied tenant price runs above WSP;
+            # shown as-is (kept simple — James, Jul-2026). TBC rows stay blank.
             formulas: dict[int, str] = {}
             if not is_tbc:
-                formulas[10] = f"=E{r}-I{r}"                         # J  FB Retro  = total - off-invoice
-                if line["net_brl"] is not None:
-                    formulas[6] = f"=D{r}-E{r}"                      # F  Net/Brl  = WSP - total discount
-                if line["net_keg"] is not None:
-                    formulas[7] = f"=(D{r}-I{r})*{line['bpu']!r}"    # G  Net/Keg  = (WSP - off) * keg factor
-                if line["net_pint"] is not None:
+                bpu = line["bpu"]
+                formulas[10] = f"=E{r}-I{r}"                          # J  FB Retro = total - off-invoice
+                if line["net_keg"] is not None:                      # WSP present -> all WSP-derived cols
+                    formulas[6] = f"=D{r}-E{r}"                       # F  Net/Brl  = WSP - total discount
+                    formulas[7] = f"=(D{r}-I{r})*{bpu!r}"            # G  Net/Keg  = (WSP - off) * keg factor
                     formulas[8] = f"=(D{r}-I{r})/{PINTS_PER_BRL!r}"  # H  Net/Pint = (WSP - off) / pints per brl
+                    formulas[11] = f"=(D{r}-E{r})*{bpu!r}"           # FB net cost £/keg
+                    formulas[12] = f"=(D{r}-E{r}+150)*{bpu!r}"       # tenant £/keg @ £150 RPB
+                    formulas[13] = f"=(D{r}-E{r}+200)*{bpu!r}"       # tenant £/keg @ £200 RPB
+                    formulas[14] = f"=(D{r}-E{r}+250)*{bpu!r}"       # tenant £/keg @ £250 RPB
             for c, v in enumerate(values, start=1):
                 cell = ws.cell(row=r, column=c, value=formulas.get(c, v))
                 cell.border = border
-                if c in _MONEY_COLS and isinstance(v, (int, float)):
+                if c in _MONEY_COLS and (isinstance(v, (int, float)) or c in formulas):
                     cell.number_format = '"£"#,##0.00'
                 if c == _ABV_COL and isinstance(v, (int, float)):
                     cell.number_format = '0.0"%"'
@@ -270,12 +282,15 @@ def _write_site_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -
                f"per-site off-invoice split from Site_Prices. Net £/Keg is on the invoice basis "
                f"(WSP − off-invoice); New Net £/Brl is after the FB retro. Net £/Brl, Net £/Keg, "
                f"Net £/Pint and FB Retro are live formulas — edit WSP, Total Discount or Tenant "
-               f"Off-Invoice in-sheet and they recalculate. RATE TBC = no agreed "
-               f"Tennents rate yet — not priced."))
+               f"Off-Invoice in-sheet and they recalculate. Substitution guidance (right-hand "
+               f"block): FB Net Cost £/Keg is what FB pays; the @£150/£200/£250 RPB columns give the "
+               f"tenant keg price at that retained margin. Typical RPB £150-250; when switching a "
+               f"product the replacement's FB Retro must beat the retired product's — every switch "
+               f"accretive. RATE TBC = no agreed Tennents rate yet — not priced."))
     note.font = Font(size=9, bold=bool(warn), color="B00020" if warn else "555555")
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=len(HEADERS))
 
-    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 40]
+    widths = [12, 26, 7, 12, 16, 14, 13, 13, 15, 14, 15, 16, 16, 16, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = f"A{header_row + 1}"
