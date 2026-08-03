@@ -618,7 +618,8 @@ def _findings_script(cfg: dict) -> str:
             "sourceFile": cfg.get("sourceFile", ""),
             "defaultEffDate": cfg.get("defaultEffDate", ""),
             "email": {"file": cfg.get("sourceFile", ""),
-                      "tenant_mismatches": [], "missing_products": [], "missing_prices": []},
+                      "tenant_mismatches": [], "fb_mismatches": [],
+                      "missing_products": [], "missing_prices": []},
         })
     cfg_json = cfg_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     return (
@@ -847,7 +848,7 @@ def render_summary_html(
     # items; accepting a missing item into the master (buttons above) drops it
     # from the draft live. The accept buttons' JS also lives in this block, so it
     # is emitted whenever there is anything actionable on the page.
-    if s.tenant_blocks or s.products_not_on_master or s.tenant_price_missing:
+    if s.tenant_blocks or s.fb_blocks or s.products_not_on_master or s.tenant_price_missing:
         default_subject = f"FB Taverns pricing — {s.file_name}"
         email_data = {
             "file": s.file_name,
@@ -858,15 +859,30 @@ def render_summary_html(
                  "qty": r.qty}
                 for b in s.tenant_blocks for r in b.rows
             ],
+            # Section 2 of the page: LWC's MASTER column (what they charge FB for
+            # the product) vs our agreed LIST price. Positive delta = charged
+            # above the agreed list = FB overcharged, so the draft asks for a
+            # credit. Product-level, with the affected sites named so LWC can
+            # find the invoices.
+            "fb_mismatches": [
+                {"product": b.product_code, "desc": b.product_desc,
+                 "expected": round(b.expected, 2), "charged": round(b.actual, 2),
+                 "delta_unit": round(b.delta_per_unit, 2), "qty": b.total_qty,
+                 "delta_total": round(b.total_delta, 2),
+                 "sites": [{"site": sid, "name": name, "qty": q}
+                           for sid, (name, q, _d) in sorted(b.site_totals.items())]}
+                for b in s.fb_blocks
+            ],
             "missing_products": [_email_missing_row(r, policy) for r in s.products_not_on_master],
             "missing_prices": [_email_missing_row(r, policy) for r in s.tenant_price_missing],
         }
         parts.append("<h2>5. Draft email to LWC</h2>")
         parts.append(
             "<p class='sub'>Auto-drafted from the price mismatches and missing items above &mdash; "
-            "the tenant prices for LWC to correct, plus our <strong>required prices</strong> for "
-            "anything missing, to instruct rather than ask. Accepting an item into the master removes "
-            "it from this draft. Edit freely, then copy or open in your mail app.</p>"
+            "the tenant prices for LWC to correct, the <strong>FB cost prices</strong> to correct and "
+            "credit, plus our <strong>required prices</strong> for anything missing, to instruct rather "
+            "than ask. Accepting an item into the master removes it from this draft. Edit freely, then "
+            "copy or open in your mail app.</p>"
         )
         parts.append(
             "<div class='email-draft'>"
@@ -923,13 +939,17 @@ _FINDINGS_JS = """<script>
 
   function buildBody() {
     var e = CFG.email, L = [];
+    // Sections are numbered as they are emitted, so an empty one never leaves a
+    // gap in the sequence.
+    var sec = 0;
+    function n() { return ++sec; }
     L.push('Hi,');
     L.push('');
     L.push('Reviewing ' + e.file + ', the following need your attention:');
     L.push('');
     var tmis = (e.tenant_mismatches || []).filter(function (m) { return !accepted.has(m.site + '|' + m.product); });
     if (tmis.length) {
-      L.push('1) Tenant prices charged that differ from the agreed price - please correct these on your system:');
+      L.push(n() + ') Tenant prices charged that differ from the agreed price - please correct these on your system:');
       var total1 = 0;
       tmis.forEach(function (m) {
         total1 += Number(m.delta_total) || 0;
@@ -940,12 +960,38 @@ _FINDINGS_JS = """<script>
       L.push('   Total tenant-price discrepancy across the above: ' + money(Math.abs(total1)) + ' ' + (total1 >= 0 ? 'overcharged' : 'undercharged') + '.');
       L.push('');
     }
+    // FB cost (list) price mismatches: LWC's MASTER column vs our agreed list
+    // price. delta > 0 means they charged us above the agreed price.
+    var fbm = e.fb_mismatches || [];
+    if (fbm.length) {
+      L.push(n() + ') FB Taverns cost prices that differ from our agreed list price - please correct these on your system and credit the difference where we have been overcharged:');
+      var total2 = 0;
+      fbm.forEach(function (m) {
+        total2 += Number(m.delta_total) || 0;
+        var over = (Number(m.delta_total) || 0) >= 0;
+        var sites = m.sites || [];
+        L.push('   - ' + m.product + ' ' + m.desc + ': agreed ' + money(m.expected) +
+               ', charged ' + money(m.charged) + ' (' + money(Math.abs(m.delta_unit)) + '/unit ' +
+               (over ? 'above' : 'below') + ' the agreed price on ' + fmtQty(m.qty) + ' = ' +
+               money(Math.abs(m.delta_total)) + ' ' + (over ? 'overcharged' : 'undercharged') + ')');
+        if (sites.length) {
+          L.push('     Affected sites: ' + sites.map(function (s) {
+            return s.site + ' ' + s.name + ' (' + fmtQty(s.qty) + ')';
+          }).join('; '));
+        }
+      });
+      L.push('   Net FB cost-price discrepancy across the above: ' + money(Math.abs(total2)) + ' ' + (total2 >= 0 ? 'overcharged' : 'undercharged') + '.');
+      if (total2 > 0) {
+        L.push('   Please confirm the corrected prices and raise a credit for the overcharge.');
+      }
+      L.push('');
+    }
     var missing = [];
     (e.missing_products || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'not on our price list'; missing.push(y); });
     (e.missing_prices || []).forEach(function (x) { var y = {}; for (var k in x) y[k] = x[k]; y.kind = 'no agreed price for this site'; missing.push(y); });
     missing = missing.filter(function (x) { return !accepted.has(x.site + '|' + x.product); });
     if (missing.length) {
-      L.push('2) Please set the following tenant prices on your system:');
+      L.push(n() + ') Please set the following tenant prices on your system:');
       missing.forEach(function (x) {
         var line = '   - ' + x.site + ' ' + x.site_name + ' / ' + x.product + ' ' + x.desc + ': ';
         var amendedPrice = amended[x.site + '|' + x.product];
