@@ -477,12 +477,25 @@ class InvoiceLine:
     account_no: str = ""  # LWC customer account number (ACCOUNT NO column), if present
 
 
+class LwcParseError(ValueError):
+    """The uploaded LWC workbook can't be parsed (wrong sheet or columns).
+
+    Must stay a normal exception, never sys.exit(): parse_lwc_sales also runs
+    inside the web app's /upload route, where SystemExit escapes the route's
+    `except Exception` handler and kills the whole uvicorn worker (Render
+    "Exited with status 1", incident 2026-08-31)."""
+
+
+def _map_header(col) -> str:
+    clean = re.sub(r"\s+", " ", str(col).replace("\n", " ")).strip().upper()
+    return LWC_COLUMN_MAP.get(clean, clean.lower())
+
+
 def _normalise_lwc_columns(df: pd.DataFrame) -> pd.DataFrame:
-    new_cols = {}
-    for c in df.columns:
-        clean = re.sub(r"\s+", " ", str(c).replace("\n", " ")).strip().upper()
-        new_cols[c] = LWC_COLUMN_MAP.get(clean, clean.lower())
-    return df.rename(columns=new_cols)
+    return df.rename(columns={c: _map_header(c) for c in df.columns})
+
+
+_REQUIRED_LINE_COLS = {"site_id", "product_code", "invoice_date", "qty", "unit_price", "master_price"}
 
 
 def _find_line_sheet(xl: pd.ExcelFile) -> str:
@@ -492,9 +505,21 @@ def _find_line_sheet(xl: pd.ExcelFile) -> str:
     for s in xl.sheet_names:
         if "Date" in s and "Pivot" not in s:
             return s
-    sys.exit(
+    # LWC re-saves sometimes land the data on an arbitrarily named tab (e.g.
+    # "scratch120151", 2026-08-31) with the columns intact — fall back to
+    # recognising the line sheet by its header row.
+    for s in xl.sheet_names:
+        try:
+            header = pd.read_excel(xl, sheet_name=s, nrows=0)
+        except Exception:
+            continue
+        if _REQUIRED_LINE_COLS <= {_map_header(c) for c in header.columns}:
+            return s
+    raise LwcParseError(
         f"No line-level sheet found in workbook. Sheets present: {xl.sheet_names}. "
-        "Older 'Diff. From Master' format is not yet supported in Phase 1."
+        "Expected an 'FB_Taverns_Del_Date'-style sheet, or any sheet with the standard "
+        "columns (SITE ID, PRODUCT CODE, DATE, QTY, UNIT, MASTER). Older 'Diff. From "
+        "Master' format is not yet supported in Phase 1."
     )
 
 
@@ -504,10 +529,9 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
         df = pd.read_excel(xl, sheet_name=sheet)
     df = _normalise_lwc_columns(df)
 
-    required = {"site_id", "product_code", "invoice_date", "qty", "unit_price", "master_price"}
-    missing = required - set(df.columns)
+    missing = _REQUIRED_LINE_COLS - set(df.columns)
     if missing:
-        sys.exit(
+        raise LwcParseError(
             f"LWC file missing required columns: {missing}. Got: {list(df.columns)}"
         )
 
@@ -942,6 +966,8 @@ if __name__ == "__main__":
         # Surface a concise one-line message + non-zero exit for the CLI rather
         # than a full traceback. Imported lazily — airtable_io is only loaded in
         # --use-airtable / --to-airtable modes.
+        if isinstance(_e, LwcParseError):
+            raise SystemExit(str(_e))
         from airtable_io import AirtableError
         if isinstance(_e, AirtableError):
             raise SystemExit(f"Airtable error: {_e}")

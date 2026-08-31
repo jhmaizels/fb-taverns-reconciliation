@@ -59,6 +59,7 @@ from login_page import (  # noqa: E402
 )
 
 from reconcile import (  # noqa: E402
+    LwcParseError,
     parse_lwc_sales,
     reconcile_lines,
     parse_fb_cost_file,
@@ -814,6 +815,11 @@ def upload(
                     logger.info("captured %d site account numbers from %s", n_acct, original_name)
         except Exception:
             logger.exception("site account capture failed (non-fatal)")
+    except LwcParseError as e:
+        # Operator-actionable: the workbook itself is the problem (wrong sheet
+        # name or missing columns), so show the specific message.
+        logger.warning("LWC file rejected: %s", e)
+        return _error_page(str(e))
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
