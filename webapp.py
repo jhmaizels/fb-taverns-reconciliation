@@ -3024,9 +3024,9 @@ def _signoff_name(principal) -> str:
         v = getattr(principal, attr, None)
         if v and str(v).strip():
             return str(v).strip()
-    local = (getattr(principal, "email", "") or "").split("@")[0]
+    local = (getattr(principal, "email", "") or "").split("@")[0].split("+")[0]   # drop a +tag
     if "." in local:
-        return " ".join(part.capitalize() for part in local.split(".") if part)
+        return " ".join("-".join(p.capitalize() for p in part.split("-")) for part in local.split(".") if part)
     return (os.environ.get("TENNENTS_EMAIL_SIGNOFF") or "").strip()
 
 

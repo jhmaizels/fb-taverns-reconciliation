@@ -437,7 +437,15 @@ def test_render():
     _check("sign-off + minor threshold in config", cfg_n.get("signoff") == "James Maizels" and cfg_n.get("minorGbp") == 5.0,
            str((cfg_n.get("signoff"), cfg_n.get("minorGbp"))))
     _check("over-discount opt-in checkbox rendered", "id='t-email-include-over'" in html_n)
-    _check("over-discounts stay in the config (page keeps them; draft excludes by default)", "over" in cfg_n["email"])
+    s_over = _summary_with_findings()
+    s_over.discount_mismatches.append(tn.DiscountMismatch("11110001", "STANDARD ARMS", "090425", "T.LAGER 11G KEG", "agreed rate",
+                                                          314.33, 344.58, -30.25, 1.0, 0.3055, -9.24))
+    html_o = tn.render_summary_html(s_over, accept_url="/x", can_accept=True, source_file="Aug26.xlsx", master=m)
+    cfg_o = json.loads(html_o.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
+                       .replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
+    _check("an over-discount lands in the config over list (page keeps them; draft excludes by default)",
+           [x["sku"] for x in cfg_o["email"]["over"]] == ["090425"] and all(x["sku"] != "090425" for x in cfg_o["email"]["short"]),
+           str(cfg_o["email"]["over"]))
     _check("no sign-off when none is known", '"signoff": ""' in html_a)
 
     empty = tn.TennentsSummary("f.xlsx", "2026-08", 1, "v", [], [], [], [], [], [], [], [], [], [], [], [])
@@ -493,11 +501,105 @@ def test_export_multi_alt():
     _check("category resolves via the SECOND alt code", tpe._category(z) == "Standard Lager", tpe._category(z))
 
 
+def test_email_js():
+    """Drive the real draft-email JS (tn._TENNENTS_JS) under node with a minimal DOM
+    shim — the grouping / materiality / opt-in logic lives client-side and was
+    otherwise untested. Skips (loudly) if node isn't on PATH."""
+    print("\n-- draft email JS (node)")
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        print("  [skip] node not on PATH — JS grouping not exercised here")
+        return
+    js = tn._TENNENTS_JS
+    js = js[js.index("<script>") + len("<script>"): js.rindex("</script>")]
+    shim = r"""
+const fs = require('fs');
+const CFG = fs.readFileSync(process.argv[2], 'utf8');
+const listeners = {};
+function el(id, extra) {
+  return Object.assign({ id: id, value: '', textContent: '', checked: false, style: {}, options: [],
+    setAttribute: function () {},
+    addEventListener: function (ev, fn) { (listeners[id + ':' + ev] = listeners[id + ':' + ev] || []).push(fn); } }, extra || {});
+}
+const els = {
+  'tennents-findings-config': el('cfg', { textContent: CFG }),
+  't-email-body': el('t-email-body'), 't-email-subject': el('t-email-subject', { value: 'S' }),
+  't-email-mailto': el('t-email-mailto'), 't-email-include-over': el('t-email-include-over'),
+  't-email-copy': el('t-email-copy'), 't-email-copied': el('t-email-copied'), 't-email-dirty-note': el('t-email-dirty-note'),
+};
+global.document = { getElementById: function (id) { return els[id] || null; }, querySelectorAll: function () { return []; },
+  createElement: function () { return el('x'); }, body: { appendChild: function () {}, removeChild: function () {} } };
+global.window = { alert: function () {}, confirm: function () { return true; } };
+global.navigator = {};
+eval(fs.readFileSync(process.argv[3], 'utf8'));
+const fire = function (id, ev) { (listeners[id + ':' + ev] || []).forEach(function (f) { f(); }); };
+const out = { def: els['t-email-body'].value };
+els['t-email-include-over'].checked = true; fire('t-email-include-over', 'change');
+out.withOver = els['t-email-body'].value;
+els['t-email-include-over'].checked = false; fire('t-email-include-over', 'change');
+els['t-email-body'].value = 'EDITED'; fire('t-email-body', 'input');
+els['t-email-include-over'].checked = true; fire('t-email-include-over', 'change');
+out.afterDirtyToggle = els['t-email-body'].value;
+out.dirtyNote = els['t-email-dirty-note'].style.display || '';
+process.stdout.write(JSON.stringify(out));
+"""
+    row = lambda acct, site, sku, desc, exp, act, dbrl, brl, dtot: {
+        "account": acct, "site": site, "sku": sku, "desc": desc, "expected": exp, "actual": act,
+        "delta_brl": dbrl, "barrels": brl, "delta_total": dtot}
+    cfg = {"acceptUrl": "/x", "sourceFile": "f.xlsx", "canAccept": True, "signoff": "James", "minorGbp": 5.0,
+           "email": {"file": "f.xlsx", "period": "2026-08",
+                     "short": [
+                         # same SKU + applied rate but DIFFERENT agreed rates (one site reconciles against an
+                         # exception's Loaded value) -> must NOT merge into one line with one 'agreed' figure
+                         row("1", "EXC PUB", "401175", "Blackthorn Dry 50L Keg", 290.0, 280.0, 10.0, 0.61, 6.10),
+                         row("2", "PLAIN PUB", "401175", "Blackthorn Dry 50L Keg", 293.49, 280.0, 13.49, 0.61, 8.23),
+                         # three sites whose 2dp totals sum to exactly £5.00 -> a major line, not rolled up
+                         row("3", "A", "X1", "X One", 100.0, 99.0, 1.0, 0.01, 0.01),
+                         row("4", "B", "X1", "X One", 100.0, 99.0, 1.0, 4.02, 4.02),
+                         row("5", "C", "X1", "X One", 100.0, 99.0, 1.0, 0.97, 0.97),
+                         # a genuine minor
+                         row("6", "D", "Y1", "Y One", 50.0, 49.0, 1.0, 0.5, 0.50),
+                     ],
+                     "over": [row("7", "E", "Z1", "Z One", 100.0, 130.0, -30.0, 1.0, -30.0)],
+                     "pending": [], "resolved": [], "no_rate": [], "not_on_master": [],
+                     "retro_arith": [], "line_arith": []}}
+    with tempfile.TemporaryDirectory() as d:
+        cp, jp, sp = os.path.join(d, "cfg.json"), os.path.join(d, "email.js"), os.path.join(d, "shim.js")
+        open(cp, "w", encoding="utf-8").write(json.dumps(cfg))
+        open(jp, "w", encoding="utf-8").write(js)
+        open(sp, "w", encoding="utf-8").write(shim)
+        r = subprocess.run([node, sp, cp, jp], capture_output=True, text=True, encoding="utf-8")
+        if r.returncode != 0:
+            _check("node harness ran", False, r.stderr[-500:])
+            return
+        out = json.loads(r.stdout)
+    body = out["def"]
+    lines = [l for l in body.split("\n") if l.startswith("   - ")]
+    exc = [l for l in lines if "401175" in l]
+    _check("mixed agreed rates are NOT merged: two lines, each with its own 'vs agreed'",
+           len(exc) == 2 and any("vs agreed £290.00/brl" in l for l in exc) and any("vs agreed £293.49/brl" in l for l in exc), str(exc))
+    x_lines = [l for l in lines if "X One" in l]
+    _check("a 3-site group totalling exactly £5.00 is a major line, not rolled up",
+           len(x_lines) == 1 and x_lines[0].startswith("   - X One (X1)") and "£5.00 short" in x_lines[0], str(x_lines))
+    _check("a genuine minor is rolled up", any("Plus 1 minor variance under £5.00 each, £0.50 in total" in l for l in lines), str(lines[-1:]))
+    _check("total short = sum of ALL short rows incl. minors", "Total short across the above: £19.83." in body, body[-300:])
+    _check("over section absent by default, present when ticked",
+           "ABOVE the agreed rate" not in body and "ABOVE the agreed rate" in out["withOver"] and "Z One (Z1)" in out["withOver"])
+    _check("sign-off appended", body.rstrip().endswith("Thanks,\nJames"), body[-40:])
+    _check("hand-edited body is not clobbered by the toggle; dirty note shown",
+           out["afterDirtyToggle"] == "EDITED" and out["dirtyNote"] == "inline", str((out["afterDirtyToggle"][:20], out["dirtyNote"])))
+
+
 if __name__ == "__main__":
     test_codes_and_suggest()
     test_accept_primitive()
     test_preserve_on_replace()
     test_render()
     test_export_multi_alt()
+    test_email_js()
     print("\nALL PASS" if PASS else "\nFAILURES")
     sys.exit(0 if PASS else 1)

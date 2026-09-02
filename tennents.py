@@ -782,33 +782,41 @@ _TENNENTS_JS = """<script>
 
     // sign +1: FB got LESS discount than agreed (short); -1: more (over)
     function rateSection(title, items, sign) {
-      // bucket the applied rate to the nearest 50p so penny-level rounding across sites can't split a group
-      var groups = groupBy(items, function (m) { return m.sku + '|' + (Math.round(Number(m.actual) * 2) / 2).toFixed(2); });
+      // One group per SKU + AGREED rate + applied rate (bucketed to the nearest 50p so penny-level
+      // rounding across sites can't split a group). The agreed rate is part of the key because a
+      // site with an open exception reconciles against the exception's Loaded value, not the
+      // master rate - two sites can share a SKU and an applied rate yet have different agreed rates.
+      var groups = groupBy(items, function (m) { return m.sku + '|' + Number(m.expected).toFixed(2) + '|' + (Math.round(Number(m.actual) * 2) / 2).toFixed(2); });
       groups.sort(function (a, b) { return Math.abs(sum(b, 'delta_total')) - Math.abs(sum(a, 'delta_total')); });
-      var major = [], minors = [];
-      groups.forEach(function (g) { (Math.abs(sum(g, 'delta_total')) < minor ? minors : major).push(g); });
+      var major = [], minors = [], minorP = Math.round(minor * 100);
+      groups.forEach(function (g) {   // compare in pennies: a float fold of 2dp values can land at 4.999...
+        (Math.round(Math.abs(sum(g, 'delta_total')) * 100) < minorP ? minors : major).push(g);
+      });
       if (!major.length && !minors.length) return;
       var word = sign > 0 ? 'short' : 'over';
       L.push(n() + ') ' + title);
+      // per-brl from the reconciliation's own exact figures (a range only when it varies within the
+      // 50p bucket), never re-derived from rounded totals
+      function perBrlText(g) {
+        var dlo = Infinity, dhi = -Infinity;
+        g.forEach(function (x) { var d = Math.abs(Number(x.delta_brl)); if (d < dlo) dlo = d; if (d > dhi) dhi = d; });
+        if (!isFinite(dlo)) { dlo = dhi = Math.abs(Number(g[0].expected) - Number(g[0].actual)); }
+        return (dhi - dlo) > 0.005 ? (money(dlo) + ' to ' + money(dhi)) : money(dlo);
+      }
       major.forEach(function (g) {
-        var m = g[0], lo = Infinity, hi = -Infinity, dlo = Infinity, dhi = -Infinity;
+        var m = g[0], lo = Infinity, hi = -Infinity;
         var brls = sum(g, 'barrels'), tot = Math.abs(sum(g, 'delta_total'));
-        g.forEach(function (x) {
-          var a = Number(x.actual), d = Math.abs(Number(x.delta_brl));
-          if (a < lo) lo = a; if (a > hi) hi = a; if (d < dlo) dlo = d; if (d > dhi) dhi = d;
-        });
+        g.forEach(function (x) { var a = Number(x.actual); if (a < lo) lo = a; if (a > hi) hi = a; });
         var applied = (hi - lo) > 0.005 ? (money(lo) + ' to ' + money(hi)) : money(m.actual);
-        // per-brl from the reconciliation's own exact figures, never re-derived from rounded totals
-        var perBrl = (dhi - dlo) > 0.005 ? (money(dlo) + ' to ' + money(dhi)) : money(dlo);
         L.push('   - ' + label(m) + ': applied ' + applied + '/brl vs agreed ' + money(m.expected) + '/brl (' +
-               perBrl + '/brl ' + word + ') at ' + fmtSites(g) + '; ' + brl(brls) + ', ' + money(tot) + ' ' + word);
+               perBrlText(g) + '/brl ' + word + ') at ' + fmtSites(g) + '; ' + brl(brls) + ', ' + money(tot) + ' ' + word);
       });
       if (minors.length) {
         var mt = 0;
         minors.forEach(function (g) { mt += Math.abs(sum(g, 'delta_total')); });
         L.push('   - Plus ' + minors.length + ' minor variance' + (minors.length === 1 ? '' : 's') + ' under ' + money(minor) +
                ' each, ' + money(mt) + ' in total (details on the reconciliation page): ' +
-               minors.map(function (g) { return label(g[0]) + ' ' + money(Math.abs(g[0].delta_brl)) + '/brl ' + word + ' at ' + fmtSites(g); }).join('; '));
+               minors.map(function (g) { return label(g[0]) + ' ' + perBrlText(g) + '/brl ' + word + ' at ' + fmtSites(g); }).join('; '));
       }
       L.push('   Total ' + word + ' across the above: ' + money(Math.abs(sum(items, 'delta_total'))) + '.');
       L.push('');
@@ -1440,7 +1448,13 @@ def render_summary_html(
     def _pname(code: str, fallback: str) -> str:
         # The master's product name (covers both containers of a multi-container
         # SKU) rather than the report's truncated description ('Magners Dark Fru').
-        sku = master.find_sku(code) if master is not None else None
+        sku = None
+        if master is not None:
+            # exception rows carry the RAW listing, which may be compound ('400751/400557')
+            for part in str(code).replace("\\", "/").split("/"):
+                sku = master.find_sku(part.strip()) if part.strip() else None
+                if sku is not None:
+                    break
         name = (sku.product or sku.brand) if sku is not None else ""
         return name or fallback
 
