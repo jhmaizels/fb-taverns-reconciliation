@@ -1318,6 +1318,176 @@ def _opt(fields: dict, name: str, value) -> None:
         fields[name] = value
 
 
+# Rows written from the reconciliation FINDINGS page carry this source prefix.
+# They exist only in Airtable (the operator's workbook copy won't have them), so
+# replace_tennents_master preserves them across a workbook re-upload.
+FINDINGS_SOURCE_PREFIX = "findings:"
+
+
+def _split_codes(v) -> list[str]:
+    return [c.strip().upper() for c in str(v or "").replace("\\", "/").split("/") if c.strip()]
+
+
+def _same_code(a: str, b: str) -> bool:
+    """Equal SKU codes, tolerating Excel/pandas leading-zero drift (090425 vs 90425)
+    the same way TennentsMaster.find_sku does."""
+    a, b = str(a or "").strip().upper(), str(b or "").strip().upper()
+    return a == b or (a.isdigit() and b.isdigit() and a.lstrip("0") == b.lstrip("0"))
+
+
+def _finite(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _tennents_sku_lookup() -> dict[str, dict]:
+    """{sku_code (upper): {id, alt_code, correct_total_per_brl, source}} for the
+    findings-accept and preserve-on-replace paths."""
+    out: dict[str, dict] = {}
+    for rec in _list_all(T["TennentsSkuMaster"],
+                         fields=["sku_code", "alt_code", "correct_total_per_brl", "hold_per_brl", "source"]):
+        f = rec["fields"]
+        code = str(f.get("sku_code", "") or "").strip().upper()
+        if code:
+            out[code] = {
+                "id": rec["id"],
+                "alt_code": f.get("alt_code", "") or "",
+                "correct_total_per_brl": f.get("correct_total_per_brl"),
+                "hold_per_brl": float(f.get("hold_per_brl") or 0.0),
+                "source": f.get("source", "") or "",
+            }
+    return out
+
+
+def accept_tennents_sku(
+    mode: str, sku_code: str, actor: str, source_file: str, *,
+    link_to: str | None = None, sku_desc: str = "",
+    charged_total=None, container: str = "",
+) -> dict:
+    """Accept a Tennents findings row into the live SKU master. Backs the
+    findings page's Add-to-master buttons (admin-gated at the route). Modes:
+
+      link     — the report code is a NEW CODE for an EXISTING SKU (Tennents
+                 re-code containers: Blackthorn Dry 401175→401220, Heverlee 30L
+                 401187) → append it to that SKU's alt_code. The common case.
+      new      — a genuinely new product → create a SKU_Master row whose agreed
+                 rate = the discount Tennents actually charged (must be > 0: a
+                 £0 charge would assert £0 is the agreed rate). WSP is NOT
+                 invented — left for the workbook once Tennents confirm.
+      set_rate — SKU exists with no agreed rate (RATE TBC) → set the rate to the
+                 charged discount.
+
+    Rate/link writes are estate-wide (SKU_Master is per-SKU, not per-site).
+    Touched rows are stamped source 'findings:<actor> <file>' so a later
+    workbook re-upload preserves them. Idempotent. Raises ValueError on bad
+    input; returns a dict describing what happened."""
+    code = str(sku_code or "").strip().upper()
+    if not code:
+        raise ValueError("sku_code is required")
+    stamp = f"{FINDINGS_SOURCE_PREFIX}{(actor or '').strip()} {(source_file or '').strip()}".strip()
+    lookup = _tennents_sku_lookup()
+    tid = T["TennentsSkuMaster"]
+    # Every code any SKU already claims (primary OR alt) -> the owning primary.
+    # A code belongs to exactly one SKU; the guards below keep it that way even
+    # when the findings page is stale (another admin / a workbook re-upload).
+    owner: dict[str, str] = {}
+
+    def _claim(c: str, prim: str) -> None:
+        # register leading-zero variants too, so a drifted report code can't
+        # slip past the guards as a "new" SKU
+        for v in ((c, c.zfill(6), c.lstrip("0")) if c.isdigit() else (c,)):
+            if v:
+                owner.setdefault(v, prim)
+
+    for prim, row_ in lookup.items():
+        _claim(prim, prim)
+        for a in _split_codes(row_["alt_code"]):
+            _claim(a, prim)
+    stale = " — re-run the reconciliation (this page is stale)"
+
+    if mode == "link":
+        target = str(link_to or "").strip().upper()
+        if not target:
+            raise ValueError("choose the existing SKU to link to")
+        row = lookup.get(target)
+        if row is None:
+            raise ValueError(f"SKU {target!r} is not on the master")
+        alts = _split_codes(row["alt_code"])
+        if code == target or code in alts:
+            return {"action": "already", "sku_code": target, "alt_code": row["alt_code"]}
+        own = owner.get(code)
+        if own is not None and own == target:
+            return {"action": "already", "sku_code": target, "alt_code": row["alt_code"]}
+        if own is not None and _same_code(own, code):
+            raise ValueError(f"{code} is already a SKU of its own — set its rate instead")
+        if own is not None:
+            raise ValueError(f"{code} is already an alt code of SKU {own}{stale}")
+        new_alt = "/".join(alts + [code])
+        _batch([{"id": row["id"], "fields": {
+            "alt_code": new_alt, "source": stamp,
+            "notes": f"Alt code {code} linked from findings ({source_file}).",
+        }}], "update", tid)
+        return {"action": "linked", "sku_code": target, "alt_code": new_alt}
+
+    total = _finite(charged_total)
+    if mode == "set_rate":
+        row = lookup.get(code)
+        if row is None:
+            raise ValueError(f"SKU {code!r} is not on the master")
+        if total is None or total <= 0:
+            raise ValueError("a positive charged discount is required")
+        cur = _finite(row.get("correct_total_per_brl"))
+        if cur is not None:
+            if abs(cur - total) < 0.005:
+                return {"action": "already", "sku_code": code, "correct_total_per_brl": total}
+            # Only a RATE-TBC row may be filled from findings. Never overwrite an
+            # agreed rate with one month's charged figure — a stale page, or a
+            # rate confirmed in the workbook since this report was uploaded.
+            raise ValueError(f"{code} already has an agreed rate of £{cur:.2f}/brl (charged £{total:.2f}) — "
+                             "change it in the workbook and re-upload, or re-run the reconciliation")
+        # base + hold must equal the total (the master arithmetic check), so net
+        # the row's existing Mar-26 hold out of the charged total.
+        hold = float(row.get("hold_per_brl") or 0.0)
+        _batch([{"id": row["id"], "fields": {
+            "correct_total_per_brl": total, "contract_base_per_brl": round(total - hold, 2),
+            "source": stamp,
+            "notes": f"Rate set to the charged £{total:.2f}/brl from findings ({source_file}). Confirm with Tennents.",
+        }}], "update", tid)
+        return {"action": "rate_set", "sku_code": code, "correct_total_per_brl": total}
+
+    if mode == "new":
+        own = owner.get(code)
+        if own is not None and _same_code(own, code):
+            # already on the master (incl. leading-zero drift) — fill a TBC rate only
+            return accept_tennents_sku("set_rate", own, actor, source_file, charged_total=charged_total)
+        if own is not None:
+            raise ValueError(f"{code} is already an alt code of SKU {own}{stale}")
+        if total is None or total <= 0:
+            raise ValueError("a positive charged discount is required to add a new SKU "
+                             "(charged £0: link it to the existing SKU instead)")
+        fields = {
+            "sku_code": code,
+            "product": (sku_desc or code).strip(),
+            "on_contract": False,
+            "hold_per_brl": 0.0,
+            "correct_total_per_brl": total,
+            "contract_base_per_brl": total,
+            "source": stamp,
+            "source_file": source_file,
+            "notes": f"Added from findings ({source_file}); agreed rate = the discount charged. Confirm with Tennents.",
+        }
+        _opt(fields, "container", (container or "").strip())
+        _batch([{"fields": fields}], "create", tid)
+        return {"action": "created", "sku_code": code, "correct_total_per_brl": total}
+
+    raise ValueError(f"unknown mode {mode!r}")
+
+
 def load_tennents_master():
     """Load the Tennents master workbook mirror as a TennentsMaster."""
     from tennents_master import SkuException, SiteInfo, SitePrice, SkuRate, TennentsMaster
@@ -1411,11 +1581,37 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
     TennentsMaster. Covers four tables — TennentsSkuMaster / TennentsSiteMaster /
     TennentsSiteSkuExceptions, plus TennentsSitePrices (the per-site off-invoice
     layer), which is touched ONLY when the schema has it AND the parsed workbook
-    carried a Site_Prices sheet (else the stored layer is preserved). Returns
-    (deleted, created) across all tables written.
+    carried a Site_Prices sheet (else the stored layer is preserved). SKU rows
+    added/changed from the findings page (source 'findings:…') are PRESERVED
+    across the wipe (re-created if absent from the workbook; alt codes unioned
+    and a findings rate kept when the workbook row has none). Returns
+    (deleted, created, preserved).
     """
     deleted = 0
     created = 0
+    preserved = 0
+
+    # In-app additions made from the findings page (source 'findings:…') exist
+    # ONLY in Airtable — the operator's workbook copy won't carry them. Snapshot
+    # them BEFORE the wipe and re-apply AFTER the recreate so a workbook
+    # re-upload can't silently erase an accepted SKU, a linked alt code or a
+    # rate set from findings. The findings stamp is kept on re-applied rows so
+    # they survive the next re-upload too.
+    inapp_rows = [
+        rec["fields"] for rec in _list_all(T["TennentsSkuMaster"])
+        if str(rec["fields"].get("source", "") or "").startswith(FINDINGS_SOURCE_PREFIX)
+    ]
+    if inapp_rows:
+        # These rows exist ONLY in Airtable. Log a snapshot before the wipe so a
+        # replace that fails between wipe and re-apply is recoverable by hand.
+        logger.warning(
+            "replace_tennents_master: %d findings-stamped SKU row(s) about to be wiped and re-applied: %s",
+            len(inapp_rows),
+            json.dumps([{k: f.get(k) for k in (
+                "sku_code", "alt_code", "product", "container", "correct_total_per_brl",
+                "contract_base_per_brl", "hold_per_brl", "source", "notes")} for f in inapp_rows],
+                default=str),
+        )
 
     deleted += _wipe_table(T["TennentsSkuMaster"], "sku_code")
     payload = []
@@ -1440,7 +1636,74 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
         _opt(fields, "source", s.source)
         _opt(fields, "notes", s.notes)
         payload.append({"fields": fields})
-    created += len(_batch(payload, "create", T["TennentsSkuMaster"])) if payload else 0
+    created_recs = _batch(payload, "create", T["TennentsSkuMaster"]) if payload else []
+    created += len(created_recs)
+
+    by_code = {
+        str(r.get("fields", {}).get("sku_code", "") or "").strip().upper(): r
+        for r in created_recs
+    }
+    # Every code the fresh workbook rows claim (primary + '/'-joined alts) -> the
+    # owning primary. A code belongs to exactly one SKU: where the workbook now
+    # assigns a findings code elsewhere, the WORKBOOK WINS (it is the editing
+    # surface) — never resurrect a second claimant or re-attach a stale alt,
+    # which would leave one code on two rows with an order-dependent rate.
+    wb_claimed: dict[str, str] = {}
+    for r in created_recs:
+        wf = r.get("fields", {})
+        prim = str(wf.get("sku_code", "") or "").strip().upper()
+        for c in [prim] + _split_codes(wf.get("alt_code", "")):
+            if c:
+                wb_claimed.setdefault(c, prim)
+
+    reapply_create: list[dict] = []
+    reapply_patch: list[dict] = []
+    absorbed = 0
+    for f in inapp_rows:
+        code = str(f.get("sku_code", "") or "").strip().upper()
+        if not code:
+            continue
+        rec = by_code.get(code)
+        if rec is None:
+            if code in wb_claimed:
+                # The workbook now carries this code as another SKU's alt — it has
+                # absorbed the in-app row; do not re-create a second claimant.
+                absorbed += 1
+                continue
+            # The workbook doesn't know this in-app SKU at all → re-create it,
+            # minus any of ITS alt codes the workbook has since assigned elsewhere.
+            keep = {k: v for k, v in f.items() if k not in ("version", "source_file")}
+            keep["version"] = master.version
+            keep["source_file"] = source
+            own_alts = [a for a in _split_codes(f.get("alt_code", "")) if a not in wb_claimed]
+            if own_alts:
+                keep["alt_code"] = "/".join(own_alts)
+            else:
+                keep.pop("alt_code", None)
+            reapply_create.append({"fields": keep})
+            preserved += 1
+            continue
+        wb = rec.get("fields", {})
+        patch: dict = {}
+        wb_alts = _split_codes(wb.get("alt_code", ""))
+        merged = wb_alts + [a for a in _split_codes(f.get("alt_code", ""))
+                            if a not in wb_alts and wb_claimed.get(a, code) == code]
+        if merged != wb_alts:
+            patch["alt_code"] = "/".join(merged)          # union: keep linked codes
+        if wb.get("correct_total_per_brl") is None and f.get("correct_total_per_brl") is not None:
+            patch["correct_total_per_brl"] = f["correct_total_per_brl"]   # keep a findings rate
+            if f.get("contract_base_per_brl") is not None:
+                patch["contract_base_per_brl"] = f["contract_base_per_brl"]
+        if patch:
+            patch["source"] = f.get("source", "")
+            reapply_patch.append({"id": rec["id"], "fields": patch})
+            preserved += 1
+    if reapply_create:
+        created += len(_batch(reapply_create, "create", T["TennentsSkuMaster"]))
+    if reapply_patch:
+        _batch(reapply_patch, "update", T["TennentsSkuMaster"])
+    if absorbed:
+        logger.info("replace_tennents_master: %d findings SKU(s) now carried by the workbook as alt codes — not re-created", absorbed)
 
     deleted += _wipe_table(T["TennentsSiteMaster"], "account")
     payload = []
@@ -1500,7 +1763,7 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
             payload.append({"fields": fields})
         created += len(_batch(payload, "create", T["TennentsSitePrices"])) if payload else 0
 
-    return deleted, created
+    return deleted, created, preserved
 
 
 def get_tennents_master_info() -> dict:

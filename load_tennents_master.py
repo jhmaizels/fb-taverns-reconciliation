@@ -45,8 +45,9 @@ def main(argv: list[str]) -> int:
             print(f"    {s.sku_code} {s.product}: {s.implied_total:.2f} vs {s.correct_total_per_brl:.2f}")
 
     from airtable_io import replace_tennents_master  # import after parse — needs env
-    deleted, created = replace_tennents_master(master, source=os.path.basename(path))
-    print(f"\nAirtable updated: {deleted} rows deleted, {created} created.")
+    deleted, created, preserved = replace_tennents_master(master, source=os.path.basename(path))
+    print(f"\nAirtable updated: {deleted} rows deleted, {created} created"
+          f"{f', {preserved} in-app change(s) preserved' if preserved else ''}.")
     print("This workbook is now the primary Tennents price file.")
     return 0
 

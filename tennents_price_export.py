@@ -37,6 +37,7 @@ from tennents_master import (
     SkuRate,
     TennentsMaster,
     keg_brl_factor,
+    sku_codes,
 )
 
 # Column layout. Each site sheet stacks TWO purpose-built sections that share
@@ -121,10 +122,7 @@ _CATEGORY_KEYWORDS = [
 
 
 def _category(sku: SkuRate) -> str:
-    for code in (sku.sku_code, sku.alt_code):
-        if not code:
-            continue
-        u = str(code).strip().upper()
+    for u in sku_codes(sku):          # primary + EVERY alt (alt_code may be '/'-joined)
         for cand in (u, u.zfill(6), u.lstrip("0")):
             if cand in _SKU_CATEGORY:
                 return _SKU_CATEGORY[cand]
@@ -198,9 +196,11 @@ def _price_line(master: TennentsMaster, site: SiteInfo, sku: SkuRate) -> dict:
         "note": "",
     }
 
-    ex = master._exception_index.get((site.account, sku.sku_code.strip().upper()))
-    if ex is None and sku.alt_code:
-        ex = master._exception_index.get((site.account, sku.alt_code.strip().upper()))
+    ex = None
+    for code in sku_codes(sku):       # exceptions key on the RAW code — try each alt too
+        ex = master._exception_index.get((site.account, code))
+        if ex is not None:
+            break
     if ex is not None and ex.loaded_total_per_brl is not None:
         note_bits.append(f"Correction pending — currently loaded £{ex.loaded_total_per_brl:,.2f}/brl")
     if site.is_managed:

@@ -50,6 +50,55 @@ LITRES_PER_BRL = 163.659            # 36 imp gal × 4.54609 L/gal
 _LITRES_PER_GALLON = 4.54609
 
 
+def sku_codes(s: "SkuRate") -> list[str]:
+    """Primary + every alt code, upper-cased. alt_code may hold SEVERAL codes,
+    "/"-separated — Tennents re-code containers (Heverlee 400217/401187), and the
+    findings page's "Link to existing SKU" appends the new code there."""
+    out = [str(s.sku_code).strip().upper()] if s.sku_code else []
+    for c in str(s.alt_code or "").replace("\\", "/").split("/"):
+        c = c.strip().upper()
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+_DESC_STOP = {"keg", "kegs", "the", "and", "a", "of", "x", "brl", "case"}
+
+
+def _desc_tokens(text: str) -> set[str]:
+    """Brand/product words only — sizes, ABVs and pack words are dropped so
+    'Blackthorn Dry 5% 50L Keg' and 'Blackthorn Dry 50L Keg' compare equal."""
+    out: set[str] = set()
+    for t in re.split(r"[^a-z0-9]+", (text or "").lower()):
+        if not t or t in _DESC_STOP:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?%?|\d+l|\d+g|\d+lt|\d+ltr", t):
+            continue
+        out.add(t)
+    return out
+
+
+def suggest_sku(master: "TennentsMaster", desc: str) -> "SkuRate | None":
+    """Best existing SKU for an unknown report description (Jaccard overlap on
+    brand + product words) — preselects the 'Link to existing SKU' dropdown on
+    the findings page. None when nothing shares a word."""
+    want = _desc_tokens(desc)
+    if not want:
+        return None
+    best, best_score = None, 0.0
+    for s in master.skus:
+        have = _desc_tokens(f"{s.brand} {s.product}")
+        if not have:
+            continue
+        overlap = len(want & have)
+        if not overlap:
+            continue
+        score = overlap / len(want | have)
+        if score > best_score:
+            best, best_score = s, score
+    return best
+
+
 # ---------- row shapes ----------
 
 @dataclass
@@ -182,9 +231,8 @@ class TennentsMaster:
     def reindex(self) -> None:
         self._sku_index = {}
         for s in self.skus:
-            for code in (s.sku_code, s.alt_code):
-                if code:
-                    self._sku_index[str(code).strip().upper()] = s
+            for code in sku_codes(s):
+                self._sku_index[code] = s
 
         self._site_by_account = {
             s.account: s for s in self.sites if s.account and s.account.upper() != "TBC"

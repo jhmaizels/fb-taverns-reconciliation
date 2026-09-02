@@ -98,6 +98,7 @@ from airtable_io import (  # noqa: E402
     upsert_products_with_retros,
     load_tennents_master,
     replace_tennents_master,
+    accept_tennents_sku,
     get_tennents_master_info,
     list_tennents_monthly_volumes,
     write_tennents_findings,
@@ -2965,7 +2966,7 @@ def upload_tennents_master(
             master = parse_master_workbook(tmp_path, source_name=original_name)
         except ValueError as e:
             return _error_page(escape(str(e)))
-        deleted, created = replace_tennents_master(master, source=original_name)
+        deleted, created, preserved = replace_tennents_master(master, source=original_name)
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
@@ -2976,6 +2977,12 @@ def upload_tennents_master(
             except OSError:
                 pass
 
+    preserved_note = (
+        f"<div class='result'><strong>{preserved} in-app change(s) preserved</strong> — SKUs, alt codes or "
+        f"rates accepted from the findings page that this workbook didn't carry were kept rather than wiped. "
+        f"Add them to the workbook when convenient (see <a href=\"{ext_url('/tennents/master')}\">Browse master</a>).</div>"
+        if preserved else ""
+    )
     no_rate = [s.sku_code for s in master.skus if s.correct_total_per_brl is None]
     open_exceptions = sum(1 for ex in master.exceptions if not ex.resolved)
     arith = master.arithmetic_errors()
@@ -2988,6 +2995,7 @@ def upload_tennents_master(
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents master replaced</h1>
+{preserved_note}
 {_tennents_master_banner_html()}
 {arith_warning}
 <div class="result">
@@ -3005,6 +3013,40 @@ def upload_tennents_master(
   <a class="button" href="{ext_url('/tennents')}" style="background:#666">Back to Tennents</a>
 </p>
 {PAGE_FOOT}"""
+
+
+@app.post("/tennents/accept-sku")
+async def tennents_accept_sku(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """Accept a Tennents findings row into the live SKU master — backs the
+    Tennents findings page's Add-to-master buttons (JSON for the in-page fetch).
+    Modes: link (a new report code for an existing SKU → alt code), new (create
+    at the charged rate), set_rate (fill a RATE-TBC SKU). Rows written from here
+    are stamped 'findings:' so a workbook re-upload preserves them."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+
+    def g(name: str) -> str:
+        return (form.get(name) or "").strip()
+
+    try:
+        result = await run_in_threadpool(
+            accept_tennents_sku, g("mode"), g("sku_code"), principal.email, g("source_file"),
+            link_to=g("link_to") or None, sku_desc=g("sku_desc"),
+            charged_total=g("charged_total") or None, container=g("container"),
+        )
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except Exception:
+        logger.exception("tennents accept-sku failed")
+        return JSONResponse(
+            {"ok": False, "error": "Could not update the master — the details have been logged."},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, **result})
 
 
 @app.post("/upload-tennents", response_class=HTMLResponse)
@@ -3055,7 +3097,13 @@ def upload_tennents(
             except OSError:
                 pass
 
-    summary_html = render_tennents_summary_html(summary)
+    summary_html = render_tennents_summary_html(
+        summary,
+        accept_url=ext_url("/tennents/accept-sku"),
+        can_accept=role_at_least(principal.role, "admin"),
+        source_file=original_name,
+        master=master,
+    )
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents reconciliation complete</h1>

@@ -209,6 +209,19 @@ Key facts:
   Rates/WSP from `SKU_Master`; per-site off-invoice from `TennentsSitePrices`
   (`tennents_price_export.py`). Managed sites = all off-invoice; bespoke split
   is not modelled (total only). NOT a master write.
+- **`POST /tennents/accept-sku`** (admin, JSON): the Tennents findings page's
+  Add-to-master buttons (LWC parity). `airtable_io.accept_tennents_sku` modes:
+  `link` — a new report code for an EXISTING SKU (the usual "unknown product":
+  Tennents re-code containers) → appended to that SKU's `alt_code`; `new` —
+  create a SKU_Master row whose agreed rate = the discount charged (must be
+  > 0; no WSP invented); `set_rate` — fill a RATE-TBC SKU. Estate-wide (SKU_Master
+  is per-SKU). Rows are stamped `source='findings:<actor> <file>'` and
+  **`replace_tennents_master` PRESERVES them across a workbook re-upload**
+  (re-creates rows absent from the workbook; unions alt codes; keeps a findings
+  rate when the workbook row has none) — the deliberate exception to wipe-and-
+  replace. The page also drafts an **email to Tennents** client-side (short
+  discounts to correct + credit, pending corrections, rates to confirm); accepted
+  SKUs drop out of it live.
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -287,7 +300,8 @@ NON-ZERO rate.
   resolved. Exceptions key on **(account, RAW sku code)** — a mis-load on the
   30L code says nothing about the 50L; a row covering both containers lists
   both codes (`"400751/400557"`). SKU-rate lookup, by contrast, resolves alt
-  codes (`09000X` → `090425`).
+  codes (`09000X` → `090425`); `alt_code` may hold SEVERAL codes, `/`-joined
+  (`400217/401187`) — `sku_codes()` indexes every one.
 - **Exception line outcomes:** actual ≈ Loaded → `tennents_exception_pending`
   (known state persists; NOT re-flagged as a mismatch; `(correct − actual) ×
   barrels` accrues as "short vs correct"); actual ≈ Correct →
@@ -336,6 +350,7 @@ medium `>=5` / low; over and paid-not-on-master medium.
 | `GET /tennents/master` | yes | Read-only browse of the master workbook mirror | — |
 | `POST /upload-tennents-master` | yes | **Tennents master workbook WIPE+replace** (admin) | **YES** |
 | `POST /upload-tennents` | yes | Tennents monthly reconcile | findings only |
+| `POST /tennents/accept-sku` | yes (admin) | Findings-page **Add to master** (JSON): `link` a new report code to an existing SKU (alt code), `new` at the charged rate, `set_rate` on a RATE-TBC SKU | **YES** (SKU_Master, findings-stamped) |
 
 Auth: single shared credential, `WEB_USERNAME` (default `admin`) /
 `WEB_PASSWORD`, constant-time compare. **If `WEB_PASSWORD` is unset the whole
