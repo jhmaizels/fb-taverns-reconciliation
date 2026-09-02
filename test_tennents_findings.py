@@ -567,6 +567,8 @@ process.stdout.write(JSON.stringify(out));
                      "over": [row("7", "E", "Z1", "Z One", 100.0, 130.0, -30.0, 1.0, -30.0)],
                      "pending": [], "resolved": [], "no_rate": [], "not_on_master": [],
                      "retro_arith": [], "line_arith": []}}
+    # one of the two alt-rate rows came through on Tennents' new code -> label says so, only on that line
+    cfg["email"]["short"][1]["delivered"] = ["401220"]
     with tempfile.TemporaryDirectory() as d:
         cp, jp, sp = os.path.join(d, "cfg.json"), os.path.join(d, "email.js"), os.path.join(d, "shim.js")
         open(cp, "w", encoding="utf-8").write(json.dumps(cfg))
@@ -582,6 +584,9 @@ process.stdout.write(JSON.stringify(out));
     exc = [l for l in lines if "401175" in l]
     _check("mixed agreed rates are NOT merged: two lines, each with its own 'vs agreed'",
            len(exc) == 2 and any("vs agreed £290.00/brl" in l for l in exc) and any("vs agreed £293.49/brl" in l for l in exc), str(exc))
+    _check("'delivered as' shown for an alt-code delivery, and only on that line",
+           any("(401175, delivered as 401220)" in l for l in exc)
+           and any("(401175):" in l and "delivered" not in l for l in exc), str(exc))
     x_lines = [l for l in lines if "X One" in l]
     _check("a 3-site group totalling exactly £5.00 is a major line, not rolled up",
            len(x_lines) == 1 and x_lines[0].startswith("   - X One (X1)") and "£5.00 short" in x_lines[0], str(x_lines))
@@ -594,6 +599,37 @@ process.stdout.write(JSON.stringify(out));
            out["afterDirtyToggle"] == "EDITED" and out["dirtyNote"] == "inline", str((out["afterDirtyToggle"][:20], out["dirtyNote"])))
 
 
+def test_delivered_codes():
+    """A delivery under an alt code (Heverlee 30L = 401187, Blackthorn Dry new code
+    401220) is bucketed under the master's primary code; the email must still tell
+    Tennents the code it was delivered under."""
+    print("\n-- delivered-as codes")
+    buckets = {}
+    l1 = tn.DeliveryLine("11110001", "STANDARD ARMS", "401187", "Heverlee 4.4% 30L Keg",
+                         1.0, 0.1833, 107.8, 100.0, 61.31, 0.0, 161.31, None, None)
+    l2 = tn.DeliveryLine("11110001", "STANDARD ARMS", "400217", "Heverlee 4.4% 50L Keg",
+                         1.0, 0.3055, 200.0, 100.0, 61.31, 0.0, 161.31, None, None)
+    tn._add_discount_mismatch(buckets, l1, "401136", 370.14, basis="agreed rate")
+    tn._add_discount_mismatch(buckets, l2, "401136", 370.14, basis="agreed rate")
+    b = list(buckets.values())[0]
+    _check("mismatch bucket records every delivered code", b.raw_codes == ["401187", "400217"], str(b.raw_codes))
+    m = make_master()
+    s = _summary_with_findings()
+    s.discount_mismatches = [b]
+    html = tn.render_summary_html(s, accept_url="/x", can_accept=True, master=m)
+    cfg = json.loads(html.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
+                     .replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
+    _check("config carries the delivered codes that differ from the primary",
+           cfg["email"]["short"][0]["delivered"] == ["401187", "400217"], str(cfg["email"]["short"][0]))
+    b2 = tn.DiscountMismatch("11110001", "STANDARD ARMS", "401175", "x", "agreed rate",
+                             293.49, 0.0, 293.49, 1.0, 0.3055, 89.66, ["401175"])
+    s.discount_mismatches = [b2]
+    html = tn.render_summary_html(s, accept_url="/x", can_accept=True, master=m)
+    cfg = json.loads(html.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
+                     .replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
+    _check("a primary-code delivery has no 'delivered' entry", cfg["email"]["short"][0]["delivered"] == [])
+
+
 if __name__ == "__main__":
     test_codes_and_suggest()
     test_accept_primitive()
@@ -601,5 +637,6 @@ if __name__ == "__main__":
     test_render()
     test_export_multi_alt()
     test_email_js()
+    test_delivered_codes()
     print("\nALL PASS" if PASS else "\nFAILURES")
     sys.exit(0 if PASS else 1)

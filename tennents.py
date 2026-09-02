@@ -226,6 +226,7 @@ class DiscountMismatch:
     kegs: float
     barrels: float
     delta_total: float
+    raw_codes: list[str] = field(default_factory=list)   # report codes the deliveries came through on
 
 
 @dataclass
@@ -313,6 +314,7 @@ class NoRateRow:
     # offers "Set rate = charged" when they agree (a single unambiguous figure).
     total_min: float = 0.0
     total_max: float = 0.0
+    raw_codes: list[str] = field(default_factory=list)   # report codes the deliveries came through on
 
 
 @dataclass
@@ -536,12 +538,16 @@ def reconcile(
                     actual_total_per_brl=line.total_per_brl,
                     note=(rb.sku.notes if rb.sku else ""),
                     total_min=line.total_per_brl, total_max=line.total_per_brl,
+                    raw_codes=[str(line.sku_code).strip().upper()],
                 )
             else:
                 b.kegs += line.kegs
                 b.barrels += line.barrels
                 b.total_min = min(b.total_min, line.total_per_brl)
                 b.total_max = max(b.total_max, line.total_per_brl)
+                _rc = str(line.sku_code).strip().upper()
+                if _rc and _rc not in b.raw_codes:
+                    b.raw_codes.append(_rc)
         else:  # sku_master
             if abs(line.total_per_brl - rb.expected) > discount_tolerance:  # type: ignore[operator]
                 _add_discount_mismatch(disc_buckets, line, canonical, rb.expected, basis="agreed rate")  # type: ignore[arg-type]
@@ -643,6 +649,7 @@ def _add_discount_mismatch(
     basis: str,
 ) -> None:
     delta = expected - line.total_per_brl
+    raw = str(line.sku_code).strip().upper()   # the code Tennents actually delivered under
     k = (line.account, canonical, round(expected, 2), round(line.total_per_brl, 2))
     b = buckets.get(k)
     if b is None:
@@ -652,11 +659,14 @@ def _add_discount_mismatch(
             expected=expected, actual=line.total_per_brl,
             delta_per_brl=delta, kegs=line.kegs, barrels=line.barrels,
             delta_total=delta * line.barrels,
+            raw_codes=[raw] if raw else [],
         )
     else:
         b.kegs += line.kegs
         b.barrels += line.barrels
         b.delta_total += delta * line.barrels
+        if raw and raw not in b.raw_codes:
+            b.raw_codes.append(raw)
 
 
 # ---------- HTML rendering ----------
@@ -768,7 +778,18 @@ _TENNENTS_JS = """<script>
     });
     return order.map(function (k) { return map[k]; });
   }
-  function label(m) { return m.desc + ' (' + m.sku + ')'; }
+  // Codes the deliveries actually came through on, where they differ from the
+  // master's primary (Tennents re-code containers) - unioned across a group.
+  function delivered(items) {
+    var seen = {}, out = [];
+    items.forEach(function (m) { (m.delivered || []).forEach(function (c) { if (!seen[c]) { seen[c] = 1; out.push(c); } }); });
+    return out;
+  }
+  function labelG(g) {
+    var m = g[0], d = delivered(g);
+    return m.desc + ' (' + m.sku + (d.length ? ', delivered as ' + d.join(', ') : '') + ')';
+  }
+  function label(m) { return labelG([m]); }
 
   function buildBody() {
     var e = CFG.email || {}, L = [], sec = 0;
@@ -808,7 +829,7 @@ _TENNENTS_JS = """<script>
         var brls = sum(g, 'barrels'), tot = Math.abs(sum(g, 'delta_total'));
         g.forEach(function (x) { var a = Number(x.actual); if (a < lo) lo = a; if (a > hi) hi = a; });
         var applied = (hi - lo) > 0.005 ? (money(lo) + ' to ' + money(hi)) : money(m.actual);
-        L.push('   - ' + label(m) + ': applied ' + applied + '/brl vs agreed ' + money(m.expected) + '/brl (' +
+        L.push('   - ' + labelG(g) + ': applied ' + applied + '/brl vs agreed ' + money(m.expected) + '/brl (' +
                perBrlText(g) + '/brl ' + word + ') at ' + fmtSites(g) + '; ' + brl(brls) + ', ' + money(tot) + ' ' + word);
       });
       if (minors.length) {
@@ -816,7 +837,7 @@ _TENNENTS_JS = """<script>
         minors.forEach(function (g) { mt += Math.abs(sum(g, 'delta_total')); });
         L.push('   - Plus ' + minors.length + ' minor variance' + (minors.length === 1 ? '' : 's') + ' under ' + money(minor) +
                ' each, ' + money(mt) + ' in total (details on the reconciliation page): ' +
-               minors.map(function (g) { return label(g[0]) + ' ' + perBrlText(g) + '/brl ' + word + ' at ' + fmtSites(g); }).join('; '));
+               minors.map(function (g) { return labelG(g) + ' ' + perBrlText(g) + '/brl ' + word + ' at ' + fmtSites(g); }).join('; '));
       }
       L.push('   Total ' + word + ' across the above: ' + money(Math.abs(sum(items, 'delta_total'))) + '.');
       L.push('');
@@ -833,7 +854,7 @@ _TENNENTS_JS = """<script>
       pg.sort(function (a, b) { return sum(b, 'short') - sum(a, 'short'); });
       pg.forEach(function (g) {
         var m = g[0];
-        L.push('   - ' + label(m) + ': still at ' + money(m.loaded) + '/brl vs agreed ' + money(m.correct) + '/brl at ' + fmtSites(g) +
+        L.push('   - ' + labelG(g) + ': still at ' + money(m.loaded) + '/brl vs agreed ' + money(m.correct) + '/brl at ' + fmtSites(g) +
                '; ' + brl(sum(g, 'barrels')) + ', ' + money(sum(g, 'short')) + ' short this month');
       });
       L.push('');
@@ -847,8 +868,8 @@ _TENNENTS_JS = """<script>
       L.push('');
     }
     var rates = [];
-    (e.no_rate || []).forEach(function (x) { rates.push({ site: x.site, account: x.account, sku: x.sku, desc: x.desc, charged: x.charged, lo: x.lo, hi: x.hi, barrels: x.barrels, why: 'no agreed rate on our schedule' }); });
-    (e.not_on_master || []).forEach(function (x) { rates.push({ site: x.site, account: x.account, sku: x.sku, desc: x.desc, charged: x.charged, lo: x.lo, hi: x.hi, barrels: x.barrels, why: 'SKU code not on our schedule' }); });
+    (e.no_rate || []).forEach(function (x) { rates.push({ site: x.site, account: x.account, sku: x.sku, desc: x.desc, delivered: x.delivered, charged: x.charged, lo: x.lo, hi: x.hi, barrels: x.barrels, why: 'no agreed rate on our schedule' }); });
+    (e.not_on_master || []).forEach(function (x) { rates.push({ site: x.site, account: x.account, sku: x.sku, desc: x.desc, delivered: x.delivered, charged: x.charged, lo: x.lo, hi: x.hi, barrels: x.barrels, why: 'SKU code not on our schedule' }); });
     rates = rates.filter(function (x) { return !accepted.has(key(x.sku)); });
     if (rates.length) {
       L.push(n() + ') Rates to confirm - please confirm the agreed total discount per brl in writing for the following:');
@@ -1458,19 +1479,26 @@ def render_summary_html(
         name = (sku.product or sku.brand) if sku is not None else ""
         return name or fallback
 
+    def _delivered(r) -> list[str]:
+        # the report codes the deliveries actually came through on, where they
+        # differ from the master's primary code (Tennents re-code containers) -
+        # the code David needs to find the line in his system
+        prim = str(r.sku_code).strip().upper()
+        return [c for c in getattr(r, "raw_codes", []) if str(c).strip().upper() != prim]
+
     email = {
         "file": s.file_name,
         "period": s.period or "",
         "short": [
             {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "expected": _r(r.expected), "actual": _r(r.actual), "delta_brl": _r(r.delta_per_brl),
-             "barrels": _r(r.barrels), "delta_total": _r(r.delta_total)}
+             "barrels": _r(r.barrels), "delta_total": _r(r.delta_total), "delivered": _delivered(r)}
             for r in s.discount_mismatches if r.delta_total > 0
         ],
         "over": [
             {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "expected": _r(r.expected), "actual": _r(r.actual), "delta_brl": _r(r.delta_per_brl),
-             "barrels": _r(r.barrels), "delta_total": _r(r.delta_total)}
+             "barrels": _r(r.barrels), "delta_total": _r(r.delta_total), "delivered": _delivered(r)}
             for r in s.discount_mismatches if r.delta_total < 0
         ],
         "pending": [
@@ -1488,7 +1516,8 @@ def render_summary_html(
             {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "charged": _r(r.actual_total_per_brl), "barrels": _r(r.barrels),
              "lo": _r(norate_range.get(str(r.sku_code).strip().upper(), (r.actual_total_per_brl,))[0]),
-             "hi": _r(norate_range.get(str(r.sku_code).strip().upper(), (0, r.actual_total_per_brl))[1])}
+             "hi": _r(norate_range.get(str(r.sku_code).strip().upper(), (0, r.actual_total_per_brl))[1]),
+             "delivered": _delivered(r)}
             for r in s.no_rate
         ],
         "not_on_master": [
