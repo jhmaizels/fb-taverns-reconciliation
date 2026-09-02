@@ -3015,6 +3015,21 @@ def upload_tennents_master(
 {PAGE_FOOT}"""
 
 
+def _signoff_name(principal) -> str:
+    """Display name for the draft-email sign-off: a real name if the principal
+    carries one, else "First Last" from a dotted mailbox (james.maizels@...);
+    a bare mailbox (jhm@...) falls back to the TENNENTS_EMAIL_SIGNOFF env var,
+    else "" so the operator types their own."""
+    for attr in ("name", "full_name", "display_name"):
+        v = getattr(principal, attr, None)
+        if v and str(v).strip():
+            return str(v).strip()
+    local = (getattr(principal, "email", "") or "").split("@")[0]
+    if "." in local:
+        return " ".join(part.capitalize() for part in local.split(".") if part)
+    return (os.environ.get("TENNENTS_EMAIL_SIGNOFF") or "").strip()
+
+
 @app.post("/tennents/accept-sku")
 async def tennents_accept_sku(
     request: Request,
@@ -3103,6 +3118,7 @@ def upload_tennents(
         can_accept=role_at_least(principal.role, "admin"),
         source_file=original_name,
         master=master,
+        actor_name=_signoff_name(principal),
     )
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>

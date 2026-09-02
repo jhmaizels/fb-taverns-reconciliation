@@ -35,6 +35,7 @@ def make_master() -> TennentsMaster:
     skus = [
         sku("401136", "400217/401187", "Heverlee", "Heverlee 4.4% 50L / 30L Keg", 370.14),
         sku("401175", "", "Blackthorn", "Blackthorn Dry 50L Keg", 293.49),
+        sku("GUI002", "GUI003", "Guinness", "Guinness 50L/30L Keg", 249.0),
         sku("090425", "09000X", "Tennent's Lager", "T.Lager 11G / 22G Keg", 314.33),
         SkuRate("401211", "", "Tennent's", "T.Bavarian 50L", "50L", 0.3055, 4.7, None, None, False, "C&C", 0.0, None),
     ]
@@ -425,6 +426,19 @@ def test_render():
     _check("config JSON has no raw < > &", "<" not in cfg and ">" not in cfg and "&" not in cfg)
     _check("config carries the short mismatch + rates to confirm", '"short"' in cfg and '"401220"' in cfg and '"401187"' in cfg)
     _check("config acceptUrl + sourceFile", '"acceptUrl": "/tennents/accept-sku"' in cfg and '"sourceFile": "Aug26.xlsx"' in cfg)
+
+    # email polish: master product names, sign-off, materiality threshold, over-discount opt-in
+    html_n = tn.render_summary_html(s, accept_url="/x", can_accept=True, source_file="Aug26.xlsx", master=m, actor_name="James Maizels")
+    cfg_n = json.loads(html_n.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
+                       .replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
+    _check("email uses the MASTER product name, not the report's",
+           any(x["desc"] == "Guinness 50L/30L Keg" for x in cfg_n["email"]["short"]), str([x["desc"] for x in cfg_n["email"]["short"]]))
+    _check("unknown SKU keeps the report description", any("Blackthorn Dry" in x["desc"] for x in cfg_n["email"]["not_on_master"]))
+    _check("sign-off + minor threshold in config", cfg_n.get("signoff") == "James Maizels" and cfg_n.get("minorGbp") == 5.0,
+           str((cfg_n.get("signoff"), cfg_n.get("minorGbp"))))
+    _check("over-discount opt-in checkbox rendered", "id='t-email-include-over'" in html_n)
+    _check("over-discounts stay in the config (page keeps them; draft excludes by default)", "over" in cfg_n["email"])
+    _check("no sign-off when none is known", '"signoff": ""' in html_a)
 
     empty = tn.TennentsSummary("f.xlsx", "2026-08", 1, "v", [], [], [], [], [], [], [], [], [], [], [], [])
     html_e = tn.render_summary_html(empty, accept_url="/x", can_accept=True, master=m)

@@ -48,6 +48,9 @@ RETRO_EXACT_TOLERANCE = 0.005
 LINE_ARITH_TOLERANCE = 0.005
 # Implied WSP vs master WSP — monitoring only, not persisted as findings
 WSP_VARIANCE_TOLERANCE = 1.00
+# Draft-email materiality: (SKU, rate) groups whose total shortfall is below this are
+# rolled into one 'minor variances' line so the note to Tennents stays focused.
+EMAIL_MINOR_GBP = 5.0
 
 # Volume commitment (Agreement_Terms): minimum draught barrels per agreement year
 ANNUAL_BARREL_COMMITMENT = 2700
@@ -673,6 +676,7 @@ _TENNENTS_STYLE = """<style>
   .email-draft input[type=text] { width:100%; }
   .email-draft textarea { width:100%; min-height:20em; font-family: inherit; font-size:0.95em; }
   .email-actions { margin-top:0.6em; display:flex; gap:0.8em; align-items:center; flex-wrap:wrap; }
+  .email-actions label.email-opt { display:inline-flex; gap:0.35em; align-items:center; font-weight:400; margin-top:0; }
 </style>"""
 
 
@@ -729,6 +733,7 @@ _TENNENTS_JS = """<script>
   var subject = document.getElementById('t-email-subject');
   var body = document.getElementById('t-email-body');
   var mailto = document.getElementById('t-email-mailto');
+  var overBox = document.getElementById('t-email-include-over');
 
   function money(v) { return '\\u00a3' + (Number(v) || 0).toFixed(2); }
   function brl(b) { return (Number(b) || 0).toFixed(2) + ' brl'; }
@@ -741,39 +746,87 @@ _TENNENTS_JS = """<script>
     return (names[i] || m[2]) + ' ' + m[1];
   }
 
+  function fmtSites(items) {
+    var seen = {}, out = [];
+    items.forEach(function (m) {
+      var k = String(m.site) + '|' + String(m.account);
+      if (seen[k]) return;
+      seen[k] = 1;
+      out.push(m.site + ' (' + m.account + ')');
+    });
+    return out.join(', ');
+  }
+  function sum(items, f) { var t = 0; items.forEach(function (m) { t += Number(m[f]) || 0; }); return t; }
+  // Tennents load a rate per SKU across accounts, so the draft groups per-site
+  // findings by SKU + applied rate: one line per (SKU, rate) naming the sites.
+  function groupBy(items, keyFn) {
+    var map = {}, order = [];
+    items.forEach(function (m) {
+      var k = keyFn(m);
+      if (!map[k]) { map[k] = []; order.push(k); }
+      map[k].push(m);
+    });
+    return order.map(function (k) { return map[k]; });
+  }
+  function label(m) { return m.desc + ' (' + m.sku + ')'; }
+
   function buildBody() {
     var e = CFG.email || {}, L = [], sec = 0;
+    var minor = Number(CFG.minorGbp) || 0;
+    var includeOver = !!(overBox && overBox.checked);
     function n() { return ++sec; }
     L.push('Hi David,');
     L.push('');
     L.push('Reviewing the ' + fmtPeriod(e.period) + ' draught pricing report (' + (e.file || '') + '), the following need your attention:');
     L.push('');
-    var short = e.short || [];
-    if (short.length) {
-      L.push(n() + ') Discounts applied BELOW the agreed rate - please correct these and credit the shortfall:');
-      var t1 = 0;
-      short.forEach(function (m) {
-        t1 += Number(m.delta_total) || 0;
-        L.push('   - ' + m.site + ' (' + m.account + ') / ' + m.sku + ' ' + m.desc + ': agreed ' + money(m.expected) + '/brl, applied ' + money(m.actual) + '/brl (' + money(m.delta_brl) + '/brl short on ' + brl(m.barrels) + ' = ' + money(m.delta_total) + ')');
+
+    // sign +1: FB got LESS discount than agreed (short); -1: more (over)
+    function rateSection(title, items, sign) {
+      // bucket the applied rate to the nearest 50p so penny-level rounding across sites can't split a group
+      var groups = groupBy(items, function (m) { return m.sku + '|' + (Math.round(Number(m.actual) * 2) / 2).toFixed(2); });
+      groups.sort(function (a, b) { return Math.abs(sum(b, 'delta_total')) - Math.abs(sum(a, 'delta_total')); });
+      var major = [], minors = [];
+      groups.forEach(function (g) { (Math.abs(sum(g, 'delta_total')) < minor ? minors : major).push(g); });
+      if (!major.length && !minors.length) return;
+      var word = sign > 0 ? 'short' : 'over';
+      L.push(n() + ') ' + title);
+      major.forEach(function (g) {
+        var m = g[0], lo = Infinity, hi = -Infinity, dlo = Infinity, dhi = -Infinity;
+        var brls = sum(g, 'barrels'), tot = Math.abs(sum(g, 'delta_total'));
+        g.forEach(function (x) {
+          var a = Number(x.actual), d = Math.abs(Number(x.delta_brl));
+          if (a < lo) lo = a; if (a > hi) hi = a; if (d < dlo) dlo = d; if (d > dhi) dhi = d;
+        });
+        var applied = (hi - lo) > 0.005 ? (money(lo) + ' to ' + money(hi)) : money(m.actual);
+        // per-brl from the reconciliation's own exact figures, never re-derived from rounded totals
+        var perBrl = (dhi - dlo) > 0.005 ? (money(dlo) + ' to ' + money(dhi)) : money(dlo);
+        L.push('   - ' + label(m) + ': applied ' + applied + '/brl vs agreed ' + money(m.expected) + '/brl (' +
+               perBrl + '/brl ' + word + ') at ' + fmtSites(g) + '; ' + brl(brls) + ', ' + money(tot) + ' ' + word);
       });
-      L.push('   Total short across the above: ' + money(t1) + '.');
+      if (minors.length) {
+        var mt = 0;
+        minors.forEach(function (g) { mt += Math.abs(sum(g, 'delta_total')); });
+        L.push('   - Plus ' + minors.length + ' minor variance' + (minors.length === 1 ? '' : 's') + ' under ' + money(minor) +
+               ' each, ' + money(mt) + ' in total (details on the reconciliation page): ' +
+               minors.map(function (g) { return label(g[0]) + ' ' + money(Math.abs(g[0].delta_brl)) + '/brl ' + word + ' at ' + fmtSites(g); }).join('; '));
+      }
+      L.push('   Total ' + word + ' across the above: ' + money(Math.abs(sum(items, 'delta_total'))) + '.');
       L.push('');
     }
-    var over = e.over || [];
-    if (over.length) {
-      L.push(n() + ') Discounts applied ABOVE the agreed rate - please confirm these are intended so we can align our records:');
-      over.forEach(function (m) {
-        L.push('   - ' + m.site + ' (' + m.account + ') / ' + m.sku + ' ' + m.desc + ': agreed ' + money(m.expected) + '/brl, applied ' + money(m.actual) + '/brl (' + money(Math.abs(m.delta_brl)) + '/brl over on ' + brl(m.barrels) + ')');
-      });
-      L.push('');
+    rateSection('Discounts applied BELOW the agreed rate - please correct these and credit the shortfall:', e.short || [], 1);
+    if (includeOver) {
+      rateSection('Discounts applied ABOVE the agreed rate - please confirm these are intended so we can align our records:', e.over || [], -1);
     }
+
     var pend = e.pending || [];
     if (pend.length) {
-      var tp = 0;
-      pend.forEach(function (m) { tp += Number(m.short) || 0; });
-      L.push(n() + ') Known corrections still not loaded - this month adds ' + money(tp) + ' to the amounts already raised:');
-      pend.forEach(function (m) {
-        L.push('   - ' + m.site + ' (' + m.account + ') / ' + m.sku + ' ' + m.desc + ': still at ' + money(m.loaded) + '/brl vs agreed ' + money(m.correct) + '/brl (' + money(m.short) + ' short this month on ' + brl(m.barrels) + ')');
+      L.push(n() + ') Known corrections still not loaded - this month adds ' + money(sum(pend, 'short')) + ' to the amounts already raised:');
+      var pg = groupBy(pend, function (m) { return m.sku + '|' + Number(m.loaded).toFixed(2) + '|' + Number(m.correct).toFixed(2); });
+      pg.sort(function (a, b) { return sum(b, 'short') - sum(a, 'short'); });
+      pg.forEach(function (g) {
+        var m = g[0];
+        L.push('   - ' + label(m) + ': still at ' + money(m.loaded) + '/brl vs agreed ' + money(m.correct) + '/brl at ' + fmtSites(g) +
+               '; ' + brl(sum(g, 'barrels')) + ', ' + money(sum(g, 'short')) + ' short this month');
       });
       L.push('');
     }
@@ -781,7 +834,7 @@ _TENNENTS_JS = """<script>
     if (res.length) {
       L.push(n() + ') Corrections we can see have now landed - thank you, we will close these our end:');
       res.forEach(function (m) {
-        L.push('   - ' + m.site + ' / ' + m.sku + ' ' + m.desc + ': now ' + money(m.actual) + '/brl (agreed ' + money(m.correct) + '/brl)');
+        L.push('   - ' + label(m) + ' at ' + m.site + ': now ' + money(m.actual) + '/brl (agreed ' + money(m.correct) + '/brl)');
       });
       L.push('');
     }
@@ -792,20 +845,20 @@ _TENNENTS_JS = """<script>
     if (rates.length) {
       L.push(n() + ') Rates to confirm - please confirm the agreed total discount per brl in writing for the following:');
       rates.forEach(function (x) {
-        // quote the RANGE when this code was charged at more than one rate this month
         var applied = (x.lo != null && x.hi != null && (Number(x.hi) - Number(x.lo)) > 0.5)
           ? (money(x.lo) + ' to ' + money(x.hi)) : money(x.charged);
-        L.push('   - ' + x.site + ' (' + x.account + ') / ' + x.sku + ' ' + x.desc + ': ' + x.why + '; ' + applied + '/brl applied on ' + brl(x.barrels));
+        L.push('   - ' + label(x) + ' at ' + x.site + ' (' + x.account + '): ' + x.why + '; ' + applied + '/brl applied on ' + brl(x.barrels));
       });
       L.push('');
     }
     var ar = (e.retro_arith || []).concat(e.line_arith || []);
     if (ar.length) {
       L.push(n() + ') Arithmetic errors on the report - please correct:');
-      ar.forEach(function (m) { L.push('   - ' + m.site + ' / ' + m.sku + ' ' + m.desc + ': ' + m.what); });
+      ar.forEach(function (m) { L.push('   - ' + label(m) + ' at ' + m.site + ': ' + m.what); });
       L.push('');
     }
     L.push('Thanks,');
+    if (CFG.signoff) L.push(CFG.signoff);
     return L.join('\\n');
   }
 
@@ -907,6 +960,14 @@ _TENNENTS_JS = """<script>
   });
   if (body) body.addEventListener('input', function () { bodyDirty = true; updateMailto(); });
   if (subject) subject.addEventListener('input', updateMailto);
+  if (overBox) overBox.addEventListener('change', function () {
+    if (bodyDirty) {
+      var note = document.getElementById('t-email-dirty-note');
+      if (note) note.style.display = 'inline';
+    } else {
+      rebuild();
+    }
+  });
   var copyBtn = document.getElementById('t-email-copy');
   if (copyBtn) copyBtn.addEventListener('click', function () {
     var text = (subject ? 'Subject: ' + subject.value + '\\n\\n' : '') + (body ? body.value : '');
@@ -948,6 +1009,7 @@ def render_summary_html(
     can_accept: bool = False,
     source_file: str = "",
     master: TennentsMaster | None = None,
+    actor_name: str = "",
 ) -> str:
     """Findings page. With can_accept (admin) the 'no agreed rate' / 'not on
     master' rows get Add-to-master actions (POST accept_url — link a new code to
@@ -1375,54 +1437,61 @@ def render_summary_html(
     def _r(v) -> float:
         return round(float(v or 0.0), 2)
 
+    def _pname(code: str, fallback: str) -> str:
+        # The master's product name (covers both containers of a multi-container
+        # SKU) rather than the report's truncated description ('Magners Dark Fru').
+        sku = master.find_sku(code) if master is not None else None
+        name = (sku.product or sku.brand) if sku is not None else ""
+        return name or fallback
+
     email = {
         "file": s.file_name,
         "period": s.period or "",
         "short": [
-            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "expected": _r(r.expected), "actual": _r(r.actual), "delta_brl": _r(r.delta_per_brl),
              "barrels": _r(r.barrels), "delta_total": _r(r.delta_total)}
             for r in s.discount_mismatches if r.delta_total > 0
         ],
         "over": [
-            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "expected": _r(r.expected), "actual": _r(r.actual), "delta_brl": _r(r.delta_per_brl),
              "barrels": _r(r.barrels), "delta_total": _r(r.delta_total)}
             for r in s.discount_mismatches if r.delta_total < 0
         ],
         "pending": [
-            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "loaded": _r(r.loaded), "correct": _r(r.correct), "barrels": _r(r.barrels),
              "short": _r(r.short_vs_correct)}
             for r in s.exception_pending if (r.short_vs_correct or 0.0) > 0
         ],
         "resolved": [
-            {"site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "correct": _r(r.correct), "actual": _r(r.actual)}
             for r in s.exceptions_resolved
         ],
         "no_rate": [
-            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "charged": _r(r.actual_total_per_brl), "barrels": _r(r.barrels),
              "lo": _r(norate_range.get(str(r.sku_code).strip().upper(), (r.actual_total_per_brl,))[0]),
              "hi": _r(norate_range.get(str(r.sku_code).strip().upper(), (0, r.actual_total_per_brl))[1])}
             for r in s.no_rate
         ],
         "not_on_master": [
-            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "charged": _r(r.avg_discount_per_brl), "barrels": _r(r.barrels),
              "lo": _r(nom_range.get(str(r.sku_code).strip().upper(), (r.avg_discount_per_brl,))[0]),
              "hi": _r(nom_range.get(str(r.sku_code).strip().upper(), (0, r.avg_discount_per_brl))[1])}
             for r in s.not_on_master
         ],
         "retro_arith": [
-            {"site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "what": f"retro due {_money_neutral(r.retro_due)} on the report vs {_money_neutral(r.calc_due)} "
                      f"({_money_neutral(r.retro_per_brl)}/brl x {r.barrels:.4f} brl)"}
             for r in s.retro_arithmetic
         ],
         "line_arith": [
-            {"site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
+            {"site": r.customer_name, "sku": r.sku_code, "desc": _pname(r.sku_code, r.sku_desc),
              "what": f"off {_money_neutral(r.off_per_brl)} + retro {_money_neutral(r.retro_per_brl)} + AOD "
                      f"{_money_neutral(r.aod_per_brl)} does not equal the total {_money_neutral(r.total_per_brl)}"}
             for r in s.line_arithmetic
@@ -1434,10 +1503,12 @@ def render_summary_html(
         default_subject = f"FB Taverns — Tennents draught pricing, {_period_label(s.period) or s.file_name}"
         parts.append("<h2>13. Draft email to Tennents</h2>")
         parts.append(
-            "<p class='sub'>Auto-drafted from the findings above &mdash; discounts applied below the agreed "
-            "rate to correct and credit, known corrections still accruing, rates to confirm and any "
-            "arithmetic errors. Accepting or linking an SKU into the master (sections 7 and 8) removes it "
-            "from this draft. Edit freely, then copy or open in your mail app.</p>"
+            "<p class='sub'>Auto-drafted from the findings above, grouped the way Tennents load rates (one line per "
+            "SKU and applied rate, naming the sites): discounts applied below the agreed rate to correct and "
+            f"credit (variances under &pound;{EMAIL_MINOR_GBP:.0f} rolled into one line), known corrections still accruing, rates to "
+            "confirm and any arithmetic errors. <strong>Over-discounts are left out by default</strong> (we monitor "
+            "them, we don't raise them) &mdash; tick the box to include them. Accepting or linking an SKU into the "
+            "master (sections 7 and 8) removes it from this draft. Edit freely, then copy or open in your mail app.</p>"
         )
         parts.append(
             "<div class='email-draft'>"
@@ -1448,6 +1519,8 @@ def render_summary_html(
             "<div class='email-actions'>"
             "<button type='button' id='t-email-copy'>Copy email</button>"
             "<a class='button' id='t-email-mailto' href='#' style='margin-top:0'>Open in mail app</a>"
+            "<label class='email-opt'><input type='checkbox' id='t-email-include-over'> Include over-discounts "
+            "<span class='sub'>(off by default: monitored, not raised)</span></label>"
             "<span class='ok' id='t-email-copied' style='display:none'>Copied &check;</span>"
             "<span id='t-email-dirty-note' style='display:none'>&#9888; Edited &mdash; accepted items are no longer auto-removed; delete them by hand.</span>"
             "</div></div>"
@@ -1457,6 +1530,8 @@ def render_summary_html(
             "acceptUrl": accept_url,
             "sourceFile": source_file or s.file_name,
             "canAccept": can_accept,
+            "signoff": actor_name or "",
+            "minorGbp": EMAIL_MINOR_GBP,
             "email": email,
         }))
 
