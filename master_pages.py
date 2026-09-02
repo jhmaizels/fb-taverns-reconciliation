@@ -492,6 +492,9 @@ def render_master_pivot(
         '<strong>Save changes</strong> to commit them all · '
         '<strong>clear a cell</strong> to remove its price · '
         '<strong>+ Add product</strong> for a brand-new line. '
+        'The <strong>Price</strong> and <strong>Retro P/Keg</strong> columns are '
+        'editable too — one figure per product, applied to <strong>every site</strong> '
+        'from today (the Net price follows automatically). '
         '(Pressing Enter in a single cell still saves just that one.) '
         'Unsaved cells are highlighted; you’ll be warned before leaving with unsaved changes. '
         'Changes take effect from today; history is kept underneath.</p>'
@@ -587,6 +590,62 @@ def render_master_pivot(
             f'{margin}</form></td>'
         )
 
+    papply_url = ext_url("/master/product-cell/apply")
+
+    def _pinfo_edit(p: str, agg: dict, idx: int) -> str:
+        """Edit-mode Price / Retro P/Keg / Net cells. The FB list price and the
+        retro are PRODUCT-level figures (one value for every site), posting to
+        /master/product-cell/apply with the same semantics as the product
+        settings page: applied estate-wide from today, tenant prices untouched.
+        ONE form covers BOTH cells (the retro input associates via the form
+        attribute), so a row save posts the PAIR in a single request — the
+        server validates list vs retro together and applies them in one write
+        (a lowered list + lowered retro can't deadlock on the stale
+        counterpart). The hidden submit button keeps Enter-to-save working —
+        implicit submission needs one once a form has two fields. Net stays
+        derived (list − retro); the script live-updates it as the operator
+        types."""
+        fbs = agg["fbs"]
+        fb = next(iter(fbs)) if len(fbs) == 1 else None
+        retro = (products.get(p) or {}).get("retro_per_keg") or 0.0
+        fb_val = "" if fb is None else f"{fb:.2f}"
+        retro_val = f"{retro:.2f}" if retro else ""
+        hidden = _hidden({"product_code": p, "fsite": site_f, "fq": q})
+        fb_title = (
+            "FB list price — one figure for every site, applied from today. "
+            "Type a price and press Enter; clearing restores the current figure."
+        )
+        varies_attr = ""
+        if len(fbs) > 1:
+            fb_title += (
+                " Currently differs across sites — saving a figure makes it uniform."
+            )
+            varies_attr = ' placeholder="varies"'
+        retro_title = (
+            "Retro £/keg — the fixed rebate per keg, every site, applied from "
+            "today. Clear + Enter removes the retro."
+        )
+        if len(fbs) > 1:
+            net_c = varies
+        elif fb is None:
+            net_c = "—"
+        else:
+            net_c = escape(_money(fb - retro))
+        return (
+            f'<td class="num pinfo edit-cell"><form method="post" action="{papply_url}" '
+            f'class="cellf" id="pcell-{idx}">'
+            f'{hidden}<input type="number" step="0.01" min="0" name="fb_price" '
+            f'class="cell-input" value="{fb_val}" data-prev="{fb_val}"{varies_attr} '
+            f'title="{escape(fb_title)}">'
+            f'<button type="submit" style="display:none" tabindex="-1" aria-hidden="true"></button>'
+            f'</form></td>'
+            f'<td class="num pinfo edit-cell">'
+            f'<input type="number" step="0.01" min="0" name="retro_gbp" form="pcell-{idx}" '
+            f'class="cell-input" value="{retro_val}" data-prev="{retro_val}" '
+            f'title="{escape(retro_title)}"></td>'
+            f'<td class="num pinfo"><span class="net-val">{net_c}</span></td>'
+        )
+
     def _cell(sid: str, p: str) -> str:
         w = winners.get((sid, p))
         if not edit:
@@ -613,9 +672,9 @@ def render_master_pivot(
                 body.append(_section_row("Cask"))
                 cask_started = True
         agg = prod_agg[p]
-        price_c, retro_c, net_c = _left_cells(p, agg)
         if edit:
-            # Edit mode: code/name open the product settings (rename / remove).
+            # Edit mode: code/name open the product settings (rename / remove);
+            # the Price / Retro cells become product-level inputs.
             purl = ext_url("/master/product") + _qs(product_code=p, fsite=site_f, fq=q)
             prod_cells = (
                 f'<td class="sticky-col c1 pcode"><a class="site-head" href="{purl}"'
@@ -623,16 +682,18 @@ def render_master_pivot(
                 f'<td class="sticky-col c2"><a class="site-head" href="{purl}"'
                 f' title="Edit code / name, or remove this product">{escape(agg["desc"] or "")}</a></td>'
             )
+            pinfo = _pinfo_edit(p, agg, i)
         else:
             prod_cells = (
                 f'<td class="sticky-col c1 pcode">{escape(p)}</td>'
                 f'<td class="sticky-col c2">{escape(agg["desc"] or "")}</td>'
             )
-        pinfo = (
-            f'<td class="num pinfo">{price_c}</td>'
-            f'<td class="num pinfo">{retro_c}</td>'
-            f'<td class="num pinfo">{net_c}</td>'
-        )
+            price_c, retro_c, net_c = _left_cells(p, agg)
+            pinfo = (
+                f'<td class="num pinfo">{price_c}</td>'
+                f'<td class="num pinfo">{retro_c}</td>'
+                f'<td class="num pinfo">{net_c}</td>'
+            )
         cells = "".join(_cell(sid, p) for sid in site_ids)
         body.append(f"<tr>{prod_cells}{pinfo}{cells}</tr>")
 
@@ -663,6 +724,18 @@ def render_master_pivot(
     #   - Enter in one cell still saves just that cell (now in place, no reload);
     #   - "Done editing" flushes pending edits first; a beforeunload guard warns
     #     if the operator navigates away with unsaved cells.
+    # The product-level Price / Retro P/Keg cells ride the SAME machinery
+    # (form.cellf + input.cell-input), posting to /master/product-cell/apply.
+    # ONE form per row covers both cells (retro input associated via the form
+    # attribute), so a row save posts the list+retro PAIR in a single request
+    # and the server validates them together. Blank-cell semantics differ per
+    # column: an emptied tenant cell removes the price (confirm), an emptied
+    # retro cell removes the retro (confirm), an emptied FB Price cell is
+    # restored — the list price can't be cleared from the grid. Typing in
+    # either recomputes the row's Net cell live. EVERY cell POST (Enter or
+    # Save changes) is serialized through one shared promise chain — a
+    # product-level save rewrites the same rule rows a tenant/retro save for
+    # that product touches, so overlapping requests could clobber each other.
     # If JS fails to load, each cell form still submits natively (POST -> 303),
     # i.e. today's no-JS behaviour.
     toggle_js = r"""<script>(function(){
@@ -675,15 +748,20 @@ var doneLink=document.getElementById('grid-done');
 function sameNum(a,b){a=(a||'').trim();b=(b||'').trim();if(a===''&&b==='')return true;if(a===''||b==='')return false;var x=parseFloat(a),y=parseFloat(b);if(isNaN(x)||isNaN(y))return a===b;return Math.abs(x-y)<0.005;}
 function dirty(i){return !sameNum(i.value,i.getAttribute('data-prev')||'');}
 function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(saveBtn){saveBtn.textContent=n?('Save changes ('+n+')'):'Save changes';saveBtn.disabled=(n===0);}return n;}
-t.addEventListener('input',function(e){var i=e.target;if(i&&i.classList&&i.classList.contains('cell-input'))refresh();});
-function post(f){var body=new URLSearchParams(new FormData(f));body.set('ajax','1');return fetch(f.getAttribute('action'),{method:'POST',credentials:'same-origin',headers:{'X-Requested-With':'fetch','Content-Type':'application/x-www-form-urlencoded'},body:body.toString()}).then(function(r){return r.json().catch(function(){return{ok:false,errors:['HTTP '+r.status]};}).then(function(j){return{status:r.status,j:j};});});}
+function updNet(i){var tr=i.closest('tr');if(!tr)return;var n=tr.querySelector('.net-val');var fbi=tr.querySelector('input[name=fb_price]');if(!n||!fbi)return;if(n._orig===undefined)n._orig=n.innerHTML;var fb=parseFloat(fbi.value);if(isNaN(fb)){n.innerHTML=n._orig;return;}var ri=tr.querySelector('input[name=retro_gbp]');var r=ri?(parseFloat(ri.value)||0):0;n.textContent='£'+(fb-r).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});}
+t.addEventListener('input',function(e){var i=e.target;if(!i||!i.classList||!i.classList.contains('cell-input'))return;refresh();if(i.name==='fb_price'||i.name==='retro_gbp')updNet(i);});
+function post(f){var body=new URLSearchParams(new FormData(f));body.set('ajax','1');return fetch(f.getAttribute('action'),{method:'POST',credentials:'same-origin',headers:{'X-Requested-With':'fetch','Content-Type':'application/x-www-form-urlencoded'},body:body.toString()}).then(function(r){return r.json().catch(function(){return{ok:false,errors:['HTTP '+r.status],raw:true};}).then(function(j){return{status:r.status,j:j};});}).catch(function(){return{status:0,j:{ok:false,errors:['network error'],raw:true}};});}
 function flash(i){i.classList.add('saved');setTimeout(function(){i.classList.remove('saved');},1000);}
-function errmsg(res){return (res.j&&res.j.errors&&res.j.errors.join('; '))||('HTTP '+res.status);}
-function saveOne(f){var i=f.querySelector('input[name=tenant_price]');if(!i)return Promise.resolve(false);var prev=i.getAttribute('data-prev')||'';var v=i.value.trim();if(v===''){if(prev==='')return Promise.resolve(true);if(!confirm('Remove this price? The product stops billing at this site from today.')){i.value=prev;refresh();return Promise.resolve(false);}}else if(sameNum(v,prev))return Promise.resolve(true);return post(f).then(function(res){if(res.j&&res.j.ok){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');flash(i);refresh();return true;}i.classList.add('err');alert('Could not save that price: '+errmsg(res));return false;});}
+function errmsg(res){var m=(res.j&&res.j.errors&&res.j.errors.join('; '))||('HTTP '+res.status);if(res.j&&res.j.raw)m+='\nThe save may still have landed (product-wide saves can outlast the proxy) — reload the grid to check before retrying.';return m;}
 var busy=false;
-function saveAll(){if(busy)return Promise.resolve(false);var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){var i=f.querySelector('input[name=tenant_price]');if(i&&dirty(i))forms.push(f);});if(!forms.length)return Promise.resolve(true);var rem=forms.filter(function(f){return f.querySelector('input[name=tenant_price]').value.trim()==='';});if(rem.length&&!confirm('Remove '+rem.length+' price'+(rem.length>1?'s':'')+'? Those products stop billing at those sites from today.'))return Promise.resolve(false);busy=true;if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…';}var idx=0,ok=true;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var i=f.querySelector('input[name=tenant_price]');return post(f).then(function(res){if(res.j&&res.j.ok){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');return step();}ok=false;i.classList.add('err');i.focus();alert('Could not save that price: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return all;});}
-if(saveBtn){saveBtn.addEventListener('click',function(){saveAll().then(function(all){if(all){location=saveBtn.getAttribute('data-reload')||location.href;}});});}
-if(doneLink){doneLink.addEventListener('click',function(e){if(refresh()>0){e.preventDefault();var href=doneLink.getAttribute('href');saveAll().then(function(all){if(all)location=href;});}});}
+var chain=Promise.resolve();
+function enq(fn){var p=chain.then(fn,fn);chain=p.then(function(){},function(){});return p;}
+function cellInputs(f){return Array.prototype.filter.call(f.elements,function(el){return el.classList&&el.classList.contains('cell-input');});}
+function formDirty(f){return cellInputs(f).some(dirty);}
+function saveOne(f){var ins=cellInputs(f);if(!ins.length)return Promise.resolve(false);var proceed=true,changed=false;ins.forEach(function(i){var prev=i.getAttribute('data-prev')||'';var v=i.value.trim();if(v===''&&prev!==''){if(i.name==='fb_price'){i.value=prev;updNet(i);}else{var msg=(i.name==='retro_gbp')?'Remove this retro? The net price rises to the full list price at every site.':'Remove this price? The product stops billing at this site from today.';if(confirm(msg)){changed=true;}else{i.value=prev;if(i.name==='retro_gbp')updNet(i);proceed=false;}}}else if(!sameNum(v,prev)){changed=true;}});refresh();if(!proceed)return Promise.resolve(false);if(!changed)return Promise.resolve(true);var dl=ins.filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){ins.forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});dl.forEach(flash);refresh();return true;}dl.forEach(function(i){i.classList.add('err');});alert('Could not save that price: '+errmsg(res));return false;});}
+function saveAll(){if(busy)return Promise.resolve({ok:false,wrote:0});var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){if(formDirty(f))forms.push(f);});if(!forms.length)return Promise.resolve({ok:true,wrote:0});forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name==='fb_price'&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!==''){i.value=i.getAttribute('data-prev');updNet(i);}});});forms=forms.filter(formDirty);function empties(name){var n=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name===name&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!=='')n++;});});return n;}var rem=empties('tenant_price');if(rem&&!confirm('Remove '+rem+' price'+(rem>1?'s':'')+'? Those products stop billing at those sites from today.')){refresh();return Promise.resolve({ok:false,wrote:0});}var remR=empties('retro_gbp');if(remR&&!confirm('Remove '+remR+' retro'+(remR>1?'s':'')+'? The net price rises to the full list price for those products.')){refresh();return Promise.resolve({ok:false,wrote:0});}refresh();if(!forms.length)return Promise.resolve({ok:true,wrote:0});busy=true;if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…';}var idx=0,ok=true,wrote=0;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var dl=cellInputs(f).filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){if(res.j.saved)wrote++;cellInputs(f).forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});return step();}ok=false;dl.forEach(function(i){i.classList.add('err');});if(dl[0])dl[0].focus();alert('Could not save that price: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return {ok:all,wrote:wrote};});}
+if(saveBtn){saveBtn.addEventListener('click',function(){saveAll().then(function(r){if(r.ok&&r.wrote){location=saveBtn.getAttribute('data-reload')||location.href;}});});}
+if(doneLink){doneLink.addEventListener('click',function(e){if(refresh()>0){e.preventDefault();var href=doneLink.getAttribute('href');saveAll().then(function(r){if(r.ok)location=href;});}});}
 t.addEventListener('submit',function(e){var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;e.preventDefault();saveOne(f);});
 window.addEventListener('beforeunload',function(e){if(refresh()>0){e.preventDefault();e.returnValue='';return '';}});
 refresh();

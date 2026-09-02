@@ -1703,6 +1703,400 @@ def test_findings_overwrite_button_render_and_guards():
     assert "use editor" in html_mixed and 'data-overwrite="1"' not in html_mixed
 
 
+def test_render_master_pivot_product_cells_editable():
+    """Edit mode makes the product-level Price / Retro P/Keg columns inline
+    inputs (ONE per row — the figures are estate-wide) posting to
+    /master/product-cell/apply; Net stays derived (a .net-val span the script
+    live-updates). Read mode and viewer-with-?edit=1 keep plain text cells."""
+    from master_pages import render_master_pivot
+    r1 = _rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0)
+    snap = _snap([r1])
+    snap.products = {PROD_CODE: {"desc": "Test Keg", "retro_per_keg": 15.0}}
+    html_e = render_master_pivot(snap, {"edit": "1"}, is_admin=True)
+    assert "/master/product-cell/apply" in html_e
+    # values tied to their input names (a swapped fb/retro render must fail)
+    m_fb = re.search(r'name="fb_price"[^>]*', html_e)
+    assert m_fb and 'value="120.00" data-prev="120.00"' in m_fb.group(0)
+    m_rg = re.search(r'name="retro_gbp"[^>]*', html_e)
+    assert m_rg and 'value="15.00" data-prev="15.00"' in m_rg.group(0)
+    assert 'class="net-val"' in html_e and "£105.00" in html_e
+    # the ROW form's hidden identity is the product alone — scoped to the
+    # pcell form so the tenant cells' identical hidden can't mask a drop
+    m_form = re.search(r'id="pcell-0".*?</form>', html_e, re.S)
+    assert m_form, "product row form must render"
+    assert f'name="product_code" value="{PROD_CODE}"' in m_form.group(0)
+    assert 'name="site_id"' not in m_form.group(0), (
+        "product cells carry no site — the figures are estate-wide"
+    )
+    # ONE form covers both cells: the retro input associates via form=, and a
+    # hidden submit button keeps Enter-to-save working on a two-field form
+    assert 'form="pcell-0"' in html_e
+    assert '<button type="submit" style="display:none"' in html_e
+
+    # read mode: plain text, no product-level inputs
+    html_r = render_master_pivot(snap, {}, is_admin=True)
+    assert 'name="fb_price"' not in html_r and 'name="retro_gbp"' not in html_r
+    # a viewer never gets the inputs, even with ?edit=1
+    html_v = render_master_pivot(snap, {"edit": "1"}, is_admin=False)
+    assert 'name="fb_price"' not in html_v
+
+    # fb differing across sites -> empty input with a "varies" placeholder;
+    # zero retro -> empty input (the read grid shows an em-dash for no retro)
+    r2 = Rule(site_id=SITE2_ID, product_code=PROD_CODE, product_desc="Test Keg",
+              tenant_price=175.0, fb_price=125.0, retro_pct=0.0,
+              valid_from=date(2026, 1, 1), valid_to=None, status="tenanted")
+    snap2 = MasterSnapshot(
+        sites={SITE_ID: {"name": "Alpha"}, SITE2_ID: {"name": "Beta"}},
+        rules=[r1, r2],
+        site_ids={SITE_ID: SITE_REC, SITE2_ID: SITE2_REC},
+        product_ids={PROD_CODE: PROD_REC}, rule_ids={}, banner_info={},
+        products={PROD_CODE: {"desc": "Test Keg", "retro_per_keg": 0.0}},
+    )
+    html_var = render_master_pivot(snap2, {"edit": "1"}, is_admin=True)
+    assert 'placeholder="varies"' in html_var
+    m = re.search(r'name="fb_price"[^>]*', html_var)
+    assert m and 'value=""' in m.group(0)
+    m2 = re.search(r'name="retro_gbp"[^>]*', html_var)
+    assert m2 and 'value=""' in m2.group(0)
+
+
+def test_route_product_cell_fb_save():
+    """The grid's Price cell: saving a new FB list price re-dates every current
+    tenanted price from today with the new figure — tenant prices unchanged —
+    and the patched cache shows the new Price/Net immediately. Re-saving the
+    same figure writes NOTHING (ajax saved:false)."""
+    today_iso = date.today().isoformat()
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130.00", "fsite": SITE_ID,
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            loc = r.headers["location"]
+            assert "saved=1" in loc and "edit=1" in loc and f"site={SITE_ID}" in loc
+            created = _creates(fa)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["tenant_price"] == 180.0, "tenant price must NOT change"
+            assert f["fb_price"] == 130.0
+            assert f["valid_from"] == today_iso
+            assert f["source"] == f"product-cell:{FakeAuthClient.EMAIL}"
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"]
+            assert closes[0]["fields"]["valid_to"] == today_iso
+            # no Products write on an fb-only change (the list rides on rules)
+            assert not [1 for op, t, _recs in fa.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            # patched cache: the new Price/Net render immediately
+            r2 = client.get("/master")
+            assert "£130.00" in r2.text
+            # ajax: the same figure again -> ok:true saved:false, no writes
+            calls_before = len(fa.calls)
+            r3 = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130.00", "ajax": "1",
+            })
+            assert r3.status_code == 200
+            assert r3.json() == {"ok": True, "saved": False}
+            assert len(fa.calls) == calls_before, "same-figure save must write NOTHING"
+
+
+def test_route_product_cell_retro_save_and_remove():
+    """The grid's Retro P/Keg cell: saving a retro writes Products.retro_per_keg
+    (+ eligibility) and reflows every current tenanted price from today with
+    retro_pct = £/list, tenant unchanged; clearing the cell (blank) removes the
+    retro — Products drops to 0 / not eligible."""
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "13.00", "ajax": "1",
+            })
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            prod_ups = [recs for op, t, recs in fa.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            assert len(prod_ups) == 1
+            pf = prod_ups[0][0]["fields"]
+            assert pf["retro_per_keg"] == 13.0 and pf["retro_eligible"] is True
+            created = _creates(fa)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["tenant_price"] == 180.0 and f["fb_price"] == 120.0
+            assert abs(f["retro_pct"] - 13.0 / 120.0) < 1e-9
+            # patched cache: Retro and Net (120-13=£107.00) show immediately
+            r2 = client.get("/master")
+            assert "£13.00" in r2.text and "£107.00" in r2.text
+
+    # blank retro = remove: Products cleared to 0 / not eligible; the reflowed
+    # rules are created WITHOUT a retro_pct field (the write path skips zeros).
+    prods = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 13.0, "retro_eligible": True}}]
+    rec2 = _grid_rule("rec_old")
+    rec2["fields"]["fb_price"] = 120.0
+    rec2["fields"]["retro_pct"] = 13.0 / 120.0
+    with FakeAirtable([rec2], products=prods) as fa2:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "", "ajax": "1",
+            })
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            prod_ups = [recs for op, t, recs in fa2.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            assert len(prod_ups) == 1
+            pf = prod_ups[0][0]["fields"]
+            assert pf["retro_per_keg"] == 0.0 and pf["retro_eligible"] is False
+            created = _creates(fa2)
+            assert len(created) == 1
+            assert "retro_pct" not in created[0]["fields"]
+
+
+def test_route_product_cell_validation_and_auth():
+    """Product-cell guard rails: bad figures 400 with pointed messages (JSON in
+    ajax mode, the product settings page re-rendered for a no-JS submit); an fb
+    save needs current tenanted prices to ride on; a rule-less product can
+    still take a retro; viewer and foreign-Origin posts are rejected."""
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "0", "ajax": "1"})
+            assert r.status_code == 400
+            assert "must be positive" in r.json()["errors"][0]
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "-1", "ajax": "1"})
+            assert r.status_code == 400
+            assert "must not be negative" in r.json()["errors"][0]
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "120", "ajax": "1"})
+            assert r.status_code == 400
+            assert "net price would be zero or negative" in r.json()["errors"][0]
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": "NOPE", "fb_price": "100", "ajax": "1"})
+            assert r.status_code == 404
+            assert not fa.calls, "failed posts write nothing (ANY table)"
+            # a no-JS validation error re-renders the product settings page
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "0"}, follow_redirects=False)
+            assert r.status_code == 400 and 'name="new_fb"' in r.text
+            # foreign Origin rejected even for an admin
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130", "ajax": "1",
+            }, headers={"Origin": "https://evil.example"})
+            assert r.status_code == 403
+        with FakeAuthClient("viewer") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130", "ajax": "1"})
+            assert r.status_code == 403
+
+    # a product with NO current prices can take a retro (it drives the retro
+    # reconciliation and the Net column) but not an FB list price
+    prods = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 5.0, "retro_eligible": True}}]
+    with FakeAirtable([], products=prods) as fa2:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "100", "ajax": "1"})
+            assert r.status_code == 400
+            assert "no current tenanted prices" in r.json()["errors"][0]
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "6.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            prod_ups = [recs for op, t, recs in fa2.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            assert prod_ups and prod_ups[0][0]["fields"]["retro_per_keg"] == 6.0
+            assert not _creates(fa2), "no rules to reflow"
+
+
+def test_route_product_cell_joint_save_validates_pair():
+    """A row save posts BOTH figures in one request: the pair is validated
+    together (lowering the list below the OLD retro is fine when the new retro
+    comes down with it) and applied in one successor set. The same pair split
+    across two requests would 400 on the fb leg — the single row POST is what
+    makes it commitable from the grid."""
+    prods = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 100.0, "retro_eligible": True}}]
+
+    def _rec():
+        rec = _grid_rule("rec_old")
+        rec["fields"]["fb_price"] = 120.0
+        rec["fields"]["retro_pct"] = 100.0 / 120.0
+        return rec
+
+    with FakeAirtable([_rec()], products=prods) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "90.00",
+                "retro_gbp": "50.00", "ajax": "1",
+            })
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            created = _creates(fa)
+            assert len(created) == 1
+            f = created[0]["fields"]
+            assert f["fb_price"] == 90.0 and f["tenant_price"] == 180.0
+            assert abs(f["retro_pct"] - 50.0 / 90.0) < 1e-9
+            prod_ups = [recs for op, t, recs in fa.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            assert prod_ups and prod_ups[0][0]["fields"]["retro_per_keg"] == 50.0
+
+    with FakeAirtable([_rec()], products=prods):
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "90.00", "ajax": "1"})
+            assert r.status_code == 400
+            assert "net price would be zero or negative" in r.json()["errors"][0]
+
+
+def test_route_product_cell_future_guard_and_varies_floor():
+    """Cost edits are refused while a future-dated change is scheduled (the
+    grid shows today's billing figure while the standing rules already carry
+    the scheduled one — a silent swallow or wrong reflow would follow); and on
+    a 'varies' product the retro is checked against the LOWEST current list
+    price, so a fat-fingered retro can't drive any site's net negative."""
+    future = (date.today() + timedelta(days=10)).isoformat()
+    fut = _pr_record("rec_fut", _key(future), valid_from=future)
+    fut["fields"].update({"tenant_price": 185.0, "status": "tenanted",
+                          "fb_price": 130.0})
+    with FakeAirtable([fut]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "125.00", "ajax": "1"})
+            assert r.status_code == 400
+            assert "future-dated price change" in r.json()["errors"][0]
+            assert not _creates(fa) and not _updates(fa)
+
+    sites2 = SITES + [{"id": SITE2_REC, "fields": {"site_id": SITE2_ID}}]
+    r1 = _grid_rule("rec_s1")
+    r1["fields"]["fb_price"] = 120.0
+    r2 = {"id": "rec_s2", "fields": {
+        "rule_key": f"{SITE2_ID}|{PROD_CODE}|2026-01-01", "site": [SITE2_REC],
+        "product": [PROD_REC], "valid_from": "2026-01-01",
+        "tenant_price": 175.0, "status": "tenanted", "fb_price": 125.0}}
+    with FakeAirtable([r1, r2], sites=sites2) as fa2:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "130.00", "ajax": "1"})
+            assert r.status_code == 400
+            assert "net price would be zero or negative" in r.json()["errors"][0]
+            # a retro between the two lists must ALSO fail, against the
+            # LOWEST list — max(cur_fbs) would wrongly wave £122 through
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "122.00", "ajax": "1"})
+            assert r.status_code == 400 and "£120.00" in r.json()["errors"][0], (
+                "the floor must be the LOWEST current list price"
+            )
+            assert not _creates(fa2)
+            # a sane retro still lands across both sites, each at its own
+            # list — posted alongside a BLANK fb (exactly what the no-JS row
+            # form sends on a 'varies' product): blank fb means KEEP
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "",
+                "retro_gbp": "13.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json()["saved"] is True
+            created = _creates(fa2)
+            assert len(created) == 2
+            fbs = sorted(f["fields"]["fb_price"] for f in created)
+            assert fbs == [120.0, 125.0], "blank fb must keep each rule's own list"
+            pcts = sorted(f["fields"]["retro_pct"] for f in created)
+            assert abs(pcts[0] - 13.0 / 125.0) < 1e-9
+            assert abs(pcts[1] - 13.0 / 120.0) < 1e-9
+
+
+def test_route_product_cell_nonfinite_and_resync():
+    """'1e400'/'inf'/'nan' are rejected with the pointed message (never an
+    estate-wide Infinity write); and a retro save whose figure matches
+    Products but NOT the rules (a prior partial failure) re-runs the reflow
+    instead of no-opping — the grid heals the divergence."""
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            for bad in ("1e400", "inf", "nan"):
+                r = client.post("/master/product-cell/apply", data={
+                    "product_code": PROD_CODE, "fb_price": bad, "ajax": "1"})
+                assert r.status_code == 400, bad
+                assert "enter the FB list price" in r.json()["errors"][0]
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "nan", "ajax": "1"})
+            assert r.status_code == 400
+            assert not fa.calls, "nothing may be written for non-finite input"
+
+    # Products already says £13 (a previous save's update_product landed) but
+    # the rules still carry 10/120 — the reflow must run again, and once the
+    # rules agree the same figure becomes a true no-op.
+    prods = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 13.0, "retro_eligible": True}}]
+    rec2 = _grid_rule("rec_old")
+    rec2["fields"]["fb_price"] = 120.0
+    rec2["fields"]["retro_pct"] = 10.0 / 120.0
+    with FakeAirtable([rec2], products=prods) as fa2:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "13.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            created = _creates(fa2)
+            assert len(created) == 1
+            assert abs(created[0]["fields"]["retro_pct"] - 13.0 / 120.0) < 1e-9
+            calls_before = len(fa2.calls)
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "13.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": False}
+            assert len(fa2.calls) == calls_before, "healed state must no-op"
+
+
+def test_route_product_cell_retro_remove_same_day_clears_pct():
+    """Removing a retro the SAME DAY as an earlier re-date: the successor
+    PATCHes today's existing rule in place, and the generic upsert never
+    sends a zero retro_pct — so the route must follow up with an explicit
+    clear or the rule silently keeps the old percentage. The retry of a
+    half-landed removal (Products already 0, rules still carrying the pct)
+    must reflow + clear too, not no-op."""
+    today_iso = date.today().isoformat()
+
+    def _today_rec():
+        rec = _pr_record("rec_today", _key(today_iso), valid_from=today_iso)
+        rec["fields"].update({"tenant_price": 180.0, "status": "tenanted",
+                              "fb_price": 120.0, "retro_pct": 13.0 / 120.0})
+        return rec
+
+    prods13 = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 13.0, "retro_eligible": True}}]
+    with FakeAirtable([_today_rec()], products=prods13) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            clears = [u for u in _updates(fa) if u["fields"] == {"retro_pct": 0}]
+            assert [u["id"] for u in clears] == ["rec_today"], (
+                "the stale retro_pct must be explicitly zeroed"
+            )
+            pf = [recs for op, t, recs in fa.calls
+                  if op == "update" and t == airtable_io.T["Products"]]
+            assert pf and pf[0][0]["fields"]["retro_per_keg"] == 0.0
+
+    # partial-failure retry: Products already 0, rules still carry the pct —
+    # the blank re-save must reflow + clear rather than answer saved:false.
+    prods0 = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 0.0, "retro_eligible": False}}]
+    with FakeAirtable([_today_rec()], products=prods0) as fa2:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}
+            clears = [u for u in _updates(fa2) if u["fields"] == {"retro_pct": 0}]
+            assert [u["id"] for u in clears] == ["rec_today"], (
+                "the half-landed removal must heal on retry"
+            )
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -1743,6 +2137,14 @@ TESTS = [
     test_route_universal_increase_preview_apply,
     test_route_site_create_end_all_delete,
     test_route_product_settings_rename_end_all_delete,
+    test_render_master_pivot_product_cells_editable,
+    test_route_product_cell_fb_save,
+    test_route_product_cell_retro_save_and_remove,
+    test_route_product_cell_validation_and_auth,
+    test_route_product_cell_joint_save_validates_pair,
+    test_route_product_cell_future_guard_and_varies_floor,
+    test_route_product_cell_nonfinite_and_resync,
+    test_route_product_cell_retro_remove_same_day_clears_pct,
     test_route_upload_master_updates_grid_immediately,
     test_route_export_master_from_snapshot,
     test_route_apply_revalidates_tampered_hidden_inputs,

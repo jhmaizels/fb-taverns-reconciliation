@@ -74,6 +74,7 @@ from reconcile import (  # noqa: E402
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from deal_products import build_deal_products_payload, token_ok  # noqa: E402
 from airtable_io import (  # noqa: E402
+    clear_rule_retro_pcts,
     create_site,
     delete_product,
     delete_site,
@@ -2145,6 +2146,242 @@ async def master_product_apply(
         logger.exception("snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
     return _back()
+
+
+@app.post("/master/product-cell/apply")
+async def master_product_cell_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """The pivot's in-grid Price / Retro P/Keg cells (edit mode). Applies ONE
+    product-level figure — the FB list price (fb_price) or the retro £/keg
+    (retro_gbp) — estate-wide from today, with the SAME semantics as the
+    product-settings save branch above: every current tenanted price is
+    re-dated from today with the new cost figures, tenant prices untouched; a
+    retro change also updates Products.retro_per_keg. ajax=1 opts into the
+    per-cell JSON the grid's save driver reads (mirrors /master/cell/apply);
+    the native no-JS submit 303s back to the grid, re-rendering the product
+    settings page on validation errors."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    product_code = (form.get("product_code") or "").strip()
+    fsite = (form.get("fsite") or "").strip()
+    fq = (form.get("fq") or "").strip()
+    wants_json = (form.get("ajax") or "").strip() == "1"
+
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("request failed")
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
+        return _error_page(_GENERIC_ERR)
+    if product_code not in snap.product_ids:
+        if wants_json:
+            return JSONResponse(
+                {"ok": False, "errors": [f"{product_code} is not on the master."]},
+                status_code=404,
+            )
+        return _master_not_found_page(principal, product_code)
+
+    def _rerender(errors: list[str], status_code: int = 400):
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": errors}, status_code=status_code)
+        body = master_pages.render_product_page(
+            snap, product_code, fsite=fsite, fq=fq, errors=errors
+        )
+        return HTMLResponse(
+            f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+            status_code=status_code,
+        )
+
+    def _back(saved: bool):
+        if wants_json:
+            return JSONResponse({"ok": True, "saved": saved})
+        back = [("edit", "1")]
+        if fsite:
+            back.append(("site", fsite))
+        if fq:
+            back.append(("q", fq))
+        qs = ([("saved", "1")] if saved else []) + back
+        return RedirectResponse(
+            ext_url("/master") + "?" + urlencode(qs), status_code=303
+        )
+
+    # The grid's row form posts ONE OR BOTH fields (Enter in either cell
+    # submits the Price+Retro pair, which is validated TOGETHER — that is
+    # what lets a lowered list and lowered retro commit without deadlocking
+    # on the stale counterpart). Presence — not emptiness — decides which
+    # figures are being set: a blank FB price is a keep (the grid restores
+    # the cell client-side); a blank retro is £0.
+    new_fb: float | None = None
+    new_retro: float | None = None
+    if "fb_price" in form:
+        raw = (form.get("fb_price") or "").strip()
+        if raw:
+            try:
+                new_fb = float(raw)
+            except (TypeError, ValueError):
+                new_fb = None
+            # isfinite: float() happily accepts 'nan'/'inf'/'1e400' — an
+            # Infinity would fan out estate-wide and die opaquely at Airtable.
+            if new_fb is None or not math.isfinite(new_fb):
+                return _rerender(["enter the FB list price in £, e.g. 130.00"])
+    if "retro_gbp" in form:
+        raw = (form.get("retro_gbp") or "").strip()
+        if raw:
+            try:
+                new_retro = float(raw)
+            except (TypeError, ValueError):
+                new_retro = None
+            if new_retro is None or not math.isfinite(new_retro):
+                return _rerender(["enter the retro in £ per keg, e.g. 13.00"])
+        else:
+            new_retro = 0.0
+
+    # Same current-state + change detection as the product-settings save branch.
+    today = date.today()
+    open_rules = [
+        r for r in snap.rules
+        if r.product_code == product_code and r.valid_to is None
+    ]
+    # While a future-dated change is scheduled (e.g. an annual increase not yet
+    # effective), the grid shows today's BILLING figure but the standing open
+    # rules already carry the scheduled one — a grid edit would silently no-op
+    # or reflow the wrong population. Refuse with a pointer instead.
+    if any(r.valid_from is not None and r.valid_from > today for r in open_rules):
+        return _rerender([
+            "a future-dated price change is already scheduled for this product "
+            "— edit its rules from the detailed list view instead, or wait "
+            "until the scheduled change takes effect"
+        ])
+    cur_fbs = {round(r.fb_price, 4) for r in open_rules if r.fb_price is not None}
+    cur_fb = next(iter(cur_fbs)) if len(cur_fbs) == 1 else None
+    cur_retro = (
+        (getattr(snap, "products", {}) or {}).get(product_code) or {}
+    ).get("retro_per_keg") or 0.0
+
+    fb_changed = new_fb is not None and (
+        cur_fb is None or abs(new_fb - cur_fb) > 0.005 or len(cur_fbs) > 1
+    )
+    retro_final = new_retro if new_retro is not None else cur_retro
+    retro_changed = new_retro is not None and abs(new_retro - cur_retro) > 0.005
+    if new_fb is not None and new_fb <= 0:
+        return _rerender(["the FB list price must be positive"])
+    if new_retro is not None and new_retro < 0:
+        return _rerender(["the retro must not be negative"])
+    fb_for_net = new_fb if new_fb is not None else cur_fb
+    if fb_for_net is None and cur_fbs:
+        # FB list varies across sites (cur_fb is None): check the retro
+        # against the LOWEST current list price — a retro at or above it
+        # would drive that site's net to zero or below.
+        fb_for_net = min(cur_fbs)
+    if fb_for_net is not None and retro_final >= fb_for_net > 0:
+        return _rerender([
+            f"retro £{retro_final:.2f}/keg is at or above the FB list price "
+            f"£{fb_for_net:.2f} — the net price would be zero or negative"
+        ])
+    if new_retro is not None and not retro_changed:
+        # Self-healing after a partial failure (Products updated, rule reflow
+        # failed): if any current tenanted rule's implied retro (retro_pct ×
+        # list) disagrees with the figure being saved, treat the save as a
+        # change so the reflow — and, for removals, the explicit retro_pct
+        # clear below — runs again instead of no-opping.
+        for r in open_rules:
+            if (r.status or "tenanted") != "tenanted":
+                continue
+            if not r.fb_price:
+                continue
+            if abs((r.retro_pct or 0.0) * r.fb_price - retro_final) > 0.005:
+                retro_changed = True
+                break
+    if not fb_changed and not retro_changed:
+        return _back(saved=False)
+
+    info = (getattr(snap, "products", {}) or {}).get(product_code) or {}
+    desc = (info.get("desc") or "").strip()
+    if not desc:
+        desc = next((r.product_desc for r in open_rules if r.product_desc),
+                    product_code)
+
+    # FB list / retro change: re-date every current tenanted price for this
+    # product from today with the new figures — tenant prices unchanged, so
+    # only the cost side (and therefore margins) moves. History kept.
+    successors: list = []
+    for r in open_rules:
+        if (r.status or "tenanted") != "tenanted":
+            continue
+        if r.valid_from is not None and r.valid_from > today:
+            continue
+        fb = new_fb if new_fb is not None else r.fb_price
+        retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
+        successors.append(Rule(
+            site_id=r.site_id, product_code=product_code,
+            product_desc=r.product_desc or desc,
+            tenant_price=r.tenant_price, fb_price=fb, retro_pct=retro_pct,
+            valid_from=today, valid_to=None, status="tenanted",
+            reason=f"grid: list/retro updated (was fb {r.fb_price}, retro £{cur_retro:g})",
+            source=f"product-cell:{principal.email}",
+        ))
+    if fb_changed and not successors:
+        return _rerender([
+            "this product has no current tenanted prices for the FB list price "
+            "to ride on — add a site price first, or use the product settings page"
+        ])
+
+    if retro_changed:
+        try:
+            await run_in_threadpool(
+                update_product, product_code, product_code, desc, retro_final
+            )
+        except ValueError as exc:
+            return _rerender([str(exc)])
+        except Exception:
+            logger.exception("product cell retro update failed")
+            if wants_json:
+                return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
+            return _error_page(_GENERIC_ERR)
+    if successors:
+        try:
+            await run_in_threadpool(upsert_pricing_rules, successors, today)
+        except Exception:
+            logger.exception("product cell fb/retro rules rewrite failed")
+            if wants_json:
+                return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
+            return _error_page(_GENERIC_ERR)
+    if retro_changed and retro_final == 0 and successors:
+        # Retro REMOVAL: the generic upsert never sends a zero retro_pct (a
+        # same-key PATCH must not clear retros it wasn't told about), so a
+        # rule updated in place — e.g. a second edit the same day — would
+        # silently keep the old percentage. Clear it explicitly on exactly
+        # the keys just written.
+        try:
+            await run_in_threadpool(
+                clear_rule_retro_pcts,
+                [(s.site_id, s.product_code) for s in successors], today,
+            )
+        except Exception:
+            logger.exception("product cell retro_pct clear failed")
+            if wants_json:
+                return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
+            return _error_page(_GENERIC_ERR)
+
+    from dataclasses import replace as _dc_replace
+    try:
+        products = dict(getattr(snap, "products", {}) or {})
+        pinfo = dict(products.get(product_code) or {})
+        pinfo["desc"] = pinfo.get("desc") or desc
+        pinfo["retro_per_keg"] = retro_final
+        products[product_code] = pinfo
+        patched = _dc_replace(snap, products=products)
+        if successors:
+            patched = patch_snapshot_for_bulk_upsert(patched, successors, today)
+        publish_patched_snapshot(patched)
+    except Exception:
+        logger.exception("snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+    return _back(saved=True)
 
 
 @app.get("/master/increase", response_class=HTMLResponse)

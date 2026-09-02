@@ -716,6 +716,40 @@ def set_product_retro(
     return len(successors)
 
 
+def clear_rule_retro_pcts(pairs: list[tuple[str, str]], valid_from) -> int:
+    """Explicitly ZERO retro_pct on the rules keyed by the given
+    (site_id, product_code) pairs at ``valid_from``.
+
+    ``upsert_pricing_rules`` deliberately never sends a zero retro_pct — a
+    same-key PATCH must not clear a retro it wasn't told about — so a retro
+    REMOVAL leaves the old percentage on any rule that was updated in place
+    (e.g. a second edit on the same day). This targeted follow-up clears
+    exactly the keys the caller just re-dated. Rows whose retro_pct is
+    already empty/zero are left untouched. Returns the number patched.
+    """
+    keys = [_rule_key(s, p, valid_from) for s, p in pairs]
+    keys = [k for k in keys if '"' not in k]
+    if not keys:
+        return 0
+    updates: list[dict] = []
+    for i in range(0, len(keys), 50):
+        chunk = keys[i:i + 50]
+        formula = "OR(" + ",".join(f'{{rule_key}}="{k}"' for k in chunk) + ")"
+        want = set(chunk)
+        recs = _list_all(T["PricingRules"], fields=["rule_key", "retro_pct"],
+                         filter_by_formula=formula)
+        updates.extend(
+            {"id": r["id"], "fields": {"retro_pct": 0}}
+            for r in recs
+            if (r.get("fields") or {}).get("rule_key") in want
+            and (r.get("fields") or {}).get("retro_pct")
+        )
+    if updates:
+        _batch(updates, "update", T["PricingRules"])
+        invalidate_master_cache()
+    return len(updates)
+
+
 def delete_product(code: str) -> None:
     """Delete a Products record — ONLY when no pricing rule references it
     (typo cleanup). A product with rule history keeps its record; use
