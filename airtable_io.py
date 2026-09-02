@@ -1328,6 +1328,14 @@ def _split_codes(v) -> list[str]:
     return [c.strip().upper() for c in str(v or "").replace("\\", "/").split("/") if c.strip()]
 
 
+# Tennents SKU codes are plain ASCII alphanumerics (090425, T00045238, GUI002,
+# 09000X). Anything else is refused by the accept path: a '/'-joined value would
+# be split into separate codes on the next load, and zero-width / fullwidth
+# characters would mint a visually-identical duplicate row no report code can
+# ever match.
+_CODE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+
 def _same_code(a: str, b: str) -> bool:
     """Equal SKU codes, tolerating Excel/pandas leading-zero drift (090425 vs 90425)
     the same way TennentsMaster.find_sku does."""
@@ -1414,11 +1422,8 @@ def accept_tennents_sku(
     code = str(sku_code or "").strip().upper()
     if not code:
         raise ValueError("sku_code is required")
-    if "/" in code or "\\" in code or any(ch.isspace() for ch in code):
-        # A '/'-joined value is split into separate codes on the next load, so a
-        # compound code would smuggle another SKU's code past the ownership
-        # guards (and 'new' would mint a junk primary). One code per action.
-        raise ValueError(f"{code!r} is a compound or malformed code — link or add each code separately")
+    if len(code) > 32 or any(ch not in _CODE_CHARS for ch in code):
+        raise ValueError(f"{code!r} is a compound or malformed code — one plain alphanumeric code per action")
     stamp = f"{FINDINGS_SOURCE_PREFIX}{(actor or '').strip()} {(source_file or '').strip()}".strip()
     lookup = _tennents_sku_lookup()
     tid = T["TennentsSkuMaster"]
@@ -1475,6 +1480,9 @@ def accept_tennents_sku(
         # base + hold must equal the total (the master arithmetic check), so net
         # the row's existing Mar-26 hold out of the charged total.
         hold = float(row.get("hold_per_brl") or 0.0)
+        if total < hold:
+            raise ValueError(f"charged £{total:.2f}/brl is below this SKU's Mar-26 hold of £{hold:.2f}/brl — "
+                             "the base would be negative; confirm the rate with Tennents and set it in the workbook")
         _batch([{"id": row["id"], "fields": {
             "correct_total_per_brl": total, "contract_base_per_brl": round(total - hold, 2),
             "source": stamp,
@@ -1725,6 +1733,8 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
                 host = rec_by_prim.get(host_prim)
                 if host is not None and f_alts:
                     _add_alts(host, host_prim, f_alts, f_stamp)
+                elif f_alts:
+                    dropped_alts += f_alts      # host is a re-created findings row: log, never lose silently
                 continue
             # The workbook doesn't know this in-app SKU at all → re-create it,
             # minus any of ITS alts the workbook has since assigned elsewhere.
@@ -1749,8 +1759,8 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
         if wb.get("correct_total_per_brl") is None and f.get("correct_total_per_brl") is not None:
             p = patches.setdefault(rec["id"], {})
             p.setdefault("correct_total_per_brl", f["correct_total_per_brl"])   # keep a findings rate
-            if f.get("contract_base_per_brl") is not None:
-                p.setdefault("contract_base_per_brl", f["contract_base_per_brl"])
+            if f.get("contract_base_per_brl") is not None and wb.get("contract_base_per_brl") is None:
+                p.setdefault("contract_base_per_brl", f["contract_base_per_brl"])   # never over a workbook base
             p["source"] = f_stamp
     reapply_patch = [{"id": rid, "fields": flds} for rid, flds in patches.items() if flds]
     preserved = len(reapply_create) + len(reapply_patch)

@@ -226,6 +226,24 @@ def test_accept_primitive():
             except ValueError as e:
                 _check(f"{mode}: refuses compound code {bad!r}", "compound" in str(e), str(e))
     _check("compound refusal wrote nothing", not fake.patches and not fake.creates)
+    # zero-width / soft-hyphen / fullwidth characters would mint a visually-identical duplicate row
+    for bad in ("ALT2​", "NEW­C", "０９０４２５", "A|B", "A;B"):
+        try:
+            aio.accept_tennents_sku("new", bad, "james@x", "f", sku_desc="x", charged_total="70")
+            _check(f"new: refuses non-ASCII / punctuation code {bad!r}", False)
+        except ValueError:
+            _check(f"new: refuses non-ASCII / punctuation code {bad!r}", True)
+    _check("plain codes still accepted (T00045238-style)",
+           aio.accept_tennents_sku("new", "T00099997", "james@x", "f", sku_desc="ok", charged_total="70")["action"] == "created")
+    # set_rate: a charged total below the row's Mar-26 hold would give a negative base -> refused
+    fake = FakeIO([{"id": "rH2", "fields": {"sku_code": "HOLDY2", "alt_code": "", "correct_total_per_brl": None,
+                                             "hold_per_brl": 12.33, "source": "wb"}}])
+    _install(fake)
+    try:
+        aio.accept_tennents_sku("set_rate", "HOLDY2", "james@x", "f", charged_total="5")
+        _check("set_rate: refuses a charged total below the hold (negative base)", False)
+    except ValueError as e:
+        _check("set_rate: refuses a charged total below the hold (negative base)", "below" in str(e) and not fake.patches, str(e))
 
 
 def test_preserve_on_replace():
@@ -348,6 +366,18 @@ def test_preserve_on_replace():
     _check("re-created findings SKU keeps only its UNCLAIMED alt (A1); A2 stays the workbook's",
            md.find_sku("NEW1") is not None and md.find_sku("A1") is not None and md.find_sku("A1").sku_code == "NEW1"
            and md.find_sku("A2").sku_code == "OLD1" and p10 == 1, f"p={p10}")
+    # ...and the DRIFT-spelled variant of that branch (pre-hardening left 090999 on TWO rows)
+    fk = FakeIO([{"id": "d6", "fields": {"sku_code": "NEW1", "alt_code": "A1/090999",
+                                          "correct_total_per_brl": 100.0, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v11", "wb", [sku("OLD1", "90999", "Old", "Old 50L", 50.0)], [], [], [])
+    _, _, p11 = aio.replace_tennents_master(wbd, source="wb_v11.xlsx")
+    md = aio.load_tennents_master()
+    by = {r["fields"]["sku_code"]: r["fields"] for r in fk.rows}
+    _check("re-created findings SKU drops a DRIFT-spelled alt the workbook claims (090999 ~ 90999 -> OLD1 only)",
+           by["NEW1"].get("alt_code") == "A1" and md.find_sku("090999") is not None
+           and md.find_sku("090999").sku_code == "OLD1" and md.find_sku("90999").sku_code == "OLD1" and p11 == 1,
+           f"{by['NEW1'].get('alt_code')} p={p11}")
 
 
 # ---------- rendering ----------
@@ -409,8 +439,10 @@ def test_render():
         tn.NoRateRow("11110002", "MANAGED HOUSE", "401211", "T.Bavarian 50L", 1.0, 0.3055, 300.00, "", 300.00, 300.00),
     ]
     # same unknown code at two sites, two discounts (the real Aug-26 Heverlee 30L case)
+    # one row carries a PADDED raw code ("(401187 )" in the report — _SKU_PAT keeps the space), so the
+    # cross-row range only groups both rows if the keys are whitespace-normalised
     s2.not_on_master = [
-        tn.NotOnMasterRow("11110001", "STANDARD ARMS", "401187", "Heverlee 4.4% 30L Keg", 1.0, 0.1833, 107.8, 370.34, 370.34, 370.34),
+        tn.NotOnMasterRow("11110001", "STANDARD ARMS", "401187 ", "Heverlee 4.4% 30L Keg", 1.0, 0.1833, 107.8, 370.34, 370.34, 370.34),
         tn.NotOnMasterRow("11110002", "MANAGED HOUSE", "401187", "Heverlee 4.4% 30L Keg", 1.0, 0.1833, 114.9, 161.31, 161.31, 161.31),
     ]
     html_m = tn.render_summary_html(s2, accept_url="/x", can_accept=True, source_file="f", master=m)
@@ -420,7 +452,7 @@ def test_render():
            "data-mode='new'" not in html_m and html_m.count("data-mode='link'") == 2)
     cfg_m = html_m.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
     cfg_j = json.loads(cfg_m.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
-    hev = [x for x in cfg_j["email"]["not_on_master"] if x["sku"] == "401187"]
+    hev = [x for x in cfg_j["email"]["not_on_master"] if x["sku"].strip() == "401187"]
     # both rows must carry the CROSS-ROW range (a per-row fallback would give 370.34/370.34 and 161.31/161.31)
     _check("email config carries the cross-row charged RANGE on EVERY row of a mixed code",
            len(hev) == 2 and all(x["lo"] == 161.31 and x["hi"] == 370.34 for x in hev), str(hev))
