@@ -37,7 +37,7 @@ from master_changes import (
     compute_margin,
     margin_of,
 )
-from reconcile import Rule, _parse_date
+from reconcile import Rule, _parse_date, is_support_rule, select_winners, winning_rule
 
 AIRTABLE_BASE_URL = f"https://airtable.com/{BASE_ID}"
 
@@ -302,19 +302,20 @@ def change_to_hidden_fields(change: MasterChange) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _pivot_winners(snap: MasterSnapshot, on: date) -> dict[tuple, Rule]:
-    """Current winning rule per (site_id, product_code) on ``on`` — the newest
-    valid_from among rules whose half-open window contains ``on``. This is the
-    SAME selection the reconciler and the list grid use, so the pivot shows the
-    price that would actually bill today."""
-    per_key: dict[tuple, list[Rule]] = {}
-    for r in snap.rules:
-        if _contains(r.valid_from, r.valid_to, on):
-            per_key.setdefault((r.site_id, r.product_code), []).append(r)
-    winners: dict[tuple, Rule] = {}
-    for k, lst in per_key.items():
-        lst.sort(key=lambda r: r.valid_from or date.min, reverse=True)
-        winners[k] = lst[0]
-    return winners
+    """Current winning rule per (site_id, product_code) on ``on`` — an
+    in-window support first, then the newest valid_from, among rules whose
+    half-open window contains ``on`` (reconcile.rule_precedence). This is the
+    SAME selection the reconciler, the list grid and the export use, so the
+    pivot shows the price that would actually bill today."""
+    return select_winners(snap.rules, on)
+
+
+def _support_title(w: Rule | None) -> str:
+    """Hover text for a cell whose winner is a temporary support."""
+    if w is None or not is_support_rule(w):
+        return ""
+    until = f"until {w.valid_to.isoformat()}" if w.valid_to else "open-ended"
+    return f"Supported price ({until}) — the standard price resumes when the support ends"
 
 
 # Margin colour bands (operator-set 2026-07-02): gross-margin % of the tenant
@@ -340,6 +341,8 @@ def _pivot_cell(winner: Rule | None) -> str:
     (Edit mode renders inline input cells instead — see _edit_cell.)"""
     if winner is None or winner.tenant_price is None:
         return '<td class="num"><span class="pivot-empty">·</span></td>'
+    sup = _support_title(winner)
+    td_open = f'<td class="num cell-support" title="{escape(sup)}">' if sup else '<td class="num">'
     price = f'<span class="cell-price">{escape(_money(winner.tenant_price))}</span>'
     m = margin_of(winner)
     if m.net_gbp is None:
@@ -351,7 +354,7 @@ def _pivot_cell(winner: Rule | None) -> str:
             else '<span class="pct">n/a</span>'
         )
         margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
-    return f'<td class="num">{price}{margin}</td>'
+    return f'{td_open}{price}{margin}</td>'
 
 
 def render_master_pivot(
@@ -582,11 +585,17 @@ def render_master_pivot(
                     else '<span class="pct">n/a</span>'
                 )
                 margin = f'<span class="cell-margin {cls}">{escape(_money(m.net_gbp))}{pct}</span>'
+        sup = _support_title(w)
+        title = f"{_site_name(sid) or sid} — type a price and press Enter; clear + Enter removes it"
+        if sup:
+            # Editing a supported cell edits the SUPPORT itself (in place);
+            # clearing it ends the support and the standard price resumes.
+            title = f"{_site_name(sid) or sid} — {sup}. Enter changes the support price; clear + Enter ends the support"
         return (
-            f'<td class="num edit-cell"><form method="post" action="{apply_url}" class="cellf">'
+            f'<td class="num edit-cell{" cell-support" if sup else ""}"><form method="post" action="{apply_url}" class="cellf">'
             f'{hidden}<input type="number" step="0.01" min="0" name="tenant_price" '
             f'class="cell-input" value="{val}" data-prev="{val}" '
-            f'title="{escape(_site_name(sid) or sid)} — type a price and press Enter; clear + Enter removes it">'
+            f'title="{escape(title)}">'
             f'{margin}</form></td>'
         )
 
@@ -1159,8 +1168,18 @@ def render_increase_preview_page(pct: float, vf: date, stats: dict, warnings: li
         f'<div class="master-banner">⚠ {escape(w)}</div>' for w in warnings
     )
     skipped_bits = []
+    if stats.get("n_supports"):
+        skipped_bits.append(
+            f'{stats["n_supports"]} supported price(s) kept as agreed — only their FB list '
+            "price follows the increase (they keep winning at their site for their window)"
+        )
     if stats.get("skipped_support"):
-        skipped_bits.append(f'{stats["skipped_support"]} supported/managed rule(s) left alone')
+        skipped_bits.append(
+            f'{stats["skipped_support"]} supported rule(s) left alone entirely '
+            "(no standing list price to follow)"
+        )
+    if stats.get("skipped_managed"):
+        skipped_bits.append(f'{stats["skipped_managed"]} managed rule(s) left alone')
     if stats.get("skipped_future"):
         skipped_bits.append(f'{stats["skipped_future"]} future-dated rule(s) left alone')
     if stats.get("skipped_no_price"):
@@ -1256,7 +1275,8 @@ def render_master_grid(
 
     # Winner per (site, product) on the reference date — computed over the WHOLE
     # snapshot (an overlapping support may be filtered out of view but still
-    # wins). Newest valid_from first, mirroring reconcile._index_rules.
+    # wins). An in-window support first, then newest valid_from, mirroring
+    # reconcile._index_rules (rule_precedence).
     winners: dict[tuple, Rule] = {}
     if ref_date is not None:
         per_key: dict[tuple, list[Rule]] = {}
@@ -1265,8 +1285,7 @@ def render_master_grid(
                 per_key.setdefault((r.site_id, r.product_code), []).append(r)
         for key, lst in per_key.items():
             if len(lst) > 1:
-                lst.sort(key=lambda r: r.valid_from or date.min, reverse=True)
-                winners[key] = lst[0]
+                winners[key] = winning_rule(lst, ref_date)
 
     rule_created = getattr(snap, "rule_created", {}) or {}
     if show == "recent":
@@ -1386,7 +1405,9 @@ def render_master_grid(
         notes = (
             f'<p class="help">Overlapping rules exist for some (site, product) pairs — the rule marked '
             f'<span class="pill">wins on {ref_date.isoformat()}</span> is the one reconciliation uses on that date '
-            "(newest valid_from first). Overlaps are how temporary supports work; they are deliberate.</p>"
+            "(an in-window support first, then newest valid_from). Overlaps are how temporary supports "
+            "work; they are deliberate — a support keeps winning for its whole window, even after the "
+            "standing price is re-dated by a cost change.</p>"
         )
 
     admin_buttons = ""

@@ -43,7 +43,13 @@ from master_changes import (  # noqa: E402
     preview_master_change,
     validate_master_change,
 )
-from reconcile import Rule  # noqa: E402
+from reconcile import (  # noqa: E402
+    InvoiceLine,
+    Rule,
+    _index_rules,
+    _lookup_rule,
+    reconcile_lines,
+)
 
 # Reuse the close-guard test's synthetic master (same site/product fixtures).
 from test_upsert_close_guard import (  # noqa: E402
@@ -510,11 +516,14 @@ def test_preview_close_pass_skips_bounded_support_and_future_rule():
     assert [c["rule_key"] for c in p.will_close] == [_key("2026-01-01")], (
         f"only the prior open rule closes (guard mirrored), got {p.will_close}"
     )
-    # On 2026-07-02 the new rule (valid_from 2026-07-02) is newest and wins.
-    assert "new rule wins" in p.winner_note
-    # ...but the future open rule (2026-12-01) reclaims the win from its start —
-    # preview must say so, and it's a warning, not a block.
+    # On 2026-07-02 the bounded SUPPORT (Jun..Aug) is in window and outranks
+    # the new tenanted rule whatever the dates (reconcile.rule_precedence) —
+    # the preview names it, and warns that the new price bills outside it.
     assert not p.errors, p.errors
+    assert f"the support {_key('2026-06-01')}" in p.winner_note and "wins" in p.winner_note, p.winner_note
+    assert any("under a support" in w and _key("2026-06-01") in w for w in p.warnings), p.warnings
+    # ...and the future open rule (2026-12-01, same tier, newer) still reclaims
+    # the win from its start — preview must say so; a warning, not a block.
     assert "2026-12-01" in p.winner_note, p.winner_note
     assert any("2026-12-01" in w and "2026-07-02..2026-12-01" in w for w in p.warnings), p.warnings
 
@@ -2097,6 +2106,441 @@ def test_route_product_cell_retro_remove_same_day_clears_pct():
             )
 
 
+# --------------------------------------------------------------------------
+# Tenant supports keep winning through cost changes (defect fixed 2026-09-02)
+#
+# A support is a BOUNDED override layered over the still-open standing rule.
+# Every cost path re-dates the standing rule to today; with plain newest-
+# valid_from-first selection that successor silently cancelled the support
+# for the rest of its window (grid flipped to the standard price; the next
+# weekly upload raised false wrong_tenant_price at that site). The fix is
+# status-aware precedence everywhere + an in-place cost-side rewrite of the
+# support, so wrong_fb_price stays right inside the window.
+# --------------------------------------------------------------------------
+
+def _support_rec(
+    rec_id: str = "rec_sup", vf: date | None = None, vt: date | None = None,
+    tenant: float = 150.0, fb: float | None = 120.0, retro_pct: float | None = None,
+) -> dict:
+    """A bounded SUPPORT at the standard site/product in the /add-support
+    shape: status=supported, window today-30d..today+30d by default, the
+    agreed tenant price, fb inherited from the standard rule."""
+    vf = vf or (date.today() - timedelta(days=30))
+    vt = vt or (date.today() + timedelta(days=30))
+    rec = _pr_record(rec_id, _key(vf.isoformat()), valid_from=vf.isoformat(), valid_to=vt.isoformat())
+    rec["fields"].update({
+        "tenant_price": tenant, "status": "supported",
+        "reason": "hardship agreed with tenant", "source": "support_form (x)",
+    })
+    if fb is not None:
+        rec["fields"]["fb_price"] = fb
+    if retro_pct:
+        rec["fields"]["retro_pct"] = retro_pct
+    return rec
+
+
+def _master_after(fa: FakeAirtable) -> list[Rule]:
+    """The PricingRules as the fake WOULD hold them once its recorded PATCHes
+    are applied (the fake persists creates only), as Rule objects — for
+    reconcile-level assertions on what bills after a route ran."""
+    table = [{"id": rec["id"], "fields": dict(rec["fields"])} for rec in fa.tables[PR()]]
+    by_id = {rec["id"]: rec for rec in table}
+    for op, t, recs in fa.calls:
+        if op == "update" and t == PR():
+            for r in recs:
+                if r.get("id") in by_id:
+                    by_id[r["id"]]["fields"].update(r.get("fields") or {})
+    sites_by_id = {
+        rec["id"]: rec["fields"].get("site_id") for rec in fa.tables[airtable_io.T["Sites"]]
+    }
+    products_by_id = {
+        rec["id"]: (rec["fields"].get("product_code"), rec["fields"].get("description") or "")
+        for rec in fa.tables[airtable_io.T["Products"]]
+    }
+    out = []
+    for rec in table:
+        r = airtable_io._rule_from_rec(rec, sites_by_id, products_by_id)
+        if r is not None:
+            out.append(r)
+    return out
+
+
+def _bills(rules: list[Rule], on: date) -> Rule | None:
+    """What the reconciler applies on ``on`` at the standard site/product."""
+    return _lookup_rule(_index_rules(rules), SITE_ID, PROD_CODE, on)
+
+
+def _invoice(on: date, unit: float, master: float, qty: float = 4.0) -> InvoiceLine:
+    return InvoiceLine(
+        site_id=SITE_ID, site_name="Test Tavern", product_code=PROD_CODE,
+        product_desc="Test Keg", invoice_no="INV1", invoice_date=on, qty=qty,
+        unit_price=unit, master_price=master, diff_master=(unit - master) * qty,
+    )
+
+
+def _assert_support_kept(fa: FakeAirtable, sup_rec: dict, fb: float, retro_pct: float | None = None) -> None:
+    """The support was PATCHed in place under its own key with the new cost
+    figures — tenant price, window and status untouched, reason prepended —
+    and it still bills for its whole window (with the new list price); the
+    standing rule resumes after."""
+    today = date.today()
+    ups = [u for u in _updates(fa) if u["id"] == sup_rec["id"]]
+    assert len(ups) == 1, f"expected exactly one in-place PATCH of the support, got {ups}"
+    f = ups[0]["fields"]
+    sf = sup_rec["fields"]
+    assert f["rule_key"] == sf["rule_key"] and f["valid_from"] == sf["valid_from"], f
+    assert f.get("valid_to") == sf["valid_to"], f
+    assert f["status"] == "supported" and f["tenant_price"] == sf["tenant_price"], f
+    assert abs(f["fb_price"] - fb) < 1e-9, f
+    if retro_pct is not None:
+        assert abs(f.get("retro_pct", 0.0) - retro_pct) < 1e-9, f
+    assert "support price kept" in f["reason"] and f["reason"].endswith(sf["reason"]), f["reason"]
+    after = _master_after(fa)
+    for d in (today, today + timedelta(days=10), today + timedelta(days=29)):
+        w = _bills(after, d)
+        assert w is not None and w.status == "supported" and w.tenant_price == sf["tenant_price"], (d, w)
+        assert abs((w.fb_price or 0.0) - fb) < 1e-9, (d, w)
+    w = _bills(after, today + timedelta(days=30))
+    assert w is not None and w.status == "tenanted", f"the standing rule must resume after the window: {w}"
+
+
+def test_lookup_rule_in_window_support_outranks_later_tenanted():
+    """reconcile._index_rules/_lookup_rule: an in-window support wins over a
+    LATER-dated tenanted rule; standing rules (tenanted/managed) still resolve
+    newest-first among themselves; two supports resolve newest-first; the
+    window stays half-open; no invoice date -> newest rule as before."""
+    from reconcile import select_winners, winning_rule
+    today = date.today()
+    std = _rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0)
+    sup = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30),
+                tenant=150.0, status="supported")
+    succ = _rule(vf=today, tenant=180.0, fb=130.0)          # today-dated cost successor
+    std_closed = replace(std, valid_to=today)
+    idx = _index_rules([std_closed, sup, succ])
+    for d in (today, today + timedelta(days=10), today + timedelta(days=29)):
+        assert _lookup_rule(idx, SITE_ID, PROD_CODE, d) is sup, d
+    assert _lookup_rule(idx, SITE_ID, PROD_CODE, today + timedelta(days=30)) is succ, "half-open: window ended"
+    assert _lookup_rule(idx, SITE_ID, PROD_CODE, today - timedelta(days=31)) is std_closed, "before the support"
+    assert _lookup_rule(idx, SITE_ID, PROD_CODE, None) is succ, "no invoice date -> newest valid_from"
+    # managed ranks WITH tenanted: newest-first among standing rules, below a support
+    man = _rule(vf=today, tenant=None, status="managed")
+    assert _lookup_rule(_index_rules([std, sup, man]), SITE_ID, PROD_CODE, today) is sup
+    assert _lookup_rule(_index_rules([std, man]), SITE_ID, PROD_CODE, today) is man
+    assert _lookup_rule(_index_rules([man, std]), SITE_ID, PROD_CODE, today) is man
+    # two overlapping supports: newest valid_from wins
+    sup2 = _rule(vf=today - timedelta(days=5), vt=today + timedelta(days=5), tenant=140.0, status="supported")
+    assert _lookup_rule(_index_rules([std, sup, sup2]), SITE_ID, PROD_CODE, today) is sup2
+    # the whole-master helpers agree with the reconciler
+    assert select_winners([std_closed, sup, succ], today)[(SITE_ID, PROD_CODE)] is sup
+    assert winning_rule([std_closed, sup, succ], today + timedelta(days=30)) is succ
+    assert (SITE_ID, PROD_CODE) not in select_winners([sup], today + timedelta(days=30))
+
+
+def test_route_product_cell_fb_change_keeps_support():
+    """THE DEFECT through the grid's Price cell: the standing price is
+    re-dated to today as before, but the in-window support keeps winning for
+    its whole window and only its COST side moves (in place), so a delivery
+    invoiced at the agreed support price stays clean."""
+    today = date.today()
+    std = _grid_rule("rec_old")            # tenant 180 since January
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")          # tenant 150, today-30d..today+30d
+    with FakeAirtable([std, sup]) as fa:
+        before = airtable_io.load_rules_from_airtable()
+        assert _bills(before, today).status == "supported"
+        assert _bills(before, today + timedelta(days=10)).tenant_price == 150.0
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130.00", "ajax": "1",
+            })
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}, r.text[:300]
+            created = _creates(fa)
+            assert len(created) == 1, created
+            f = created[0]["fields"]
+            assert (f["tenant_price"], f["fb_price"], f["status"], f["valid_from"]) == (
+                180.0, 130.0, "tenanted", today.isoformat()
+            ), f
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"], closes
+            _assert_support_kept(fa, sup, fb=130.0)
+            after = _master_after(fa)
+            sites = {SITE_ID: {"status": "tenanted"}}
+            # a 4-keg delivery at the AGREED £150 against LWC's new £130 master is clean...
+            ms = reconcile_lines([_invoice(today, 150.0, 130.0)], after, sites)
+            assert [m.type for m in ms] == [], [m.type for m in ms]
+            # ...and one at the STANDARD £180 is the mismatch, against the support
+            ms2 = reconcile_lines([_invoice(today + timedelta(days=10), 180.0, 130.0)], after, sites)
+            assert [m.type for m in ms2] == ["wrong_tenant_price"] and ms2[0].rule.status == "supported", ms2
+            # the grid (patched cache) shows the support price, flagged as supported
+            g = client.get("/master")
+            assert "£150.00" in g.text and "cell-support" in g.text and "£180.00" not in g.text
+            ge = client.get("/master", params={"edit": "1"})
+            assert 'value="150.00"' in ge.text and "changes the support price" in ge.text
+
+
+def test_route_product_settings_fb_change_keeps_support():
+    """The same through the product-settings save (POST /master/product/apply)."""
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save", "new_code": PROD_CODE,
+                "new_desc": "Test Keg", "new_fb": "130.00",
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            created = _creates(fa)
+            assert len(created) == 1, created
+            assert created[0]["fields"]["fb_price"] == 130.0
+            assert created[0]["fields"]["tenant_price"] == 180.0
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"], closes
+            _assert_support_kept(fa, sup, fb=130.0)
+            g = client.get("/master")
+            assert "£150.00" in g.text and "£180.00" not in g.text
+
+
+def test_set_product_retro_keeps_support_and_moves_its_retro():
+    """set_product_retro (the /master/apply retro propagation): the support
+    keeps its price and window; its retro_pct follows the product retro."""
+    today = date.today()
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]) as fa:
+        n = airtable_io.set_product_retro(PROD_CODE, 15.0, today, "test")
+    assert n == 2, n
+    created = _creates(fa)
+    assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 180.0, created
+    assert abs(created[0]["fields"]["retro_pct"] - 0.125) < 1e-9
+    closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+    assert [u["id"] for u in closes] == ["rec_old"], closes
+    _assert_support_kept(fa, sup, fb=120.0, retro_pct=0.125)
+
+
+def test_route_upload_master_keeps_support_and_moves_its_costs():
+    """/upload-master (the annual price list): the file's tenant price is the
+    new STANDARD price (resumes after the window); the support keeps £150 and
+    takes the file's product-level list price / retro."""
+    from io import BytesIO
+    from openpyxl import Workbook
+    today = date.today()
+    wb = Workbook()
+    ws = wb.active
+    ws.append([None] * 6)
+    ws.append(["Product Code", "Product Name", "Price", "Retro P/Keg", "Net price",
+               f"Test Tavern {SITE_ID}"])
+    ws.append([PROD_CODE, "Test Keg", 130.0, 13.0, 117.0, 205.0])
+    buf = BytesIO()
+    wb.save(buf)
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post(
+                "/upload-master",
+                data={"valid_from": today.isoformat(), "reason": "sep list"},
+                files={"file": ("cost_sep.xlsx", buf.getvalue(),
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+            assert r.status_code == 200, r.text[:400]
+            assert "Supported prices kept (cost side updated)" in r.text
+            created = _creates(fa)
+            tenants = [c["fields"].get("tenant_price") for c in created
+                       if c["fields"].get("tenant_price") is not None]
+            assert tenants == [205.0], created
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"], closes
+            _assert_support_kept(fa, sup, fb=130.0, retro_pct=13.0 / 130.0)
+            assert _bills(_master_after(fa), today + timedelta(days=30)).tenant_price == 205.0
+            g = client.get("/master")
+            assert "£150.00" in g.text and "£205.00" not in g.text
+
+
+def test_increase_keeps_support_and_moves_its_fb():
+    """build_universal_increase: the support's AGREED price is not increased;
+    its FB list follows the standing rule's new figure (retro £ preserved), in
+    place; managed rules are left alone; a re-run writes nothing more."""
+    from master_changes import build_universal_increase, patch_snapshot_for_bulk_upsert
+    from reconcile import select_winners
+    today = date.today()
+    std = _rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0, retro=0.125)     # retro £15
+    sup = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30),
+                tenant=150.0, fb=120.0, retro=0.125, status="supported")
+    man = _rule(vf=date(2026, 1, 1), tenant=None, fb=120.0, status="managed", site="002")
+    snap = _snap([std, sup, man])
+    new_rules, stats = build_universal_increase(snap, 5.0, today, "me@x")
+    assert stats["n_rules"] == 1 and stats["n_supports"] == 1 and stats["skipped_managed"] == 1, stats
+    succ = next(r for r in new_rules if r.status == "tenanted")
+    assert (succ.tenant_price, succ.fb_price) == (189.0, 126.0)
+    patch = next(r for r in new_rules if r.status == "supported")
+    assert patch.tenant_price == 150.0 and patch.fb_price == 126.0
+    assert patch.valid_from == sup.valid_from and patch.valid_to == sup.valid_to
+    assert abs(patch.retro_pct * patch.fb_price - 15.0) < 1e-9, "retro £ preserved on the support"
+    assert "support price kept" in patch.reason and patch.reason.endswith("orig"), patch.reason
+    assert all(r.site_id != "002" for r in new_rules), "managed untouched"
+    # in-memory mirror of the apply: support patched in place, standing closed +
+    # succeeded, managed NOT closed; the support still wins for its window
+    snap2 = patch_snapshot_for_bulk_upsert(snap, new_rules, today)
+    w = select_winners(snap2.rules, today + timedelta(days=10))[(SITE_ID, PROD_CODE)]
+    assert w.status == "supported" and w.tenant_price == 150.0 and w.fb_price == 126.0, w
+    assert select_winners(snap2.rules, today + timedelta(days=30))[(SITE_ID, PROD_CODE)].tenant_price == 189.0
+    assert any(r.site_id == "002" and r.valid_to is None for r in snap2.rules)
+    again, stats2 = build_universal_increase(snap2, 5.0, today, "me@x")
+    assert again == [] and stats2["n_supports"] == 0, (again, stats2)
+
+
+def test_route_increase_keeps_support():
+    """The increase through the routes: preview reports the kept support; the
+    apply PATCHes it in place (fb 126, price 150) and the grid keeps £150."""
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/increase/preview", data={
+                "pct": "5", "valid_from": date.today().isoformat(),
+            })
+            assert r.status_code == 200 and "1 supported price(s) kept as agreed" in r.text, r.text[:2000]
+            assert not fa.calls, "preview writes NOTHING"
+            r2 = client.post("/master/increase/apply", data=_extract_hidden(r.text))
+            assert r2.status_code == 200 and "Increase applied" in r2.text, r2.text[:400]
+            created = _creates(fa)
+            assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 189.0
+            assert created[0]["fields"]["fb_price"] == 126.0
+            closes = [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+            assert [u["id"] for u in closes] == ["rec_old"], closes
+            _assert_support_kept(fa, sup, fb=126.0)
+            g = client.get("/master")
+            assert "£150.00" in g.text and "£189.00" not in g.text
+
+
+def test_route_cell_edit_at_supported_site_edits_the_support():
+    """A per-site tenant price change where an in-window support is the live
+    price edits the SUPPORT in place — its window and the standing rule are
+    untouched — from both the grid cell and the findings page's accept."""
+    today = date.today()
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/cell/apply", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE, "do": "save",
+                "tenant_price": "155.00", "ajax": "1",
+            })
+            assert r.status_code == 200 and r.json()["ok"] is True, r.text[:300]
+            assert not _creates(fa), "no successor: the support itself is corrected"
+            ups = _updates(fa)
+            assert [u["id"] for u in ups] == ["rec_sup"], ups
+            f = ups[0]["fields"]
+            assert f["tenant_price"] == 155.0 and f["status"] == "supported", f
+            assert "valid_to" not in f and f["valid_from"] == sup["fields"]["valid_from"], f
+            assert f["reason"].startswith("corrected by") and f["reason"].endswith("hardship agreed with tenant"), f["reason"]
+            after = _master_after(fa)
+            assert _bills(after, today + timedelta(days=10)).tenant_price == 155.0
+            assert _bills(after, today + timedelta(days=30)).tenant_price == 180.0, "standing rule intact"
+            g = client.get("/master")
+            assert "£155.00" in g.text and "cell-support" in g.text
+            # findings page: accepting the charged price at a supported site -> same in-place fix
+            r2 = client.post("/accept-master-rule", data={
+                "site_id": SITE_ID, "product_code": PROD_CODE,
+                "tenant_price": "152.50", "overwrite": "1",
+            })
+            assert r2.status_code == 200, r2.text[:300]
+            j = r2.json()
+            assert j["ok"] is True and "support price" in j["message"], j
+            assert not _creates(fa)
+            last = _updates(fa)[-1]
+            assert last["id"] == "rec_sup" and last["fields"]["tenant_price"] == 152.5, last
+            assert "valid_to" not in last["fields"]
+
+
+def test_preview_warns_when_support_keeps_winning_and_support_closes_nothing():
+    """Editor preview: a standing price change over an in-window support names
+    the support as the winner and warns; a NEW support layered from today
+    closes nothing (the standing rule resumes after it)."""
+    today = date.today()
+    std = _rule(vf=date(2026, 1, 1), tenant=180.0)
+    sup = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30),
+                tenant=150.0, status="supported")
+    snap = _snap([std, sup])
+    sup_key = _key(sup.valid_from.isoformat())
+    p = preview_master_change(_price_change(today, tenant=190.0), snap)
+    assert not p.errors, p.errors
+    assert [c["rule_key"] for c in p.will_close] == [_key("2026-01-01")], p.will_close
+    assert f"the support {sup_key}" in p.winner_note and "wins" in p.winner_note, p.winner_note
+    assert any("under a support" in w and sup_key in w and "150.00" in w for w in p.warnings), p.warnings
+    ch = MasterChange(
+        op="price_change", site_id=SITE_ID, product_code=PROD_CODE,
+        tenant_price=140.0, status="supported", valid_from=today,
+        valid_to=today + timedelta(days=60), reason="new support",
+    )
+    p2 = preview_master_change(ch, snap)
+    assert not p2.errors, p2.errors
+    assert p2.will_close == [], p2.will_close
+    assert "new rule wins" in p2.winner_note, p2.winner_note
+    assert not any("under a support" in w for w in p2.warnings), p2.warnings
+
+
+def test_upsert_support_row_never_closes_standing_rule():
+    """upsert_pricing_rules: a supported row in the batch (a new support, or a
+    support's in-place cost rewrite) never triggers the close pass — only the
+    standing rows in the batch close their predecessors — so a managed or
+    tenanted rule at a supported site is never closed by a support write."""
+    today = date.today()
+    std = _grid_rule("rec_old")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    sup_rule = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30),
+                     tenant=150.0, fb=130.0, status="supported")
+    with FakeAirtable([std, sup]) as fa:
+        counts = airtable_io.upsert_pricing_rules([sup_rule], today)
+    assert counts == (0, 1, 0), counts
+    assert not [u for u in _updates(fa) if set(u["fields"]) == {"valid_to"}]
+    # mixed batch: the tenanted successor closes January; the support adds nothing to the close set
+    succ = _rule(vf=today, tenant=180.0, fb=130.0)
+    with FakeAirtable([std, sup]) as fa2:
+        counts = airtable_io.upsert_pricing_rules([succ, sup_rule], today)
+    assert counts == (1, 1, 1), counts
+    closes = [u for u in _updates(fa2) if set(u["fields"]) == {"valid_to"}]
+    assert [u["id"] for u in closes] == ["rec_old"], closes
+    # a MANAGED standing rule at the supported site survives a support write
+    man = _grid_rule("rec_man")
+    man["fields"]["status"] = "managed"
+    with FakeAirtable([man, sup]) as fa3:
+        counts = airtable_io.upsert_pricing_rules([sup_rule], today)
+    assert counts[2] == 0 and not [u for u in _updates(fa3) if set(u["fields"]) == {"valid_to"}]
+
+
+def test_export_shows_support_price_and_marks_it():
+    """/export-master uses the SAME selection as the grid: the supported cell
+    carries the support price (what bills today), shaded, and the Info sheet
+    lists it with its window and the standing price."""
+    from io import BytesIO
+    from openpyxl import load_workbook
+    std = _grid_rule("rec_open")
+    std["fields"]["fb_price"] = 120.0
+    sup = _support_rec("rec_sup")
+    with FakeAirtable([std, sup]):
+        with FakeAuthClient("viewer") as client:
+            r = client.get("/export-master")
+            assert r.status_code == 200, r.text[:300]
+            wb = load_workbook(BytesIO(r.content))
+            ws = wb.active
+            row = [c.value for c in ws[3]]
+            assert row[0] == PROD_CODE and row[2] == 120.0 and row[5] == 150.0, row
+            assert str(ws.cell(row=3, column=6).fill.fgColor.rgb).endswith("FFF4CC")
+            flat = " ".join(
+                str(v) for row_ in wb["Info"].iter_rows() for v in
+                [c.value for c in row_] if v
+            )
+            assert "Supported prices" in flat and "150.00" in flat, flat
+            assert "standing price £180.00" in flat, flat
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -2156,6 +2600,17 @@ TESTS = [
     test_route_accept_overwrite_idempotent_same_price,
     test_findings_overwrite_button_render_and_guards,
     test_route_cross_origin_post_rejected,
+    test_lookup_rule_in_window_support_outranks_later_tenanted,
+    test_route_product_cell_fb_change_keeps_support,
+    test_route_product_settings_fb_change_keeps_support,
+    test_set_product_retro_keeps_support_and_moves_its_retro,
+    test_route_upload_master_keeps_support_and_moves_its_costs,
+    test_increase_keeps_support_and_moves_its_fb,
+    test_route_increase_keeps_support,
+    test_route_cell_edit_at_supported_site_edits_the_support,
+    test_preview_warns_when_support_keeps_winning_and_support_closes_nothing,
+    test_upsert_support_row_never_closes_standing_rule,
+    test_export_shows_support_price_and_marks_it,
 ]
 
 

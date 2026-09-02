@@ -612,13 +612,112 @@ def _severity(delta_total: float) -> str:
     return "high"
 
 
+# ---------- rule precedence: which rule bills on a date ----------
+#
+# Among the rules of ONE (site, product) whose half-open window contains a
+# date, an in-window `supported` rule wins over the standing rule (tenanted or
+# managed) whatever their valid_from dates; within a tier the newest valid_from
+# wins. A support is a deliberate BOUNDED override layered over the standing
+# rule: /add-support leaves the standing rule open so the standard price
+# resumes after the window, while every cost change (grid Price / Retro cells,
+# product settings, set_product_retro, /upload-master, the annual increase)
+# re-dates the standing rule to today. Plain newest-valid_from-first therefore
+# let any FB list / retro edit silently cancel an active support — the master
+# expected the standard price while LWC kept invoicing the agreed support
+# price, raising false wrong_tenant_price findings for the rest of the window.
+#
+# Managed ranks WITH tenanted: managed is the standing zero-margin assertion at
+# a managed site, not an override, and the cost paths never re-date it. A
+# support at a managed site (unusual) wins for its window, as it did before.
+#
+# Every winner selection — the reconciler, the /master grid and list view, the
+# editor previews and the export — goes through these helpers so they cannot
+# disagree about which price bills.
+
+def is_support_rule(r: Rule) -> bool:
+    return (r.status or "tenanted") == "supported"
+
+
+def rule_precedence(r: Rule) -> tuple:
+    """Sort key: higher wins. Sort with reverse=True for winner-first order."""
+    return (1 if is_support_rule(r) else 0, r.valid_from or date.min)
+
+
+def rule_contains(r: Rule, on_date: date) -> bool:
+    """Half-open window membership, missing bounds open."""
+    return (r.valid_from or date.min) <= on_date < (r.valid_to or date.max)
+
+
+def winning_rule(candidates: list[Rule], on_date: date) -> Rule | None:
+    """The rule that bills on ``on_date`` among the rules of ONE (site, product)."""
+    best: Rule | None = None
+    for r in candidates:
+        if rule_contains(r, on_date) and (best is None or rule_precedence(r) > rule_precedence(best)):
+            best = r
+    return best
+
+
+def select_winners(rules, on_date: date) -> dict[tuple[str, str], Rule]:
+    """Winner per (site_id, product_code) on ``on_date`` across a whole master."""
+    winners: dict[tuple[str, str], Rule] = {}
+    for r in rules:
+        if not rule_contains(r, on_date):
+            continue
+        k = (r.site_id, r.product_code)
+        cur = winners.get(k)
+        if cur is None or rule_precedence(r) > rule_precedence(cur):
+            winners[k] = r
+    return winners
+
+
+def active_supports(rules, product_code: str | None = None, on_or_after: date | None = None) -> list[Rule]:
+    """Supported rules whose window has not ended by ``on_or_after`` (default
+    today) — the overrides that keep winning at their site, and whose COST side
+    (FB list price / retro_pct) must follow a product cost change so that
+    wrong_fb_price checks stay right inside the window."""
+    d = on_or_after or date.today()
+    return [
+        r for r in rules
+        if is_support_rule(r)
+        and (product_code is None or r.product_code == product_code)
+        and (r.valid_to is None or r.valid_to > d)
+    ]
+
+
+def support_cost_patch(
+    r: Rule, *, fb_price: float | None, retro_pct: float, note: str, source: str,
+    product_code: str | None = None, product_desc: str | None = None,
+) -> Rule:
+    """The same-key in-place rewrite of a support's COST side. Tenant price,
+    window and status are untouched, so pushed through upsert_pricing_rules it
+    PATCHes the support under its own rule_key — never a re-date, which would
+    collide with the today-dated tenanted successor's key. ``note`` is
+    prepended to the reason so the support's own justification survives the
+    PATCH (Airtable overwrites any field sent)."""
+    old_reason = (r.reason or "").strip()
+    return Rule(
+        site_id=r.site_id,
+        product_code=product_code or r.product_code,
+        product_desc=product_desc or r.product_desc,
+        tenant_price=r.tenant_price,
+        fb_price=fb_price,
+        retro_pct=retro_pct,
+        valid_from=r.valid_from,
+        valid_to=r.valid_to,
+        status="supported",
+        reason=f"{note}; {old_reason}" if old_reason else note,
+        source=source,
+    )
+
+
 def _index_rules(rules: list[Rule]) -> dict[tuple[str, str], list[Rule]]:
     idx: dict[tuple[str, str], list[Rule]] = {}
     for r in rules:
         idx.setdefault((r.site_id, r.product_code), []).append(r)
-    # Sort newest valid_from first; if rules accidentally overlap, the most recent wins.
+    # Winner-first order (rule_precedence): an in-window support beats the
+    # standing rule whatever the dates; otherwise newest valid_from first.
     for k in idx:
-        idx[k].sort(key=lambda x: x.valid_from or date.min, reverse=True)
+        idx[k].sort(key=rule_precedence, reverse=True)
     return idx
 
 
@@ -632,11 +731,10 @@ def _lookup_rule(
     if not candidates:
         return None
     if on_date is None:
-        return candidates[0]
+        # No invoice date to place in a window: fall back to the newest rule.
+        return max(candidates, key=lambda x: x.valid_from or date.min)
     for r in candidates:
-        vf = r.valid_from or date.min
-        vt = r.valid_to or date.max
-        if vf <= on_date < vt:
+        if rule_contains(r, on_date):
             return r
     return None
 

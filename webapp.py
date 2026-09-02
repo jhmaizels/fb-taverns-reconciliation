@@ -68,6 +68,9 @@ from reconcile import (  # noqa: E402
     _parse_date,
     _to_str_code,
     Rule,
+    active_supports,
+    is_support_rule,
+    support_cost_patch,
 )
 # master_export (which imports openpyxl) is imported lazily inside /export-master
 # so it stays off the cold-start / health-check readiness path.
@@ -909,6 +912,15 @@ async def _accept_price_change_from_today(
         # rule_key) rather than close+reopen on the same date. fb/retro None keep
         # the stored values.
         change = MasterChange(op="fix_in_place", fb_price=None, retro_pct=None, **common)
+    elif is_support_rule(winner):
+        # The live price is an in-window SUPPORT — it keeps winning at its site
+        # for its whole window (reconcile.rule_precedence), so the charged price
+        # is accepted INTO the support, in place under its own key: window and
+        # standing rule untouched, the standard price still resumes after.
+        change = MasterChange(
+            op="fix_in_place", fb_price=None, retro_pct=None,
+            **{**common, "valid_from": winner.valid_from},
+        )
     else:
         change = MasterChange(
             op="price_change", fb_price=winner.fb_price,
@@ -950,9 +962,14 @@ async def _accept_price_change_from_today(
         )
     except Exception:
         pass
+    if is_support_rule(winner):
+        until = f" (support until {winner.valid_to.isoformat()})" if winner.valid_to else " (open-ended support)"
+        message = f"{site_id}/{product_code} support price changed to £{tenant_price:.2f}{until} (was £{was:.2f})"
+    else:
+        message = f"{site_id}/{product_code} changed to £{tenant_price:.2f} from today (was £{was:.2f})"
     return JSONResponse({
         "ok": True, "created": result.created, "updated": result.updated,
-        "message": f"{site_id}/{product_code} changed to £{tenant_price:.2f} from today (was £{was:.2f})",
+        "message": message,
     })
 
 
@@ -1387,9 +1404,23 @@ def upload_master(
         except Exception:
             snap_before = None
 
+        # Active supports (window not ended by the effective date) keep their
+        # agreed tenant price and keep WINNING at their site
+        # (reconcile.rule_precedence); only their cost side follows the file's
+        # product-level list price / retro, rewritten in place under the
+        # support's own rule_key. Supports on products absent from the file are
+        # left alone. Without a snapshot (cold cache) they are skipped — the
+        # next cost change or re-upload catches them up.
+        support_patches = (
+            _cost_file_support_patches(snap_before.rules, rules, vf, original_name)
+            if snap_before is not None else []
+        )
+        if snap_before is None:
+            logger.warning("upload-master: no snapshot — supports' cost side not refreshed")
+        to_write = rules + support_patches
         lookups: dict = {}
         rules_created, rules_updated, rules_closed = upsert_pricing_rules(
-            rules, close_keys_at_date=vf, lookups_out=lookups
+            to_write, close_keys_at_date=vf, lookups_out=lookups
         )
         # Reuse the product map built above so we don't re-read the Products table.
         products_created, products_updated = upsert_products_with_retros(
@@ -1410,7 +1441,7 @@ def upload_master(
     try:
         if snap_before is not None:
             from dataclasses import replace as _dc_replace
-            patched = patch_snapshot_for_bulk_upsert(snap_before, rules, vf)
+            patched = patch_snapshot_for_bulk_upsert(snap_before, to_write, vf)
             new_sites = dict(patched.sites)
             for sid, sname in (sites or {}).items():
                 cur = new_sites.get(sid)
@@ -1442,6 +1473,7 @@ def upload_master(
   <div class="summary-row"><span>Rules created</span><strong>{rules_created}</strong></div>
   <div class="summary-row"><span>Rules updated</span><strong>{rules_updated}</strong></div>
   <div class="summary-row"><span>Prior rules closed at {vf.isoformat()}</span><strong>{rules_closed}</strong></div>
+  {f'<div class="summary-row"><span>Supported prices kept (cost side updated)</span><strong>{len(support_patches)}</strong></div>' if support_patches else ""}
   <div class="summary-row"><span>Products created</span><strong>{products_created}</strong></div>
   <div class="summary-row"><span>Products updated</span><strong>{products_updated}</strong></div>
   <div class="summary-row"><span>Products with retros</span><strong>{retros_with_value}</strong></div>
@@ -1580,6 +1612,56 @@ _GENERIC_ERR = (
     "Something went wrong processing this request — the details have been "
     "logged. Try again, and if it recurs contact the administrator."
 )
+
+
+def _support_cost_patches(
+    rules, product_code: str, today: date, new_fb: float | None,
+    retro_final: float, cur_retro: float, note: str, source: str,
+    out_code: str | None = None, out_desc: str | None = None,
+) -> list:
+    """In-place COST-side rewrites for the product's active supports (window
+    not ended by today): the FB list price (the new one, or the support's own
+    when only the retro moved) and retro_pct = retro £ / list — tenant price,
+    window and status untouched. A support keeps WINNING at its site for its
+    whole window (reconcile.rule_precedence), so it must not be re-dated (its
+    key would collide with today's tenanted successor) and must not be left on
+    the old cost figures (wrong_fb_price would misfire inside the window).
+    Pushed through the same upsert as the tenanted successors: a same-key
+    PATCH, and a supported row never triggers the close pass."""
+    out: list = []
+    for s in active_supports(rules, product_code, today):
+        fb = new_fb if new_fb is not None else s.fb_price
+        retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
+        out.append(support_cost_patch(
+            s, fb_price=fb, retro_pct=retro_pct,
+            note=f"{note} (was fb {s.fb_price}, retro £{cur_retro:g}); support price kept",
+            source=source, product_code=out_code, product_desc=out_desc,
+        ))
+    return out
+
+
+def _cost_file_support_patches(rules, file_rules: list, vf: date, source: str) -> list:
+    """/upload-master's counterpart of _support_cost_patches: every active
+    support (window not ended by ``vf``) on a product the cost file carries
+    takes the file's product-level list price and retro_pct; supports on
+    products not in the file are left alone."""
+    file_fb: dict = {}
+    file_retro_pct: dict = {}
+    for r in file_rules:
+        if r.product_code not in file_fb and r.fb_price is not None:
+            file_fb[r.product_code] = r.fb_price
+            file_retro_pct[r.product_code] = r.retro_pct or 0.0
+    out: list = []
+    for s in active_supports(rules, None, vf):
+        fb = file_fb.get(s.product_code)
+        if fb is None:
+            continue
+        out.append(support_cost_patch(
+            s, fb_price=fb, retro_pct=file_retro_pct[s.product_code],
+            note=f"cost file {source}: list/retro updated; support price kept",
+            source=source,
+        ))
+    return out
 
 
 def _master_not_found_page(principal: DrinksPrincipal, rule_key: str) -> HTMLResponse:
@@ -2109,6 +2191,13 @@ async def master_product_apply(
                 reason=f"product edit: list/retro updated (was fb {r.fb_price}, retro £{cur_retro:g})",
                 source=f"product-edit:{principal.email}",
             ))
+        # Active supports keep their agreed price and their window; only their
+        # cost side follows (in place, under their own key).
+        successors.extend(_support_cost_patches(
+            snap.rules, product_code, today, new_fb, retro_final, cur_retro,
+            "product edit: list/retro updated", f"product-edit:{principal.email}",
+            out_code=new_code, out_desc=new_desc,
+        ))
         if successors:
             try:
                 await run_in_threadpool(upsert_pricing_rules, successors, today)
@@ -2329,6 +2418,14 @@ async def master_product_cell_apply(
             "this product has no current tenanted prices for the FB list price "
             "to ride on — add a site price first, or use the product settings page"
         ])
+    # Active supports keep their agreed price and their window — and keep
+    # winning there — while their cost side follows, in place under their own
+    # key (a re-date would collide with today's tenanted successor).
+    support_patches = _support_cost_patches(
+        snap.rules, product_code, today, new_fb, retro_final, cur_retro,
+        "grid: list/retro updated", f"product-cell:{principal.email}",
+    )
+    to_write = successors + support_patches
 
     if retro_changed:
         try:
@@ -2342,24 +2439,25 @@ async def master_product_cell_apply(
             if wants_json:
                 return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
             return _error_page(_GENERIC_ERR)
-    if successors:
+    if to_write:
         try:
-            await run_in_threadpool(upsert_pricing_rules, successors, today)
+            await run_in_threadpool(upsert_pricing_rules, to_write, today)
         except Exception:
             logger.exception("product cell fb/retro rules rewrite failed")
             if wants_json:
                 return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
             return _error_page(_GENERIC_ERR)
-    if retro_changed and retro_final == 0 and successors:
+    if retro_changed and retro_final == 0 and to_write:
         # Retro REMOVAL: the generic upsert never sends a zero retro_pct (a
         # same-key PATCH must not clear retros it wasn't told about), so a
-        # rule updated in place — e.g. a second edit the same day — would
-        # silently keep the old percentage. Clear it explicitly on exactly
-        # the keys just written.
+        # rule updated in place — e.g. a second edit the same day, or a
+        # support's cost-side rewrite — would silently keep the old
+        # percentage. Clear it explicitly on exactly the keys just written.
         try:
             await run_in_threadpool(
                 clear_rule_retro_pcts,
                 [(s.site_id, s.product_code) for s in successors], today,
+                rule_keys=[master_pages.rule_key_of(p) for p in support_patches],
             )
         except Exception:
             logger.exception("product cell retro_pct clear failed")
@@ -2375,8 +2473,8 @@ async def master_product_cell_apply(
         pinfo["retro_per_keg"] = retro_final
         products[product_code] = pinfo
         patched = _dc_replace(snap, products=products)
-        if successors:
-            patched = patch_snapshot_for_bulk_upsert(patched, successors, today)
+        if to_write:
+            patched = patch_snapshot_for_bulk_upsert(patched, to_write, today)
         publish_patched_snapshot(patched)
     except Exception:
         logger.exception("snapshot patch failed — grid catches up on refresh")
@@ -2505,7 +2603,7 @@ async def master_increase_apply(
 <div class="result" style="max-width:640px">
   <div class="summary-row"><span>Increase</span><span><strong>{pct:+g}%</strong> effective {vf.isoformat()}</span></div>
   <div class="summary-row"><span>Successor prices created</span><span>{created}</span></div>
-  <div class="summary-row"><span>Updated in place (same-day)</span><span>{updated}</span></div>
+  <div class="summary-row"><span>Updated in place (same-day successors; supports' FB list)</span><span>{updated}</span></div>
   <div class="summary-row"><span>Prior prices closed</span><span>{closed}</span></div>
   <div class="summary-row"><span>Retro</span><span>fixed £/keg — unchanged</span></div>
 </div>
@@ -2648,6 +2746,19 @@ async def master_cell_apply(
                 tenant_price=tp, fb_price=None, retro_pct=None,
                 status=winner.status or "tenanted", valid_from=today,
                 reason=f"grid: price corrected (was {_fmt_price(winner.tenant_price)})",
+                source_note="grid",
+            )
+        elif is_support_rule(winner):
+            # The cell shows the SUPPORT price (an in-window support wins at
+            # its site — reconcile.rule_precedence), so typing a new price
+            # changes the support itself, in place under its own key: its
+            # window and the standing rule are untouched, and the standard
+            # price still resumes when the support ends.
+            change = MasterChange(
+                op="fix_in_place", site_id=site_id, product_code=product_code,
+                tenant_price=tp, fb_price=None, retro_pct=None,
+                status="supported", valid_from=winner.valid_from,
+                reason=f"grid: support price corrected (was {_fmt_price(winner.tenant_price)})",
                 source_note="grid",
             )
         else:

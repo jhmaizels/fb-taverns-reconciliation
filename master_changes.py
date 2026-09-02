@@ -20,7 +20,10 @@ Load-bearing semantics preserved here (design §2.1):
   - half-open matching: valid_from <= d < valid_to; missing bounds are open.
   - overlaps are LEGAL and load-bearing (supports layer over standing rules);
     we never forbid them — the preview instead names which rule WINS on the
-    effective date (newest valid_from first, mirroring reconcile._index_rules).
+    effective date: an in-window support first, then newest valid_from
+    (reconcile.rule_precedence, mirroring reconcile._index_rules). A support
+    never closes the standing rule (the upsert's close pass ignores supported
+    rows in the batch), so the standard price resumes after its window.
   - rule_key = "site|product|valid_from-iso" (or "open"); a key collision is
     an in-place PATCH in the upsert, so it is allowed ONLY for the explicit
     fix_in_place op and rejected otherwise.
@@ -36,7 +39,14 @@ from typing import Literal
 
 import airtable_io
 from airtable_io import MasterSnapshot
-from reconcile import Rule, _to_str_code
+from reconcile import (
+    Rule,
+    _to_str_code,
+    active_supports,
+    is_support_rule,
+    rule_precedence,
+    support_cost_patch,
+)
 
 MasterOp = Literal["price_change", "fix_in_place", "end_rule", "add_rule"]
 
@@ -166,10 +176,11 @@ def _key_of(rule: Rule) -> str:
 
 
 def _rules_for_key(snap: MasterSnapshot, site: str, code: str) -> list[Rule]:
-    """All rules for (site, product), newest valid_from first — the same order
+    """All rules for (site, product) in winner-first order (an in-window
+    support first, then newest valid_from) — the same order
     reconcile._index_rules uses, so 'first containing window wins' holds."""
     rules = [r for r in snap.rules if r.site_id == site and r.product_code == code]
-    rules.sort(key=lambda r: r.valid_from or date.min, reverse=True)
+    rules.sort(key=rule_precedence, reverse=True)
     return rules
 
 
@@ -185,13 +196,37 @@ def _contains(vf: date | None, vt: date | None, d: date) -> bool:
     return (vf or date.min) <= d < (vt or date.max)
 
 
-def _winner_on(candidates: list[tuple[str, date | None, date | None]], on: date) -> str | None:
-    """First containing window, newest valid_from first. candidates: (label, vf, vt)."""
-    ordered = sorted(candidates, key=lambda c: c[1] or date.min, reverse=True)
-    for label, vf, vt in ordered:
-        if _contains(vf, vt, on):
-            return label
+def _winner_on(candidates: list[tuple], on: date) -> tuple | None:
+    """First containing window in precedence order (an in-window support
+    first, then newest valid_from — reconcile.rule_precedence).
+    candidates: (label, vf, vt, status); returns the winning tuple."""
+    ordered = sorted(
+        candidates,
+        key=lambda c: (1 if (c[3] or "tenanted") == "supported" else 0, c[1] or date.min),
+        reverse=True,
+    )
+    for c in ordered:
+        if _contains(c[1], c[2], on):
+            return c
     return None
+
+
+def _outranks(r: Rule, change: MasterChange) -> bool:
+    """Would existing rule ``r`` beat the rule ``change`` writes on a date both
+    cover? Same tiers as reconcile.rule_precedence: support over standing,
+    then newest valid_from."""
+    r_tier = 1 if is_support_rule(r) else 0
+    c_tier = 1 if change.status == "supported" else 0
+    if r_tier != c_tier:
+        return r_tier > c_tier
+    return (r.valid_from or date.min) > (change.valid_from or date.min)
+
+
+def _winner_phrase(w: tuple | None) -> str:
+    """'rule K' or 'the support K' for a _winner_on result."""
+    if w is None:
+        return ""
+    return f"the support {w[0]}" if (w[3] or "tenanted") == "supported" else f"rule {w[0]}"
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +435,7 @@ def validate_master_change(
             r for r in _rules_for_key(snap, site, code)
             if r.valid_to is None and _key_of(r) != key
             and r.valid_from is not None and r.valid_from > change.valid_from
+            and _outranks(r, change)
         ]
         if newer_open:
             vf = min(r.valid_from for r in newer_open)
@@ -408,6 +444,26 @@ def validate_master_change(
                 f"change — it keeps winning from {vf.isoformat()} onward, so this only takes "
                 f"effect {change.valid_from.isoformat()}..{vf.isoformat()}. To change the price "
                 f"from now on, end or fix the {vf.isoformat()} rule instead."
+            )
+
+    # An in-window SUPPORT outranks any standing rule at its site for its whole
+    # window, whatever the dates (reconcile.rule_precedence) — so a standing
+    # price written over it only bills outside the support's window. Say so;
+    # the operator who means to change the price NOW edits/ends the support.
+    if change.op in ("price_change", "add_rule") and change.status != "supported":
+        d = change.valid_from or date.today()
+        for r in active_supports(_rules_for_key(snap, site, code), on_or_after=d):
+            if _key_of(r) == key:
+                continue
+            window = (
+                f"{r.valid_from.isoformat() if r.valid_from else 'open'}.."
+                f"{r.valid_to.isoformat() if r.valid_to else 'open-ended'}"
+            )
+            price = f"£{r.tenant_price:.2f}" if r.tenant_price is not None else "unset"
+            warnings.append(
+                f"this site is under a support ({_key_of(r)}: {price}, {window}) — a support "
+                "keeps winning for its whole window, so this price bills only outside it. To "
+                "change the price during the support, edit or end the support rule instead."
             )
 
     # Invariant 8 (gaps warned): closing at D + opening at D is gapless, but if
@@ -465,15 +521,18 @@ def preview_master_change(change: MasterChange, snap: MasterSnapshot) -> ChangeP
     if change.op in ("price_change", "add_rule"):
         d = change.valid_from
         if d is not None:
-            # Mirror the upsert close pass (airtable_io.py:496-525): open rules
-            # for this (site, product) whose valid_from is BEFORE d, excluding
-            # the same-key belt. Bounded overlaps (supports) are never closed.
+            # Mirror the upsert close pass (airtable_io.upsert_pricing_rules):
+            # open rules for this (site, product) whose valid_from is BEFORE d,
+            # excluding the same-key belt. Bounded overlaps (supports) are never
+            # closed — and a SUPPORT being written closes nothing (it layers over
+            # the standing rule, which resumes after the support's window).
             closed_keys: set[str] = set()
-            for r in rules:
-                if r.valid_to is None and _key_of(r) != key \
-                        and (r.valid_from is None or r.valid_from < d):
-                    closed_keys.add(_key_of(r))
-                    will_close.append({**_desc(r), "valid_to": d.isoformat()})
+            if change.status != "supported":
+                for r in rules:
+                    if r.valid_to is None and _key_of(r) != key \
+                            and (r.valid_from is None or r.valid_from < d):
+                        closed_keys.add(_key_of(r))
+                        will_close.append({**_desc(r), "valid_to": d.isoformat()})
             will_create.append({
                 "rule_key": key,
                 "valid_from": d.isoformat(),
@@ -483,24 +542,27 @@ def preview_master_change(change: MasterChange, snap: MasterSnapshot) -> ChangeP
                 "retro_pct": change.retro_pct,
                 "status": change.status,
             })
-            candidates = [("new rule", d, change.valid_to)] + [
-                (_key_of(r), r.valid_from, d if _key_of(r) in closed_keys else r.valid_to)
+            candidates = [("new rule", d, change.valid_to, change.status)] + [
+                (_key_of(r), r.valid_from, d if _key_of(r) in closed_keys else r.valid_to, r.status)
                 for r in rules
             ]
             winner = _winner_on(candidates, d)
             # A newer OPEN sibling (valid_from > d) is not closed by the pass and
             # reclaims the win from its own start — the change only bites d..vf.
+            # (Only when it actually outranks the new rule: a standing rule
+            # never reclaims the win from a support.)
             newer_open = [
                 r for r in rules
                 if r.valid_to is None and _key_of(r) != key
                 and r.valid_from is not None and r.valid_from > d
+                and _outranks(r, change)
             ]
-            if winner == "new rule":
+            if winner is not None and winner[0] == "new rule":
                 winner_note = f"On {d.isoformat()} the new rule wins."
             elif winner:
                 winner_note = (
-                    f"On {d.isoformat()} rule {winner} wins (newest valid_from first) — "
-                    "the new rule takes over when that window ends."
+                    f"On {d.isoformat()} {_winner_phrase(winner)} wins (an in-window support "
+                    "first, then newest valid_from) — the new rule takes over when that window ends."
                 )
             if newer_open:
                 vf = min(r.valid_from for r in newer_open)
@@ -530,13 +592,16 @@ def preview_master_change(change: MasterChange, snap: MasterSnapshot) -> ChangeP
             new_desc["status"] = change.status
             will_update.append({"old": _desc(target), "new": new_desc})
         on = date.today()
-        winner = _winner_on([(_key_of(r), r.valid_from, r.valid_to) for r in rules], on)
-        if winner == key:
-            winner_note = f"On {on.isoformat()} this rule wins (newest valid_from first)."
+        winner = _winner_on([(_key_of(r), r.valid_from, r.valid_to, r.status) for r in rules], on)
+        if winner is not None and winner[0] == key:
+            winner_note = (
+                f"On {on.isoformat()} this rule wins (an in-window support first, "
+                "then newest valid_from)."
+            )
         elif winner:
             winner_note = (
-                f"On {on.isoformat()} rule {winner} wins (newest valid_from first) — "
-                "the rule you are fixing is currently overridden on that date."
+                f"On {on.isoformat()} {_winner_phrase(winner)} wins (an in-window support first, "
+                "then newest valid_from) — the rule you are fixing is currently overridden on that date."
             )
         summary = f"Rule {key} will be rewritten IN PLACE (history rewrite — the old figure is treated as never true)"
 
@@ -546,11 +611,11 @@ def preview_master_change(change: MasterChange, snap: MasterSnapshot) -> ChangeP
         if target is not None and d is not None:
             will_update.append({"old": _desc(target), "new": {**_desc(target), "valid_to": d.isoformat()}})
             others = [
-                (_key_of(r), r.valid_from, r.valid_to) for r in rules if r is not target
+                (_key_of(r), r.valid_from, r.valid_to, r.status) for r in rules if r is not target
             ]
             winner = _winner_on(others, d)
             if winner:
-                winner_note = f"On {d.isoformat()} rule {winner} takes over."
+                winner_note = f"On {d.isoformat()} {_winner_phrase(winner)} takes over."
             else:
                 winner_note = (
                     f"No rule covers {d.isoformat()} onwards — the (site, product) drops "
@@ -701,11 +766,13 @@ def patch_snapshot_for_change(
 
     # price_change / add_rule: the close pass ends any OPEN rule for this
     # (site, product) starting before the effective date, then the new rule
-    # is appended (upsert_pricing_rules semantics).
+    # is appended (upsert_pricing_rules semantics). A SUPPORT closes nothing:
+    # it layers over the standing rule, which resumes after its window.
     d = change.valid_from
     def _closed(r: Rule) -> Rule:
         if (
-            r.site_id == site and r.product_code == code
+            change.status != "supported"
+            and r.site_id == site and r.product_code == code
             and r.valid_to is None and d is not None
             and (r.valid_from or date.min) < d
         ):
@@ -759,25 +826,41 @@ def build_universal_increase(
     valid_from is on/before ``effective``. A rule starting exactly ON the
     effective date shares the successor's rule_key, so the upsert updates it
     in place rather than closing it — same outcome, no duplicate.
-    Skipped (reported in stats): supported/managed rules (temporary or
-    zero-margin layers — an annual uplift doesn't apply), future-dated rules,
-    and rules with no tenant price.
+
+    Supports (window not ended by ``effective``) keep their AGREED tenant price
+    and keep winning at their site for their window (reconcile.rule_precedence);
+    only their cost side follows: the FB list price is product-level, so the
+    support's fb_price is set to the standing rule's NEW list price (same site,
+    else the product's single new figure), retro £ preserved, rewritten in place
+    under the support's own rule_key. Following the standing figure rather than
+    multiplying the support's own is what keeps a re-run idempotent — once the
+    support carries the new list price nothing more is written.
+    Skipped (reported in stats): managed rules (zero-margin layers — an annual
+    uplift doesn't apply), supports with no standing list price to follow,
+    future-dated rules, and rules with no tenant price.
     """
     mult = 1.0 + pct / 100.0
     new_rules: list[Rule] = []
+    support_patches: list[Rule] = []
     skipped_support = 0
+    skipped_managed = 0
     skipped_future = 0
     skipped_no_price = 0
     skipped_already_at_date = 0
     examples: list[dict] = []
     sites_seen: set = set()
     products_seen: set = set()
+    # Product-level list price AFTER the increase, per (site, product): the
+    # successor's fb, or the fb of a rule already dated on the effective date.
+    new_fb_by_key: dict[tuple, float] = {}
 
     for r in snap.rules:
         if r.valid_to is not None:
             continue
+        if is_support_rule(r):
+            continue  # cost side handled below; the support price is kept
         if (r.status or "tenanted") != "tenanted":
-            skipped_support += 1
+            skipped_managed += 1
             continue
         if r.valid_from is not None and r.valid_from > effective:
             skipped_future += 1
@@ -792,6 +875,8 @@ def build_universal_increase(
             # so a crash never drops a price — the successor already shadows the
             # still-open original, and a re-run finishes the close pass).
             skipped_already_at_date += 1
+            if r.fb_price is not None:
+                new_fb_by_key.setdefault((r.site_id, r.product_code), r.fb_price)
             continue
         if r.tenant_price is None:
             skipped_no_price += 1
@@ -801,6 +886,7 @@ def build_universal_increase(
             new_fb = round(r.fb_price * mult, 2)
             retro_gbp = (r.retro_pct or 0.0) * r.fb_price
             new_retro_pct = (retro_gbp / new_fb) if new_fb else 0.0
+            new_fb_by_key[(r.site_id, r.product_code)] = new_fb
         else:
             new_fb = None
             new_retro_pct = r.retro_pct or 0.0
@@ -831,6 +917,29 @@ def build_universal_increase(
                 "retro_gbp": (r.retro_pct or 0.0) * (r.fb_price or 0.0),
             })
 
+    # Active supports: tenant price kept, cost side follows the new list price.
+    per_product_fbs: dict[str, set] = {}
+    for (_s, p), fb in new_fb_by_key.items():
+        per_product_fbs.setdefault(p, set()).add(round(fb, 4))
+    for r in active_supports(snap.rules, on_or_after=effective):
+        new_fb = new_fb_by_key.get((r.site_id, r.product_code))
+        if new_fb is None:
+            fbs = per_product_fbs.get(r.product_code) or set()
+            new_fb = next(iter(fbs)) if len(fbs) == 1 else None
+        if new_fb is None or r.fb_price is None:
+            skipped_support += 1
+            continue
+        if abs(new_fb - r.fb_price) <= 0.005:
+            continue  # already carries the new list price (re-run / same-day)
+        retro_gbp = (r.retro_pct or 0.0) * r.fb_price
+        support_patches.append(support_cost_patch(
+            r,
+            fb_price=new_fb,
+            retro_pct=(retro_gbp / new_fb) if new_fb else 0.0,
+            note=f"annual increase {pct:+g}%: FB list {r.fb_price} -> {new_fb}; support price kept",
+            source=f"increase:{actor_email}" if actor_email else "increase",
+        ))
+
     # Fingerprint of exactly which prices this increase would rewrite (and
     # from what). The confirm page carries it and apply REFUSES on mismatch —
     # so a double submit (the first apply already moved the prices) or a
@@ -857,14 +966,16 @@ def build_universal_increase(
         "n_rules": len(new_rules),
         "n_sites": len(sites_seen),
         "n_products": len(products_seen),
+        "n_supports": len(support_patches),
         "skipped_support": skipped_support,
+        "skipped_managed": skipped_managed,
         "skipped_future": skipped_future,
         "skipped_no_price": skipped_no_price,
         "skipped_already_at_date": skipped_already_at_date,
         "examples": examples,
         "checksum": checksum,
     }
-    return new_rules, stats
+    return new_rules + support_patches, stats
 
 
 def _date_iso(d: date | None) -> str:
@@ -880,7 +991,9 @@ def patch_snapshot_for_bulk_upsert(
     /upload-master whole-file replace both ride this)."""
     from dataclasses import replace as _dc_replace
 
-    touched = {(r.site_id, r.product_code) for r in new_rules}
+    # A support in the batch (an in-place cost-side rewrite) closes nothing —
+    # mirrors upsert_pricing_rules, whose close pass ignores supported rows.
+    touched = {(r.site_id, r.product_code) for r in new_rules if not is_support_rule(r)}
     new_keys = {(r.site_id, r.product_code, r.valid_from) for r in new_rules}
     rules: list[Rule] = []
     for r in snap.rules:

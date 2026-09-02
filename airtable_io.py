@@ -25,7 +25,13 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from reconcile import Mismatch, Rule, _parse_date  # type: ignore
+from reconcile import (  # type: ignore
+    Mismatch,
+    Rule,
+    _parse_date,
+    is_support_rule,
+    support_cost_patch,
+)
 
 load_dotenv()
 # Read defensively: AIRTABLE_TOKEN / AIRTABLE_BASE_ID are sync:false in Render
@@ -680,7 +686,11 @@ def set_product_retro(
     updates Products.retro_per_keg (which the retro reconciliation + export
     read) and re-dates every site's rule from ``effective`` with
     retro_pct = retro£/that rule's fb (preserving the £ across differing list
-    prices), tenant prices unchanged. Returns the number of prices reflowed.
+    prices), tenant prices unchanged. Active supports (window not ended by
+    ``effective``) keep their agreed tenant price and their own window — they
+    keep WINNING there (reconcile.rule_precedence) — and only their retro_pct
+    follows, rewritten in place under the support's own rule_key. Returns the
+    number of rules written (successors + support cost patches).
 
     Rides upsert_pricing_rules (create-before-close), so it's crash-safe and a
     re-run converges. Idempotent for a rule already dated on ``effective``
@@ -696,8 +706,21 @@ def set_product_retro(
         "update", T["Products"],
     )
     successors: list[Rule] = []
+    support_patches: list[Rule] = []
     for r in load_rules_from_airtable():
-        if r.product_code != code or r.valid_to is not None:
+        if r.product_code != code:
+            continue
+        if is_support_rule(r):
+            if (r.valid_to is not None and r.valid_to <= effective) or not r.fb_price:
+                continue  # ended support (history), or no list price to derive from
+            support_patches.append(support_cost_patch(
+                r, fb_price=r.fb_price,
+                retro_pct=(retro / r.fb_price) if retro else 0.0,
+                note=f"retro set to £{retro:g}/keg (product-level); support price kept",
+                source=source,
+            ))
+            continue
+        if r.valid_to is not None:
             continue
         if (r.status or "tenanted") != "tenanted":
             continue
@@ -710,15 +733,19 @@ def set_product_retro(
             valid_from=effective, valid_to=None, status="tenanted",
             reason=f"retro set to £{retro:g}/keg (product-level)", source=source,
         ))
-    if successors:
-        upsert_pricing_rules(successors, effective)
+    if successors or support_patches:
+        upsert_pricing_rules(successors + support_patches, effective)
     invalidate_master_cache()
-    return len(successors)
+    return len(successors) + len(support_patches)
 
 
-def clear_rule_retro_pcts(pairs: list[tuple[str, str]], valid_from) -> int:
+def clear_rule_retro_pcts(
+    pairs: list[tuple[str, str]], valid_from, rule_keys: list[str] | tuple = (),
+) -> int:
     """Explicitly ZERO retro_pct on the rules keyed by the given
-    (site_id, product_code) pairs at ``valid_from``.
+    (site_id, product_code) pairs at ``valid_from``, plus any explicit
+    ``rule_keys`` (e.g. the supports whose cost side was rewritten in place
+    under their own valid_from).
 
     ``upsert_pricing_rules`` deliberately never sends a zero retro_pct — a
     same-key PATCH must not clear a retro it wasn't told about — so a retro
@@ -727,8 +754,8 @@ def clear_rule_retro_pcts(pairs: list[tuple[str, str]], valid_from) -> int:
     exactly the keys the caller just re-dated. Rows whose retro_pct is
     already empty/zero are left untouched. Returns the number patched.
     """
-    keys = [_rule_key(s, p, valid_from) for s, p in pairs]
-    keys = [k for k in keys if '"' not in k]
+    keys = [_rule_key(s, p, valid_from) for s, p in pairs] + list(rule_keys)
+    keys = list(dict.fromkeys(k for k in keys if '"' not in k))
     if not keys:
         return 0
     updates: list[dict] = []
@@ -1070,7 +1097,12 @@ def upsert_pricing_rules(
         existing = _list_all(table_id, fields=_read_fields)
     by_key = {rec["fields"].get("rule_key"): rec["id"] for rec in existing}
 
-    keys_in_new = {(r.site_id, r.product_code) for r in rules}
+    # A SUPPORT in the batch never triggers the close pass: it layers over the
+    # standing rule (which must stay open so the standard price resumes after
+    # the support's window — /add-support's contract), and an in-place
+    # cost-side rewrite of a support must not close the standing/managed rule
+    # at its site. Only the standing rows in the batch close their predecessors.
+    keys_in_new = {(r.site_id, r.product_code) for r in rules if not is_support_rule(r)}
 
     # Pre-compute the set of rule_keys for rules in the new batch; any existing
     # record with a matching rule_key IS being updated, not replaced, and must

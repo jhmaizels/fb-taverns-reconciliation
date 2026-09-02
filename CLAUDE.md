@@ -189,6 +189,9 @@ Key facts:
   `fb_price`/`product_desc` copied from the existing active standard rule so
   wrong_fb_price still fires inside the support window. Persisted with
   `close_keys_at_date=None` so the standard rule resumes after `valid_to`.
+- The support outranks the standing rule for its whole window (§6
+  precedence), including any later-dated tenanted successor a cost change
+  creates; those cost changes update the support's fb/retro in place.
 
 ### 5e. Master updates (WRITE-TO-MASTER)
 - **`POST /upload-master`** (LWC): `parse_fb_cost_file` → rules stamped
@@ -233,9 +236,33 @@ Key facts:
 **Rule/price selection (`_lookup_rule`):** key on `(site_id, product_code)`,
 then pick the rule whose date range contains `invoice_date`, **half-open**:
 `valid_from <= date < valid_to` (defaults: `valid_from`→date.min,
-`valid_to`→date.max). Index pre-sorts **newest valid_from first**, so
-overlapping rules resolve to **most-recent**. If `invoice_date` is None → newest
-rule. A line dated exactly on a rule's `valid_to` falls into the next rule.
+`valid_to`→date.max). Among containing rules the precedence is
+**status-aware** (`reconcile.rule_precedence`, since 2026-09-02): an
+in-window `supported` rule wins over the standing rule (`tenanted` or
+`managed`) whatever their `valid_from` dates; within a tier the **newest
+valid_from** wins. `managed` ranks with `tenanted` (it is the standing rule
+at a managed site, not an override; the cost paths never re-date it).
+Rationale: every cost change re-dates the standing rule to today, so plain
+newest-first let any FB list/retro edit silently cancel an active support
+(the master expected the standard price while LWC kept invoicing the agreed
+support price → false `wrong_tenant_price`). The same selection
+(`reconcile.select_winners` / `winning_rule`) drives the `/master` grid and
+list view, the editor previews and `/export-master`, so they cannot
+disagree. If `invoice_date` is None → newest rule. A line dated exactly on a
+rule's `valid_to` falls into the next rule.
+
+**Supports through cost changes:** a support keeps its agreed tenant price
+and its window. Every cost path (grid Price/Retro cells, product settings,
+`set_product_retro`, `/upload-master`, the annual increase) rewrites an
+ACTIVE support's `fb_price`/`retro_pct` **in place under its own `rule_key`**
+(`reconcile.support_cost_patch`, pushed through the same upsert as the
+tenanted successors) so `wrong_fb_price` stays right inside the window —
+never re-dated, since `site|product|today` is the successor's key. A
+`supported` row in an upsert batch **never triggers the close pass**. A grid
+or findings-page tenant-price edit at a supported site edits the support
+itself (fix-in-place, window kept); the editor's price-change preview warns
+when a support keeps winning. The export shades supported cells and lists
+them on its Info sheet so a re-upload never bakes a support in.
 
 **Tolerances (LWC):**
 - tenant_price: `tolerance` default **0.01** (1p/unit).
