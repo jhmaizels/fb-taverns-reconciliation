@@ -1404,15 +1404,15 @@ def render_summary_html(
         "no_rate": [
             {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
              "charged": _r(r.actual_total_per_brl), "barrels": _r(r.barrels),
-             "lo": _r(norate_range.get(r.sku_code.upper(), (r.actual_total_per_brl,))[0]),
-             "hi": _r(norate_range.get(r.sku_code.upper(), (0, r.actual_total_per_brl))[1])}
+             "lo": _r(norate_range.get(str(r.sku_code).strip().upper(), (r.actual_total_per_brl,))[0]),
+             "hi": _r(norate_range.get(str(r.sku_code).strip().upper(), (0, r.actual_total_per_brl))[1])}
             for r in s.no_rate
         ],
         "not_on_master": [
             {"account": r.account, "site": r.customer_name, "sku": r.sku_code, "desc": r.sku_desc,
              "charged": _r(r.avg_discount_per_brl), "barrels": _r(r.barrels),
-             "lo": _r(nom_range.get(r.sku_code.upper(), (r.avg_discount_per_brl,))[0]),
-             "hi": _r(nom_range.get(r.sku_code.upper(), (0, r.avg_discount_per_brl))[1])}
+             "lo": _r(nom_range.get(str(r.sku_code).strip().upper(), (r.avg_discount_per_brl,))[0]),
+             "hi": _r(nom_range.get(str(r.sku_code).strip().upper(), (0, r.avg_discount_per_brl))[1])}
             for r in s.not_on_master
         ],
         "retro_arith": [

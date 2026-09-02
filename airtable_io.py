@@ -1335,6 +1335,31 @@ def _same_code(a: str, b: str) -> bool:
     return a == b or (a.isdigit() and b.isdigit() and a.lstrip("0") == b.lstrip("0"))
 
 
+def _code_variants(c: str) -> tuple[str, ...]:
+    """A code plus its leading-zero-drift spellings. Drift is real input: a numeric
+    Excel cell reads back without its zero (090431 -> '90431') while report and
+    findings codes keep it — every ownership lookup must treat them as ONE code."""
+    c = str(c or "").strip().upper()
+    if not c:
+        return ()
+    return (c, c.zfill(6), c.lstrip("0")) if c.isdigit() else (c,)
+
+
+def _register(owner: dict, c: str, prim: str) -> None:
+    """Claim every spelling of `c` for SKU `prim` (first claim wins)."""
+    for v in _code_variants(c):
+        if v:
+            owner.setdefault(v, prim)
+
+
+def _owner_of(owner: dict, c: str):
+    """The SKU that owns `c` in any spelling, or None."""
+    for v in _code_variants(c):
+        if v in owner:
+            return owner[v]
+    return None
+
+
 def _finite(v):
     try:
         f = float(v)
@@ -1389,6 +1414,11 @@ def accept_tennents_sku(
     code = str(sku_code or "").strip().upper()
     if not code:
         raise ValueError("sku_code is required")
+    if "/" in code or "\\" in code or any(ch.isspace() for ch in code):
+        # A '/'-joined value is split into separate codes on the next load, so a
+        # compound code would smuggle another SKU's code past the ownership
+        # guards (and 'new' would mint a junk primary). One code per action.
+        raise ValueError(f"{code!r} is a compound or malformed code — link or add each code separately")
     stamp = f"{FINDINGS_SOURCE_PREFIX}{(actor or '').strip()} {(source_file or '').strip()}".strip()
     lookup = _tennents_sku_lookup()
     tid = T["TennentsSkuMaster"]
@@ -1396,18 +1426,10 @@ def accept_tennents_sku(
     # A code belongs to exactly one SKU; the guards below keep it that way even
     # when the findings page is stale (another admin / a workbook re-upload).
     owner: dict[str, str] = {}
-
-    def _claim(c: str, prim: str) -> None:
-        # register leading-zero variants too, so a drifted report code can't
-        # slip past the guards as a "new" SKU
-        for v in ((c, c.zfill(6), c.lstrip("0")) if c.isdigit() else (c,)):
-            if v:
-                owner.setdefault(v, prim)
-
     for prim, row_ in lookup.items():
-        _claim(prim, prim)
+        _register(owner, prim, prim)
         for a in _split_codes(row_["alt_code"]):
-            _claim(a, prim)
+            _register(owner, a, prim)
     stale = " — re-run the reconciliation (this page is stale)"
 
     if mode == "link":
@@ -1420,7 +1442,7 @@ def accept_tennents_sku(
         alts = _split_codes(row["alt_code"])
         if code == target or code in alts:
             return {"action": "already", "sku_code": target, "alt_code": row["alt_code"]}
-        own = owner.get(code)
+        own = _owner_of(owner, code)
         if own is not None and own == target:
             return {"action": "already", "sku_code": target, "alt_code": row["alt_code"]}
         if own is not None and _same_code(own, code):
@@ -1461,7 +1483,7 @@ def accept_tennents_sku(
         return {"action": "rate_set", "sku_code": code, "correct_total_per_brl": total}
 
     if mode == "new":
-        own = owner.get(code)
+        own = _owner_of(owner, code)
         if own is not None and _same_code(own, code):
             # already on the master (incl. leading-zero drift) — fill a TBC rate only
             return accept_tennents_sku("set_rate", own, actor, source_file, charged_total=charged_total)
@@ -1639,71 +1661,109 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
     created_recs = _batch(payload, "create", T["TennentsSkuMaster"]) if payload else []
     created += len(created_recs)
 
-    by_code = {
-        str(r.get("fields", {}).get("sku_code", "") or "").strip().upper(): r
-        for r in created_recs
-    }
-    # Every code the fresh workbook rows claim (primary + '/'-joined alts) -> the
-    # owning primary. A code belongs to exactly one SKU: where the workbook now
-    # assigns a findings code elsewhere, the WORKBOOK WINS (it is the editing
+    # Index the fresh workbook rows by EVERY spelling of their primary, and map
+    # every code they claim (primary + '/'-joined alts, all drift spellings) ->
+    # the owning primary. A code belongs to exactly one SKU: where the workbook
+    # now assigns a findings code elsewhere, the WORKBOOK WINS (it is the editing
     # surface) — never resurrect a second claimant or re-attach a stale alt,
     # which would leave one code on two rows with an order-dependent rate.
+    by_code: dict[str, dict] = {}
+    rec_by_prim: dict[str, dict] = {}
     wb_claimed: dict[str, str] = {}
     for r in created_recs:
         wf = r.get("fields", {})
         prim = str(wf.get("sku_code", "") or "").strip().upper()
+        if not prim:
+            continue
+        rec_by_prim[prim] = r
+        for v in _code_variants(prim):
+            by_code.setdefault(v, r)
         for c in [prim] + _split_codes(wf.get("alt_code", "")):
-            if c:
-                wb_claimed.setdefault(c, prim)
+            _register(wb_claimed, c, prim)
 
     reapply_create: list[dict] = []
-    reapply_patch: list[dict] = []
-    absorbed = 0
+    patches: dict[str, dict] = {}          # record id -> merged PATCH fields (one per row)
+    absorbed: list[str] = []
+    dropped_alts: list[str] = []
+
+    def _alts_now(rec: dict) -> list[str]:
+        p = patches.get(rec["id"], {})
+        return _split_codes(p["alt_code"]) if "alt_code" in p else _split_codes(rec.get("fields", {}).get("alt_code", ""))
+
+    def _add_alts(rec: dict, prim: str, cands: list[str], stamp: str) -> None:
+        """Union `cands` onto rec's alt list, skipping any spelling already there,
+        the row's own primary, or a code the workbook gave to ANOTHER SKU."""
+        cur = _alts_now(rec)
+        merged = list(cur)
+        for a in cands:
+            if _same_code(a, prim) or any(_same_code(a, x) for x in merged):
+                continue
+            if _owner_of(wb_claimed, a) not in (None, prim):
+                dropped_alts.append(a)
+                continue
+            merged.append(a)
+            _register(wb_claimed, a, prim)
+        if merged != cur:
+            p = patches.setdefault(rec["id"], {})
+            p["alt_code"] = "/".join(merged)
+            p["source"] = stamp
+
     for f in inapp_rows:
         code = str(f.get("sku_code", "") or "").strip().upper()
         if not code:
             continue
-        rec = by_code.get(code)
+        f_alts = _split_codes(f.get("alt_code", ""))
+        f_stamp = f.get("source", "")
+        rec = next((by_code[v] for v in _code_variants(code) if v in by_code), None)
         if rec is None:
-            if code in wb_claimed:
-                # The workbook now carries this code as another SKU's alt — it has
-                # absorbed the in-app row; do not re-create a second claimant.
-                absorbed += 1
+            host_prim = _owner_of(wb_claimed, code)
+            if host_prim is not None:
+                # The workbook now carries this code (some spelling) as another
+                # SKU's alt — it has absorbed the in-app row. Don't re-create a
+                # second claimant; carry its own unclaimed alts onto the host.
+                absorbed.append(code)
+                host = rec_by_prim.get(host_prim)
+                if host is not None and f_alts:
+                    _add_alts(host, host_prim, f_alts, f_stamp)
                 continue
             # The workbook doesn't know this in-app SKU at all → re-create it,
-            # minus any of ITS alt codes the workbook has since assigned elsewhere.
+            # minus any of ITS alts the workbook has since assigned elsewhere.
             keep = {k: v for k, v in f.items() if k not in ("version", "source_file")}
             keep["version"] = master.version
             keep["source_file"] = source
-            own_alts = [a for a in _split_codes(f.get("alt_code", "")) if a not in wb_claimed]
+            own_alts = [a for a in f_alts if _owner_of(wb_claimed, a) is None]
+            dropped_alts += [a for a in f_alts if a not in own_alts]
             if own_alts:
                 keep["alt_code"] = "/".join(own_alts)
             else:
                 keep.pop("alt_code", None)
             reapply_create.append({"fields": keep})
-            preserved += 1
+            _register(wb_claimed, code, code)          # later rows can't claim it
+            for a in own_alts:
+                _register(wb_claimed, a, code)
             continue
         wb = rec.get("fields", {})
-        patch: dict = {}
-        wb_alts = _split_codes(wb.get("alt_code", ""))
-        merged = wb_alts + [a for a in _split_codes(f.get("alt_code", ""))
-                            if a not in wb_alts and wb_claimed.get(a, code) == code]
-        if merged != wb_alts:
-            patch["alt_code"] = "/".join(merged)          # union: keep linked codes
+        prim = str(wb.get("sku_code", "") or "").strip().upper()
+        if f_alts:
+            _add_alts(rec, prim, f_alts, f_stamp)         # union: keep linked codes
         if wb.get("correct_total_per_brl") is None and f.get("correct_total_per_brl") is not None:
-            patch["correct_total_per_brl"] = f["correct_total_per_brl"]   # keep a findings rate
+            p = patches.setdefault(rec["id"], {})
+            p.setdefault("correct_total_per_brl", f["correct_total_per_brl"])   # keep a findings rate
             if f.get("contract_base_per_brl") is not None:
-                patch["contract_base_per_brl"] = f["contract_base_per_brl"]
-        if patch:
-            patch["source"] = f.get("source", "")
-            reapply_patch.append({"id": rec["id"], "fields": patch})
-            preserved += 1
+                p.setdefault("contract_base_per_brl", f["contract_base_per_brl"])
+            p["source"] = f_stamp
+    reapply_patch = [{"id": rid, "fields": flds} for rid, flds in patches.items() if flds]
+    preserved = len(reapply_create) + len(reapply_patch)
     if reapply_create:
         created += len(_batch(reapply_create, "create", T["TennentsSkuMaster"]))
     if reapply_patch:
         _batch(reapply_patch, "update", T["TennentsSkuMaster"])
-    if absorbed:
-        logger.info("replace_tennents_master: %d findings SKU(s) now carried by the workbook as alt codes — not re-created", absorbed)
+    if absorbed or dropped_alts:
+        logger.info(
+            "replace_tennents_master: workbook wins — absorbed findings SKU(s) %s (now workbook alt codes); "
+            "dropped findings alt(s) %s (claimed by another workbook SKU)",
+            absorbed or "-", dropped_alts or "-",
+        )
 
     deleted += _wipe_table(T["TennentsSiteMaster"], "account")
     payload = []

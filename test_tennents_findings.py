@@ -9,6 +9,7 @@ Run standalone:  python test_tennents_findings.py
 from __future__ import annotations
 
 import io
+import json
 import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -211,6 +212,20 @@ def test_accept_primitive():
            r["action"] == "rate_set" and r["sku_code"] == "090425" and len(fake.rows) == 1, str(r))
     r = aio.accept_tennents_sku("link", "90425", "james@x", "f", link_to="090425")
     _check("link: drifted code onto its own SKU is a no-op", r["action"] == "already", str(r))
+    # compound / malformed codes are refused — a '/'-joined value is split on the next
+    # load, so 'NEWC/ALT2' would smuggle P1's ALT2 onto P2 past the ownership guard
+    fake = FakeIO([{"id": "rP", "fields": {"sku_code": "P1", "alt_code": "ALT1/ALT2", "correct_total_per_brl": 50.0, "source": "wb"}},
+                   {"id": "rQ", "fields": {"sku_code": "P2", "alt_code": "", "correct_total_per_brl": 60.0, "source": "wb"}}])
+    _install(fake)
+    for bad in ("NEWC/ALT2", "NEWD\\90425"):
+        for mode, kw in (("link", {"link_to": "P2"}), ("new", {"sku_desc": "x", "charged_total": "70"}),
+                         ("set_rate", {"charged_total": "70"})):
+            try:
+                aio.accept_tennents_sku(mode, bad, "james@x", "f", **kw)
+                _check(f"{mode}: refuses compound code {bad!r}", False)
+            except ValueError as e:
+                _check(f"{mode}: refuses compound code {bad!r}", "compound" in str(e), str(e))
+    _check("compound refusal wrote nothing", not fake.patches and not fake.creates)
 
 
 def test_preserve_on_replace():
@@ -274,6 +289,65 @@ def test_preserve_on_replace():
     m4 = aio.load_tennents_master()
     _check("absorbed: the code resolves to the workbook SKU @ £370.14",
            m4.find_sku("ZZZ999") is not None and m4.find_sku("ZZZ999").sku_code == "401136")
+
+    # --- verify-round fixes: leading-zero DRIFT in the collision guard; absorbed alts carried over ---
+    # S1: findings-created '012345' @150; the workbook now carries '12345' @200 (Excel dropped the zero)
+    fk = FakeIO([{"id": "d1", "fields": {"sku_code": "012345", "correct_total_per_brl": 150.0,
+                                          "contract_base_per_brl": 150.0, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v6", "wb", [sku("12345", "", "Drift", "Drift 50L Keg", 200.0)], [], [], [])
+    _, _, pd_ = aio.replace_tennents_master(wbd, source="wb_v6.xlsx")
+    _check("drift: exactly ONE row for the drifted code",
+           sum(1 for r in fk.rows if r["fields"]["sku_code"].lstrip("0") == "12345") == 1,
+           str([r["fields"]["sku_code"] for r in fk.rows]))
+    md = aio.load_tennents_master()
+    _check("drift: both spellings resolve to the workbook row @ £200",
+           all(md.find_sku(c) is not None and abs(float(md.find_sku(c).correct_total_per_brl) - 200.0) < 1e-9
+               for c in ("012345", "12345")))
+    _check("drift: nothing preserved (workbook wins)", pd_ == 0, str(pd_))
+    # S2: findings-linked alt '090999' on 401175; the workbook now lists '90999' as its OWN SKU @180
+    fk = FakeIO([{"id": "d2", "fields": {"sku_code": "401175", "alt_code": "090999",
+                                          "correct_total_per_brl": 293.49, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v7", "wb", [sku("90999", "", "New", "New Thing 50L", 180.0),
+                                      sku("401175", "", "Blackthorn", "Blackthorn Dry 50L Keg", 293.49)], [], [], [])
+    aio.replace_tennents_master(wbd, source="wb_v7.xlsx")
+    md = aio.load_tennents_master()
+    by = {r["fields"]["sku_code"]: r["fields"] for r in fk.rows}
+    _check("drift: stale drifted alt NOT re-attached", not by["401175"].get("alt_code"), str(by["401175"].get("alt_code")))
+    _check("drift: '090999' and '90999' both resolve to the workbook SKU @ £180",
+           all(md.find_sku(c) is not None and md.find_sku(c).sku_code == "90999" for c in ("090999", "90999")))
+    # S3: the workbook now holds the drifted code as ANOTHER SKU's alt -> the findings alt is dropped
+    fk = FakeIO([{"id": "d3", "fields": {"sku_code": "401175", "alt_code": "090999",
+                                          "correct_total_per_brl": 293.49, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v9", "wb", [sku("P9", "90999", "Other", "Other 50L", 99.0),
+                                      sku("401175", "", "Blackthorn", "Blackthorn Dry 50L Keg", 293.49)], [], [], [])
+    aio.replace_tennents_master(wbd, source="wb_v9.xlsx")
+    md = aio.load_tennents_master()
+    by = {r["fields"]["sku_code"]: r["fields"] for r in fk.rows}
+    _check("drift: an alt now claimed by another workbook SKU is dropped (resolves to P9)",
+           md.find_sku("090999") is not None and md.find_sku("090999").sku_code == "P9" and not by["401175"].get("alt_code"))
+    # S4: an absorbed findings SKU carries its own unclaimed alt onto the absorbing row
+    fk = FakeIO([{"id": "d4", "fields": {"sku_code": "ZZZ999", "alt_code": "ZZZ998",
+                                          "correct_total_per_brl": 150.0, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v8", "wb", [sku("401136", "400217/ZZZ999", "Heverlee", "Heverlee 50L / 30L Keg", 370.14)], [], [], [])
+    _, _, p8 = aio.replace_tennents_master(wbd, source="wb_v8.xlsx")
+    md = aio.load_tennents_master()
+    _check("absorbed: its unclaimed alt is carried onto the absorbing row (ZZZ998 -> 401136)",
+           md.find_sku("ZZZ998") is not None and md.find_sku("ZZZ998").sku_code == "401136" and p8 == 1,
+           f"{md.find_sku('ZZZ998')} p={p8}")
+    # own_alts branch: a re-created findings SKU keeps only the alts the workbook hasn't claimed
+    fk = FakeIO([{"id": "d5", "fields": {"sku_code": "NEW1", "alt_code": "A1/A2",
+                                          "correct_total_per_brl": 100.0, "source": "findings:j f"}}])
+    _install(fk)
+    wbd = TennentsMaster("v10", "wb", [sku("OLD1", "A2", "Old", "Old 50L", 50.0)], [], [], [])
+    _, _, p10 = aio.replace_tennents_master(wbd, source="wb_v10.xlsx")
+    md = aio.load_tennents_master()
+    _check("re-created findings SKU keeps only its UNCLAIMED alt (A1); A2 stays the workbook's",
+           md.find_sku("NEW1") is not None and md.find_sku("A1") is not None and md.find_sku("A1").sku_code == "NEW1"
+           and md.find_sku("A2").sku_code == "OLD1" and p10 == 1, f"p={p10}")
 
 
 # ---------- rendering ----------
@@ -345,7 +419,11 @@ def test_render():
     _check("mixed not-on-master: NO add-as-new, Link still offered",
            "data-mode='new'" not in html_m and html_m.count("data-mode='link'") == 2)
     cfg_m = html_m.split('id="tennents-findings-config" type="application/json">')[1].split("</script>")[0]
-    _check("email config carries the charged RANGE for a mixed code", '"lo": 161.31' in cfg_m and '"hi": 370.34' in cfg_m)
+    cfg_j = json.loads(cfg_m.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&"))
+    hev = [x for x in cfg_j["email"]["not_on_master"] if x["sku"] == "401187"]
+    # both rows must carry the CROSS-ROW range (a per-row fallback would give 370.34/370.34 and 161.31/161.31)
+    _check("email config carries the cross-row charged RANGE on EVERY row of a mixed code",
+           len(hev) == 2 and all(x["lo"] == 161.31 and x["hi"] == 370.34 for x in hev), str(hev))
     # a single-figure row still gets its button
     s3 = _summary_with_findings()
     html_s = tn.render_summary_html(s3, accept_url="/x", can_accept=True, master=m)
@@ -363,7 +441,10 @@ def test_export_multi_alt():
     line = tpe._price_line(m, site, m.find_sku("401136"))
     _check("exception keyed on the SECOND alt code surfaces in the price-file note",
            "Correction pending" in line["note"], line["note"])
-    _check("category lookup works via a multi-alt SKU", tpe._category(m.find_sku("401136")) == "Premium Lager")
+    # non-vacuous: the primary and brand/product hit NO mapping; only the SECOND alt (400889) is mapped,
+    # so the old two-code loop returns "Other" for this SKU
+    z = SkuRate("ZZZ1", "ZZZ2/400889", "Foo", "Foo 50L", "50L", 0.3055, 4.0, 600.0, 100.0, True, "C&C", 0.0, 100.0)
+    _check("category resolves via the SECOND alt code", tpe._category(z) == "Standard Lager", tpe._category(z))
 
 
 if __name__ == "__main__":

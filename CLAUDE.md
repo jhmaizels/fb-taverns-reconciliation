@@ -215,7 +215,10 @@ Key facts:
   Tennents re-code containers) → appended to that SKU's `alt_code`; `new` —
   create a SKU_Master row whose agreed rate = the discount charged (must be
   > 0; no WSP invented); `set_rate` — fill a RATE-TBC SKU. Estate-wide (SKU_Master
-  is per-SKU). Rows are stamped `source='findings:<actor> <file>'` and
+  is per-SKU; one code per action — compound `/` codes are refused; leading-zero
+  drift `090425`/`90425` is treated as one code; buttons are gated on an
+  unambiguous charged figure; `set_rate` never overwrites an agreed rate).
+  Rows are stamped `source='findings:<actor> <file>'` and
   **`replace_tennents_master` PRESERVES them across a workbook re-upload**
   (re-creates rows absent from the workbook; unions alt codes; keeps a findings
   rate when the workbook row has none) — the deliberate exception to wipe-and-
