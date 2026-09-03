@@ -45,6 +45,7 @@ from reconcile import (
     active_supports,
     is_support_rule,
     rule_precedence,
+    successor_bases,
     support_cost_patch,
 )
 
@@ -838,10 +839,21 @@ def build_universal_increase(
     Skipped (reported in stats): managed rules (zero-margin layers — an annual
     uplift doesn't apply), supports with no standing list price to follow,
     future-dated rules, and rules with no tenant price.
+
+    ONE successor per (site, product): the basis is today's winning open
+    tenanted rule (reconcile.successor_bases); straggling duplicate open rows
+    (a legacy `site|product|open` row beside a dated one, or an original left
+    open by a half-landed prior run) are ended by the close pass instead of
+    each spawning a successor with the same rule_key. When the basis is
+    already dated on ``effective`` but stragglers remain, it is re-saved
+    UNCHANGED (a "heal": same values, same-key PATCH, no compounding) purely
+    so the close pass finishes.
     """
     mult = 1.0 + pct / 100.0
     new_rules: list[Rule] = []
+    heals: list[Rule] = []
     support_patches: list[Rule] = []
+    n_dedupe = 0
     skipped_support = 0
     skipped_managed = 0
     skipped_future = 0
@@ -855,16 +867,16 @@ def build_universal_increase(
     new_fb_by_key: dict[tuple, float] = {}
 
     for r in snap.rules:
-        if r.valid_to is not None:
-            continue
-        if is_support_rule(r):
-            continue  # cost side handled below; the support price is kept
+        if r.valid_to is not None or is_support_rule(r):
+            continue  # ended; or a support (cost side handled below, price kept)
         if (r.status or "tenanted") != "tenanted":
             skipped_managed += 1
-            continue
-        if r.valid_from is not None and r.valid_from > effective:
+        elif r.valid_from is not None and r.valid_from > effective:
             skipped_future += 1
-            continue
+
+    for (_site, _code), (r, stragglers) in successor_bases(snap.rules, effective).items():
+        if stragglers:
+            n_dedupe += 1
         if r.valid_from is not None and r.valid_from == effective:
             # Already dated ON the effective date: either a successor this run
             # already created (a prior run that timed out part-way), or a
@@ -877,6 +889,18 @@ def build_universal_increase(
             skipped_already_at_date += 1
             if r.fb_price is not None:
                 new_fb_by_key.setdefault((r.site_id, r.product_code), r.fb_price)
+            if stragglers:
+                # Half-landed prior run: the successor exists but its original
+                # was never closed. Re-save the successor exactly as it is (a
+                # same-key PATCH with unchanged values) so the close pass ends
+                # the original — never re-increase it.
+                heals.append(Rule(
+                    site_id=r.site_id, product_code=r.product_code,
+                    product_desc=r.product_desc, tenant_price=r.tenant_price,
+                    fb_price=r.fb_price, retro_pct=r.retro_pct or 0.0,
+                    valid_from=r.valid_from, valid_to=None, status="tenanted",
+                    reason=r.reason, source=r.source,
+                ))
             continue
         if r.tenant_price is None:
             skipped_no_price += 1
@@ -967,6 +991,8 @@ def build_universal_increase(
         "n_sites": len(sites_seen),
         "n_products": len(products_seen),
         "n_supports": len(support_patches),
+        "n_dedupe": n_dedupe,
+        "n_heal": len(heals),
         "skipped_support": skipped_support,
         "skipped_managed": skipped_managed,
         "skipped_future": skipped_future,
@@ -975,7 +1001,7 @@ def build_universal_increase(
         "examples": examples,
         "checksum": checksum,
     }
-    return new_rules + support_patches, stats
+    return new_rules + heals + support_patches, stats
 
 
 def _date_iso(d: date | None) -> str:

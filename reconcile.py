@@ -710,6 +710,40 @@ def support_cost_patch(
     )
 
 
+def successor_bases(
+    rules, effective: date, product_code: str | None = None,
+) -> dict[tuple[str, str], tuple[Rule, list[Rule]]]:
+    """Per (site, product): the ONE open standing rule a cost-change successor
+    is built from on ``effective``, plus the other open standing rows for that
+    key ("stragglers") that the successor's close pass will end.
+
+    Candidates are open (valid_to None) `tenanted` rules whose valid_from is
+    on/before ``effective`` — exactly the population every cost path re-dates
+    (grid Price / Retro cells, product settings, set_product_retro, the annual
+    increase). The basis is the winner among them on ``effective`` (newest
+    valid_from), i.e. the figure the grid shows for that site today. One
+    successor per key, never one per row: a legacy `site|product|open` row
+    beside a dated one, or an original left open by a half-landed prior
+    upsert beside its successor, would otherwise yield two successors sharing
+    one rule_key — duplicate rows in Airtable and in the patched snapshot.
+    Supports, managed rules, ended and future-dated rules are not candidates.
+    """
+    per_key: dict[tuple[str, str], list[Rule]] = {}
+    for r in rules:
+        if r.valid_to is not None or (r.status or "tenanted") != "tenanted":
+            continue
+        if product_code is not None and r.product_code != product_code:
+            continue
+        if r.valid_from is not None and r.valid_from > effective:
+            continue
+        per_key.setdefault((r.site_id, r.product_code), []).append(r)
+    out: dict[tuple[str, str], tuple[Rule, list[Rule]]] = {}
+    for k, lst in per_key.items():
+        basis = winning_rule(lst, effective) or lst[0]
+        out[k] = (basis, [r for r in lst if r is not basis])
+    return out
+
+
 def _index_rules(rules: list[Rule]) -> dict[tuple[str, str], list[Rule]]:
     idx: dict[tuple[str, str], list[Rule]] = {}
     for r in rules:

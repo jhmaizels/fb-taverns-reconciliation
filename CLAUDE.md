@@ -264,6 +264,16 @@ itself (fix-in-place, window kept); the editor's price-change preview warns
 when a support keeps winning. The export shades supported cells and lists
 them on its Info sheet so a re-upload never bakes a support in.
 
+**One cost successor per (site, product):** every cost path builds its
+today-dated tenanted successor from `reconcile.successor_bases` — the
+winning OPEN tenanted rule per key on the effective date (the figure the
+grid shows) — never one per row. Straggling duplicate open rows (a legacy
+`site|product|open` row beside a dated one, or an original left open by a
+half-landed prior upsert) are ended by the successor's close pass instead of
+each spawning a successor with the same `rule_key`; the annual increase
+re-saves an already-at-date successor unchanged (`n_heal`) purely to finish
+that close, never compounding it.
+
 **Tolerances (LWC):**
 - tenant_price: `tolerance` default **0.01** (1p/unit).
 - fb_price: `fb_tolerance` default **0.05** (5p/unit, looser — LWC MASTER column

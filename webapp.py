@@ -70,6 +70,7 @@ from reconcile import (  # noqa: E402
     Rule,
     active_supports,
     is_support_rule,
+    successor_bases,
     support_cost_patch,
 )
 # master_export (which imports openpyxl) is imported lazily inside /export-master
@@ -2136,7 +2137,15 @@ async def master_product_apply(
         r for r in snap.rules
         if r.product_code == product_code and r.valid_to is None
     ]
-    cur_fbs = {round(r.fb_price, 4) for r in open_rules if r.fb_price is not None}
+    # One basis row per site — today's winning open tenanted rule
+    # (reconcile.successor_bases): the figures the grid shows, and the row each
+    # successor is built from. Straggling duplicate open rows (a legacy
+    # `site|product|open` row beside a dated one, or an original left open by
+    # a half-landed prior save) are ended by the successor's close pass, never
+    # re-dated into a second row sharing the successor's rule_key.
+    bases = successor_bases(open_rules, today, product_code)
+    current = [b for b, _stragglers in bases.values()]
+    cur_fbs = {round(r.fb_price, 4) for r in current if r.fb_price is not None}
     cur_fb = next(iter(cur_fbs)) if len(cur_fbs) == 1 else None
     cur_retro = (
         (getattr(snap, "products", {}) or {}).get(product_code) or {}
@@ -2177,11 +2186,7 @@ async def master_product_apply(
     # only the cost side (and therefore margins) moves. History kept.
     successors: list = []
     if fb_changed or retro_changed:
-        for r in open_rules:
-            if (r.status or "tenanted") != "tenanted":
-                continue
-            if r.valid_from is not None and r.valid_from > today:
-                continue
+        for r, _stragglers in bases.values():
             fb = new_fb if new_fb is not None else r.fb_price
             retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
             successors.append(Rule(
@@ -2345,7 +2350,15 @@ async def master_product_cell_apply(
             "— edit its rules from the detailed list view instead, or wait "
             "until the scheduled change takes effect"
         ])
-    cur_fbs = {round(r.fb_price, 4) for r in open_rules if r.fb_price is not None}
+    # One basis row per site — today's winning open tenanted rule
+    # (reconcile.successor_bases): the figures the pivot shows (so a re-save of
+    # the shown figure is a true no-op even when a straggler carries an old
+    # list), and the row each successor is built from. Straggling duplicate
+    # open rows are ended by the successor's close pass, never re-dated into a
+    # second row sharing the successor's rule_key.
+    bases = successor_bases(open_rules, today, product_code)
+    current = [b for b, _stragglers in bases.values()]
+    cur_fbs = {round(r.fb_price, 4) for r in current if r.fb_price is not None}
     cur_fb = next(iter(cur_fbs)) if len(cur_fbs) == 1 else None
     cur_retro = (
         (getattr(snap, "products", {}) or {}).get(product_code) or {}
@@ -2377,9 +2390,7 @@ async def master_product_cell_apply(
         # list) disagrees with the figure being saved, treat the save as a
         # change so the reflow — and, for removals, the explicit retro_pct
         # clear below — runs again instead of no-opping.
-        for r in open_rules:
-            if (r.status or "tenanted") != "tenanted":
-                continue
+        for r in current:
             if not r.fb_price:
                 continue
             if abs((r.retro_pct or 0.0) * r.fb_price - retro_final) > 0.005:
@@ -2398,11 +2409,7 @@ async def master_product_cell_apply(
     # product from today with the new figures — tenant prices unchanged, so
     # only the cost side (and therefore margins) moves. History kept.
     successors: list = []
-    for r in open_rules:
-        if (r.status or "tenanted") != "tenanted":
-            continue
-        if r.valid_from is not None and r.valid_from > today:
-            continue
+    for r, _stragglers in bases.values():
         fb = new_fb if new_fb is not None else r.fb_price
         retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
         successors.append(Rule(
@@ -2418,6 +2425,12 @@ async def master_product_cell_apply(
             "this product has no current tenanted prices for the FB list price "
             "to ride on — add a site price first, or use the product settings page"
         ])
+    n_dedupe = sum(1 for _b, stragglers in bases.values() if stragglers)
+    if n_dedupe:
+        logger.info(
+            "product-cell %s: %d site(s) carried duplicate open rules — collapsed to "
+            "today's winner; the duplicates close with this save", product_code, n_dedupe,
+        )
     # Active supports keep their agreed price and their window — and keep
     # winning there — while their cost side follows, in place under their own
     # key (a re-date would collide with today's tenanted successor).

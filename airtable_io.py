@@ -30,6 +30,7 @@ from reconcile import (  # type: ignore
     Rule,
     _parse_date,
     is_support_rule,
+    successor_bases,
     support_cost_patch,
 )
 
@@ -707,25 +708,23 @@ def set_product_retro(
     )
     successors: list[Rule] = []
     support_patches: list[Rule] = []
-    for r in load_rules_from_airtable():
-        if r.product_code != code:
+    product_rules = [r for r in load_rules_from_airtable() if r.product_code == code]
+    for r in product_rules:
+        if not is_support_rule(r):
             continue
-        if is_support_rule(r):
-            if (r.valid_to is not None and r.valid_to <= effective) or not r.fb_price:
-                continue  # ended support (history), or no list price to derive from
-            support_patches.append(support_cost_patch(
-                r, fb_price=r.fb_price,
-                retro_pct=(retro / r.fb_price) if retro else 0.0,
-                note=f"retro set to £{retro:g}/keg (product-level); support price kept",
-                source=source,
-            ))
-            continue
-        if r.valid_to is not None:
-            continue
-        if (r.status or "tenanted") != "tenanted":
-            continue
-        if r.valid_from is not None and r.valid_from > effective:
-            continue
+        if (r.valid_to is not None and r.valid_to <= effective) or not r.fb_price:
+            continue  # ended support (history), or no list price to derive from
+        support_patches.append(support_cost_patch(
+            r, fb_price=r.fb_price,
+            retro_pct=(retro / r.fb_price) if retro else 0.0,
+            note=f"retro set to £{retro:g}/keg (product-level); support price kept",
+            source=source,
+        ))
+    # ONE successor per (site, product), built from today's winning open
+    # tenanted rule (reconcile.successor_bases); straggling duplicate open rows
+    # are ended by the close pass, never re-dated into a second row sharing
+    # the successor's rule_key.
+    for r, _stragglers in successor_bases(product_rules, effective).values():
         new_retro_pct = (retro / r.fb_price) if (r.fb_price and retro) else 0.0
         successors.append(Rule(
             site_id=r.site_id, product_code=code, product_desc=r.product_desc,

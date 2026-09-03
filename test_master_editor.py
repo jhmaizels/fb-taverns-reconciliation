@@ -2541,6 +2541,159 @@ def test_export_shows_support_price_and_marks_it():
             assert "standing price £180.00" in flat, flat
 
 
+# --------------------------------------------------------------------------
+# One cost successor per (site, product) — duplicate open rows collapse
+# --------------------------------------------------------------------------
+
+def _legacy_open_rec(rec_id: str = "rec_legacy", tenant: float = 170.0, fb: float = 100.0) -> dict:
+    """A legacy `site|product|open` row (no valid_from) still open beside the
+    dated standing rule — the duplicate-open-rule shape seen in the master."""
+    rec = _pr_record(rec_id, _key(None), valid_from=None)
+    rec["fields"].update({"tenant_price": tenant, "status": "tenanted", "fb_price": fb})
+    return rec
+
+
+def _closed_ids(fa: FakeAirtable) -> list[str]:
+    return sorted(u["id"] for u in _updates(fa) if set(u["fields"]) == {"valid_to"})
+
+
+def test_successor_bases_collapse_duplicate_open_rules():
+    """reconcile.successor_bases: one basis per (site, product) — the winner
+    on the effective date among the OPEN tenanted rules starting on/before it
+    — with the other open rows as stragglers; supports, managed, ended and
+    future-dated rules are never candidates."""
+    from reconcile import successor_bases
+    today = date.today()
+    legacy = _rule(vf=None, tenant=170.0, fb=100.0)                 # site|product|open
+    dated = _rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0)
+    basis, stragglers = successor_bases([legacy, dated], today)[(SITE_ID, PROD_CODE)]
+    assert basis is dated and stragglers == [legacy]
+    # half-landed prior upsert: the at-date successor wins; the original straggles
+    at_date = _rule(vf=today, tenant=189.0, fb=126.0)
+    basis, stragglers = successor_bases([dated, at_date], today)[(SITE_ID, PROD_CODE)]
+    assert basis is at_date and stragglers == [dated]
+    ended = _rule(vf=date(2025, 1, 1), vt=date(2026, 1, 1))
+    sup = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30),
+                tenant=150.0, status="supported")
+    man = _rule(vf=date(2026, 1, 1), tenant=None, status="managed", site="002")
+    fut = _rule(vf=today + timedelta(days=5), tenant=200.0)
+    other = _rule(vf=date(2026, 1, 1), code="OTHER")
+    bases = successor_bases([legacy, dated, ended, sup, man, fut, other], today, PROD_CODE)
+    assert set(bases) == {(SITE_ID, PROD_CODE)} and bases[(SITE_ID, PROD_CODE)][0] is dated
+    assert set(successor_bases([dated, other], today)) == {(SITE_ID, PROD_CODE), (SITE_ID, "OTHER")}
+    assert successor_bases([man, sup, fut, ended], today) == {}
+
+
+def test_route_product_cell_dedupes_duplicate_open_rules():
+    """The grid's Price cell on a site with TWO open rules (a legacy
+    site|product|open row beside the dated one): the Price figure and the
+    same-figure no-op follow today's winner, ONE successor is created from it,
+    and BOTH open rows are closed — no second row with the successor's key."""
+    today = date.today()
+    dated = _grid_rule("rec_old")          # 180 since January, list 120
+    dated["fields"]["fb_price"] = 120.0
+    with FakeAirtable([_legacy_open_rec(), dated]) as fa:
+        with FakeAuthClient("admin") as client:
+            g = client.get("/master")
+            assert "£120.00" in g.text and ">varies<" not in g.text, "the grid shows the winner's list"
+            # re-saving the shown figure is a no-op even though the straggler says £100
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "120.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": False}, r.text[:300]
+            assert not fa.calls, "same-figure save must write NOTHING"
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "fb_price": "130.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}, r.text[:300]
+            created = _creates(fa)
+            assert len(created) == 1, f"ONE successor per site, got {created}"
+            f = created[0]["fields"]
+            assert f["rule_key"] == _key(today.isoformat()), f
+            assert f["tenant_price"] == 180.0 and f["fb_price"] == 130.0, "built from the winner, not the straggler"
+            assert _closed_ids(fa) == ["rec_legacy", "rec_old"], _closed_ids(fa)
+            after = _master_after(fa)
+            w = _bills(after, today)
+            assert w.tenant_price == 180.0 and w.fb_price == 130.0 and w.valid_from == today
+            assert len([x for x in after if x.valid_to is None]) == 1, "exactly one open rule remains"
+            g2 = client.get("/master")
+            assert "£180.00" in g2.text and "£170.00" not in g2.text and "£130.00" in g2.text
+
+
+def test_route_product_settings_dedupes_duplicate_open_rules():
+    """The same through the product-settings save."""
+    today = date.today()
+    dated = _grid_rule("rec_old")
+    dated["fields"]["fb_price"] = 120.0
+    with FakeAirtable([_legacy_open_rec(), dated]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save", "new_code": PROD_CODE,
+                "new_desc": "Test Keg", "new_fb": "130.00",
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            created = _creates(fa)
+            assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 180.0, created
+            assert created[0]["fields"]["rule_key"] == _key(today.isoformat())
+            assert _closed_ids(fa) == ["rec_legacy", "rec_old"]
+
+
+def test_set_product_retro_dedupes_duplicate_open_rules():
+    today = date.today()
+    dated = _grid_rule("rec_old")
+    dated["fields"]["fb_price"] = 120.0
+    with FakeAirtable([_legacy_open_rec(), dated]) as fa:
+        n = airtable_io.set_product_retro(PROD_CODE, 15.0, today, "test")
+    assert n == 1, n
+    created = _creates(fa)
+    assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 180.0, created
+    assert abs(created[0]["fields"]["retro_pct"] - 0.125) < 1e-9
+    assert _closed_ids(fa) == ["rec_legacy", "rec_old"]
+
+
+def test_increase_dedupes_duplicates_and_heals_half_landed_run():
+    """build_universal_increase: duplicate open rows at one site yield ONE
+    successor (from today's winner) and both close in the mirror; a
+    half-landed prior run (successor at the effective date, original still
+    open) is healed by re-saving the successor UNCHANGED — no compounding —
+    so the close pass ends the original; the routes agree."""
+    from master_changes import build_universal_increase, patch_snapshot_for_bulk_upsert
+    today = date.today()
+    legacy = _rule(vf=None, tenant=170.0, fb=100.0)
+    dated = _rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0)
+    new_rules, stats = build_universal_increase(_snap([legacy, dated]), 5.0, today, "me@x")
+    assert len(new_rules) == 1 and stats["n_rules"] == 1, (new_rules, stats)
+    assert stats["n_dedupe"] == 1 and stats["n_heal"] == 0, stats
+    assert (new_rules[0].tenant_price, new_rules[0].fb_price) == (189.0, 126.0), "from the winner, not the straggler"
+    snap2 = patch_snapshot_for_bulk_upsert(_snap([legacy, dated]), new_rules, today)
+    assert [r.tenant_price for r in snap2.rules if r.valid_to is None] == [189.0]
+    assert all(r.valid_to == today for r in snap2.rules if r.tenant_price in (170.0, 180.0))
+
+    at_date = _rule(vf=today, tenant=189.0, fb=126.0, reason="annual increase +5% (was 180.0)")
+    snap3 = _snap([dated, at_date])
+    again, stats3 = build_universal_increase(snap3, 5.0, today, "me@x")
+    assert stats3["n_rules"] == 0 and stats3["n_heal"] == 1 and stats3["skipped_already_at_date"] == 1, stats3
+    assert len(again) == 1 and again[0].tenant_price == 189.0 and again[0].fb_price == 126.0, again
+    assert again[0].valid_from == today and again[0].reason == at_date.reason, "re-saved unchanged"
+    snap4 = patch_snapshot_for_bulk_upsert(snap3, again, today)
+    assert [r.tenant_price for r in snap4.rules if r.valid_to is None] == [189.0]
+    done, stats4 = build_universal_increase(snap4, 5.0, today, "me@x")
+    assert done == [] and stats4["n_heal"] == 0 and stats4["n_dedupe"] == 0, (done, stats4)
+
+    dated_rec = _grid_rule("rec_old")
+    dated_rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([_legacy_open_rec(), dated_rec]) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/increase/preview", data={
+                "pct": "5", "valid_from": today.isoformat()})
+            assert r.status_code == 200 and "collapsed to today" in r.text, r.text[:2000]
+            r2 = client.post("/master/increase/apply", data=_extract_hidden(r.text))
+            assert r2.status_code == 200 and "Increase applied" in r2.text, r2.text[:400]
+            created = _creates(fa)
+            assert len(created) == 1 and created[0]["fields"]["tenant_price"] == 189.0, created
+            assert _closed_ids(fa) == ["rec_legacy", "rec_old"]
+            g = client.get("/master")
+            assert "£189.00" in g.text and "£170.00" not in g.text
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -2611,6 +2764,11 @@ TESTS = [
     test_preview_warns_when_support_keeps_winning_and_support_closes_nothing,
     test_upsert_support_row_never_closes_standing_rule,
     test_export_shows_support_price_and_marks_it,
+    test_successor_bases_collapse_duplicate_open_rules,
+    test_route_product_cell_dedupes_duplicate_open_rules,
+    test_route_product_settings_dedupes_duplicate_open_rules,
+    test_set_product_retro_dedupes_duplicate_open_rules,
+    test_increase_dedupes_duplicates_and_heals_half_landed_run,
 ]
 
 

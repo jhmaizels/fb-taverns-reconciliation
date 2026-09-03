@@ -1180,6 +1180,16 @@ def render_increase_preview_page(pct: float, vf: date, stats: dict, warnings: li
         )
     if stats.get("skipped_managed"):
         skipped_bits.append(f'{stats["skipped_managed"]} managed rule(s) left alone')
+    if stats.get("n_dedupe"):
+        skipped_bits.append(
+            f'{stats["n_dedupe"]} site × product pair(s) carried more than one open price — '
+            "collapsed to today's winner; the duplicate rows are closed"
+        )
+    if stats.get("n_heal"):
+        skipped_bits.append(
+            f'{stats["n_heal"]} price(s) already at the effective date re-saved unchanged '
+            "so a straggling original is closed"
+        )
     if stats.get("skipped_future"):
         skipped_bits.append(f'{stats["skipped_future"]} future-dated rule(s) left alone')
     if stats.get("skipped_no_price"):
