@@ -72,6 +72,7 @@ from reconcile import (  # noqa: E402
     is_support_rule,
     successor_bases,
     support_cost_patch,
+    winning_rule,
 )
 # master_export (which imports openpyxl) is imported lazily inside /export-master
 # so it stays off the cold-start / health-check readiness path.
@@ -1539,14 +1540,35 @@ def add_support(
         new_price = float(parsed["new_tenant_price"])
         reason = (parsed.get("reason") or "").strip()
 
-        # FB price comes from the existing standard rule for the same product,
-        # so reconciliation can still flag wrong_fb_price mismatches inside the
-        # support window.
-        existing_fb = next(
-            (r.fb_price for r in rules
-             if r.product_code == code and r.valid_to is None and r.fb_price is not None),
-            None,
+        # The support's COST side — what makes wrong_fb_price checks and the
+        # margin display right inside the window. FB list price: the site's
+        # OWN standing rule on the support's start date (the figure the grid
+        # shows for that cell), else any open rule of the product (the list
+        # price is product-level). retro_pct: the product-level retro
+        # (Products.retro_per_keg) over that list, exactly as every cost path
+        # sets it — no longer a hard-coded 0 — else the standing rule's own.
+        standing = winning_rule(
+            [r for r in rules
+             if r.site_id == sid and r.product_code == code and not is_support_rule(r)],
+            vf or date.today(),
         )
+        existing_fb = (
+            standing.fb_price if standing is not None and standing.fb_price is not None
+            else next(
+                (r.fb_price for r in rules
+                 if r.product_code == code and r.valid_to is None and r.fb_price is not None),
+                None,
+            )
+        )
+        retro_gbp = float(
+            ((getattr(snap, "products", {}) or {}).get(code) or {}).get("retro_per_keg") or 0.0
+        )
+        if existing_fb and retro_gbp:
+            retro_pct = retro_gbp / existing_fb
+        elif standing is not None:
+            retro_pct = standing.retro_pct or 0.0
+        else:
+            retro_pct = 0.0
         existing_desc = next(
             (r.product_desc for r in rules if r.product_code == code and r.product_desc),
             "",
@@ -1558,7 +1580,7 @@ def add_support(
             product_desc=existing_desc,
             tenant_price=new_price,
             fb_price=existing_fb,
-            retro_pct=0.0,
+            retro_pct=retro_pct,
             valid_from=vf,
             valid_to=vt,
             status="supported",
@@ -1577,8 +1599,22 @@ def add_support(
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
 
+    # Instant grid: the support is the winner at its cell from vf (a support
+    # closes nothing, which patch_snapshot_for_bulk_upsert mirrors), so publish
+    # the patched snapshot rather than leaving the next /master read on the
+    # pre-support cache for up to a minute. Best-effort; the write is done.
+    try:
+        publish_patched_snapshot(
+            patch_snapshot_for_bulk_upsert(snap, [rule], vf or date.today())
+        )
+    except Exception:
+        logger.exception("add-support: snapshot patch failed — grid catches up on refresh")
+    refresh_master_cache_async()
+
     site_name = (sites.get(sid) or {}).get("name", "")
     product_desc = products.get(code, {}).get("description", existing_desc)
+    fb_disp = f"£{existing_fb:,.2f}" if existing_fb is not None else "—"
+    retro_disp = f"£{retro_gbp:,.2f}" if retro_gbp else "—"
 
     return f"""{render_head(principal.email, principal.role)}
 <h1>Support added</h1>
@@ -1588,6 +1624,8 @@ def add_support(
   <div class="summary-row"><span>Site</span><strong>{escape(sid)} {escape(site_name)}</strong></div>
   <div class="summary-row"><span>Product</span><strong>{escape(code)} {escape(product_desc)}</strong></div>
   <div class="summary-row"><span>Support tenant price</span><strong>£{new_price:,.2f}</strong></div>
+  <div class="summary-row"><span>FB list price (inherited)</span><strong>{fb_disp}</strong></div>
+  <div class="summary-row"><span>Retro P/Keg (inherited)</span><strong>{retro_disp}</strong></div>
   <div class="summary-row"><span>Valid from</span><strong>{vf.isoformat() if vf else '?'}</strong></div>
   <div class="summary-row"><span>Valid to</span><strong>{vt.isoformat() if vt else '?'}</strong></div>
   <div class="summary-row"><span>Reason</span><span>{escape(reason)}</span></div>

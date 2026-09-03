@@ -2694,6 +2694,61 @@ def test_increase_dedupes_duplicates_and_heals_half_landed_run():
             assert "£189.00" in g.text and "£170.00" not in g.text
 
 
+# --------------------------------------------------------------------------
+# /add-support: the support inherits its site's cost side
+# --------------------------------------------------------------------------
+
+def test_route_add_support_inherits_site_cost_side_and_shows_in_grid():
+    """/add-support (LLM parse stubbed): the support takes its OWN site's
+    standing FB list price — not another site's — and retro_pct = the
+    product-level retro / that list (it was a hard-coded 0), layers over the
+    standing rule (nothing closed), wins in-window and yields after, and the
+    grid shows it at once from the patched cache."""
+    import webapp
+    today = date.today()
+    std = _grid_rule("rec_old")                       # 180 since January, list 120
+    std["fields"]["fb_price"] = 120.0
+    std["fields"]["retro_pct"] = 15.0 / 120.0
+    # listed FIRST: another site carrying a DIFFERENT list for the same product
+    sites2 = SITES + [{"id": SITE2_REC, "fields": {"site_id": SITE2_ID}}]
+    other = {"id": "rec_s2", "fields": {
+        "rule_key": f"{SITE2_ID}|{PROD_CODE}|2026-01-01", "site": [SITE2_REC],
+        "product": [PROD_REC], "valid_from": "2026-01-01",
+        "tenant_price": 175.0, "status": "tenanted", "fb_price": 125.0}}
+    prods = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 15.0, "retro_eligible": True}}]
+    vf, vt = today - timedelta(days=1), today + timedelta(days=30)
+    parsed = {
+        "site_id": SITE_ID, "product_code": PROD_CODE, "new_tenant_price": 150.0,
+        "valid_from": vf.isoformat(), "valid_to": vt.isoformat(),
+        "reason": "hardship agreed",
+    }
+    orig = webapp.parse_support_request
+    webapp.parse_support_request = lambda text, sites, products: dict(parsed)
+    try:
+        with FakeAirtable([other, std], sites=sites2, products=prods) as fa:
+            with FakeAuthClient("admin") as client:
+                r = client.post("/add-support", data={"text": "150 for PKEG1 at 001 for a month"})
+                assert r.status_code == 200 and "Support added" in r.text, r.text[:400]
+                created = _creates(fa)
+                assert len(created) == 1, created
+                f = created[0]["fields"]
+                assert f["status"] == "supported" and f["tenant_price"] == 150.0, f
+                assert f["rule_key"] == _key(vf.isoformat()) and f["valid_to"] == vt.isoformat(), f
+                assert f["fb_price"] == 120.0, "the site's OWN standing list, not another site's"
+                assert abs(f["retro_pct"] - 15.0 / 120.0) < 1e-9, "product-level retro / list"
+                assert not [u for u in _updates(fa) if "valid_to" in u["fields"]], "a support closes nothing"
+                assert "£120.00" in r.text and "£15.00" in r.text, "the inherited cost side is shown"
+                g = client.get("/master")
+                assert "£150.00" in g.text and "cell-support" in g.text, "patched cache shows the support"
+                after = _master_after(fa)
+                assert _bills(after, today).tenant_price == 150.0
+                assert _bills(after, vt).tenant_price == 180.0, "standing rule resumes after the window"
+    finally:
+        webapp.parse_support_request = orig
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -2769,6 +2824,7 @@ TESTS = [
     test_route_product_settings_dedupes_duplicate_open_rules,
     test_set_product_retro_dedupes_duplicate_open_rules,
     test_increase_dedupes_duplicates_and_heals_half_landed_run,
+    test_route_add_support_inherits_site_cost_side_and_shows_in_grid,
 ]
 
 

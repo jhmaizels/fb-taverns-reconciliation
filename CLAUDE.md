@@ -185,10 +185,14 @@ Key facts:
   Claude (model `claude-opus-4-7`, forced tool `create_support_rule`, requires
   `ANTHROPIC_API_KEY`) → `{site_id, product_code, new_tenant_price, valid_from,
   valid_to, reason}`. `validate_support_fields` checks against master.
-- Builds one `Rule(status='supported', tenant_price=new, retro_pct=0.0)`;
-  `fb_price`/`product_desc` copied from the existing active standard rule so
-  wrong_fb_price still fires inside the support window. Persisted with
-  `close_keys_at_date=None` so the standard rule resumes after `valid_to`.
+- Builds one `Rule(status='supported', tenant_price=new)`; `fb_price` from
+  the site's OWN standing rule on the start date (else any open rule of the
+  product), `retro_pct` = `Products.retro_per_keg` / that list (the
+  product-level retro model; it was a hard-coded 0 before 2026-09-03) and
+  `product_desc` copied, so wrong_fb_price and the margin display are right
+  inside the support window. Persisted with `close_keys_at_date=None` so the
+  standard rule resumes after `valid_to`; the patched snapshot is published
+  so the grid shows the support at once.
 - The support outranks the standing rule for its whole window (§6
   precedence), including any later-dated tenanted successor a cost change
   creates; those cost changes update the support's fb/retro in place.
