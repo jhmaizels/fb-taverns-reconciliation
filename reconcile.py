@@ -744,6 +744,35 @@ def successor_bases(
     return out
 
 
+def cost_successor(
+    basis: Rule, *, effective: date, fb_price: float | None, retro_pct: float,
+    reason: str, source: str, product_code: str | None = None, product_desc: str | None = None,
+) -> Rule:
+    """The ``effective``-dated tenanted successor a cost change writes for one
+    site, built from ``basis`` (its successor_bases row): tenant price kept,
+    the new cost figures applied. When the basis ALREADY starts on
+    ``effective`` the successor shares its rule_key and the upsert PATCHes it
+    in place — so ``reason`` is prepended to the basis's own (Airtable
+    overwrites any field sent) and the earlier same-day edit's note survives.
+    """
+    old_reason = (basis.reason or "").strip()
+    if basis.valid_from == effective and old_reason:
+        reason = f"{reason}; {old_reason}"
+    return Rule(
+        site_id=basis.site_id,
+        product_code=product_code or basis.product_code,
+        product_desc=product_desc or basis.product_desc,
+        tenant_price=basis.tenant_price,
+        fb_price=fb_price,
+        retro_pct=retro_pct,
+        valid_from=effective,
+        valid_to=None,
+        status="tenanted",
+        reason=reason,
+        source=source,
+    )
+
+
 def _index_rules(rules: list[Rule]) -> dict[tuple[str, str], list[Rule]]:
     idx: dict[tuple[str, str], list[Rule]] = {}
     for r in rules:

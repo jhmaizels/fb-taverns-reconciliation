@@ -2749,6 +2749,143 @@ def test_route_add_support_inherits_site_cost_side_and_shows_in_grid():
         webapp.parse_support_request = orig
 
 
+# --------------------------------------------------------------------------
+# Small follow-ups (2026-09-03): same-day reason kept, retro-only Products
+# PATCH, retro-removal clears everywhere, success log, grid JS guards
+# --------------------------------------------------------------------------
+
+def _today_rule_rec(rec_id: str = "rec_today", reason: str = "grid: price change (was £170.00)",
+                    retro_pct: float | None = None) -> dict:
+    """A tenanted rule ALREADY dated today (an earlier same-day edit)."""
+    today_iso = date.today().isoformat()
+    rec = _pr_record(rec_id, _key(today_iso), valid_from=today_iso)
+    rec["fields"].update({"tenant_price": 180.0, "status": "tenanted",
+                          "fb_price": 120.0, "reason": reason, "source": "grid:a@x"})
+    if retro_pct:
+        rec["fields"]["retro_pct"] = retro_pct
+    return rec
+
+
+def test_route_product_cell_same_day_keeps_reason_and_logs():
+    """A cost edit on a rule that already starts today PATCHes it in place —
+    the earlier same-day edit's reason must survive (prepended, not
+    overwritten) — and the route logs a success line with the counts."""
+    import logging
+    import webapp
+
+    class _Cap(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.msgs: list[str] = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    cap = _Cap()
+    webapp.logger.addHandler(cap)
+    try:
+        with FakeAirtable([_today_rule_rec()]) as fa:
+            with FakeAuthClient("admin") as client:
+                r = client.post("/master/product-cell/apply", data={
+                    "product_code": PROD_CODE, "fb_price": "130.00", "ajax": "1"})
+                assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}, r.text[:300]
+                assert not _creates(fa), "same key -> in-place PATCH, no new row"
+                ups = [u for u in _updates(fa) if u["id"] == "rec_today"]
+                assert len(ups) == 1, ups
+                f = ups[0]["fields"]
+                assert f["fb_price"] == 130.0 and f["tenant_price"] == 180.0
+                assert f["reason"].startswith("grid: list/retro updated"), f["reason"]
+                assert f["reason"].endswith("grid: price change (was £170.00)"), (
+                    f"the earlier same-day reason must be kept: {f['reason']!r}"
+                )
+    finally:
+        webapp.logger.removeHandler(cap)
+    hits = [m for m in cap.msgs if m.startswith("product-cell ") and "updated" in m]
+    assert hits and "0 created, 1 updated" in hits[0] and FakeAuthClient.EMAIL in hits[0], cap.msgs
+
+
+def test_route_product_cell_retro_only_save_leaves_description_alone():
+    """A retro-only save PATCHes Products.retro_per_keg/retro_eligible ONLY —
+    never the description (a blank one used to get the product code written
+    into it)."""
+    prods = [{"id": PROD_REC, "fields": {"product_code": PROD_CODE, "description": ""}}]
+    rec = _grid_rule("rec_old")
+    rec["fields"]["fb_price"] = 120.0
+    with FakeAirtable([rec], products=prods) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product-cell/apply", data={
+                "product_code": PROD_CODE, "retro_gbp": "13.00", "ajax": "1"})
+            assert r.status_code == 200 and r.json() == {"ok": True, "saved": True}, r.text[:300]
+            prod_ups = [recs for op, t, recs in fa.calls
+                        if op == "update" and t == airtable_io.T["Products"]]
+            assert len(prod_ups) == 1, prod_ups
+            pf = prod_ups[0][0]["fields"]
+            assert set(pf) == {"retro_per_keg", "retro_eligible"}, pf
+            assert pf["retro_per_keg"] == 13.0 and pf["retro_eligible"] is True
+            created = _creates(fa)
+            assert len(created) == 1 and abs(created[0]["fields"]["retro_pct"] - 13.0 / 120.0) < 1e-9
+
+
+def test_route_product_settings_retro_remove_clears_stale_pct():
+    """Retro REMOVAL through the product-settings save: a rule already dated
+    today (same key, updated in place) and an active support (cost-side
+    rewrite in place) both keep their old retro_pct through the upsert — the
+    route must zero them explicitly, as the grid route already did."""
+    prods13 = [{"id": PROD_REC, "fields": {
+        "product_code": PROD_CODE, "description": "Test Keg",
+        "retro_per_keg": 13.0, "retro_eligible": True}}]
+    today_rec = _today_rule_rec(retro_pct=13.0 / 120.0)
+    sup = _support_rec("rec_sup", retro_pct=13.0 / 120.0)
+    with FakeAirtable([today_rec, sup], products=prods13) as fa:
+        with FakeAuthClient("admin") as client:
+            r = client.post("/master/product/apply", data={
+                "product_code": PROD_CODE, "do": "save", "new_code": PROD_CODE,
+                "new_desc": "Test Keg", "new_retro": "0",
+            }, follow_redirects=False)
+            assert r.status_code == 303, r.text[:300]
+            clears = sorted(u["id"] for u in _updates(fa) if u["fields"] == {"retro_pct": 0})
+            assert clears == ["rec_sup", "rec_today"], clears
+            pf = [recs for op, t, recs in fa.calls
+                  if op == "update" and t == airtable_io.T["Products"]]
+            assert pf and pf[0][0]["fields"]["retro_per_keg"] == 0.0
+
+
+def test_set_product_retro_remove_clears_stale_pct():
+    """The same through set_product_retro (the /master/apply retro
+    propagation): removal zeroes the same-day row's and the support's
+    retro_pct explicitly."""
+    today = date.today()
+    today_rec = _today_rule_rec(retro_pct=13.0 / 120.0)
+    sup = _support_rec("rec_sup", retro_pct=13.0 / 120.0)
+    with FakeAirtable([today_rec, sup]) as fa:
+        n = airtable_io.set_product_retro(PROD_CODE, 0.0, today, "test")
+    assert n == 2, n
+    clears = sorted(u["id"] for u in _updates(fa) if u["fields"] == {"retro_pct": 0})
+    assert clears == ["rec_sup", "rec_today"], clears
+    # ...and a non-zero retro still writes NO clear
+    with FakeAirtable([_today_rule_rec(retro_pct=13.0 / 120.0)]) as fa2:
+        airtable_io.set_product_retro(PROD_CODE, 15.0, today, "test")
+    assert not [u for u in _updates(fa2) if u["fields"] == {"retro_pct": 0}]
+
+
+def test_render_master_pivot_grid_js_guards_zero_retro_and_live_margins():
+    """The grid script: a typed 0 in the retro cell gets the same 'remove'
+    confirm as a blank (single-cell and Save-changes paths), and margin
+    sublines recompute live from the Python band thresholds."""
+    from master_pages import MARGIN_GREEN_ABOVE_PCT, MARGIN_RED_BELOW_PCT, render_master_pivot
+    rules = [_rule(vf=date(2026, 1, 1), tenant=180.0, fb=120.0, retro=0.125)]
+    snap = _snap(rules)
+    html = render_master_pivot(snap, {"edit": "1"}, is_admin=True)
+    assert f"var MG={MARGIN_GREEN_ABOVE_PCT:g},MR={MARGIN_RED_BELOW_PCT:g};" in html
+    assert "function isZero(" in html and "function updMargins(" in html
+    # single-cell save: typed zero on a non-zero retro asks before removing
+    assert "i.name==='retro_gbp'&&prev!==''&&isZero(v)&&!isZero(prev)" in html
+    # Save-changes: typed zeros count as removals in the confirm
+    assert "(i.value.trim()===''||isZero(i.value)))remR++" in html
+    # tenant-price typing refreshes that row's margins too
+    assert "else if(i.name==='tenant_price'){var tr=i.closest('tr');if(tr)updMargins(tr);}" in html
+
+
 TESTS = [
     test_end_rule_closes_open_rule,
     test_end_rule_no_old_reason,
@@ -2825,6 +2962,11 @@ TESTS = [
     test_set_product_retro_dedupes_duplicate_open_rules,
     test_increase_dedupes_duplicates_and_heals_half_landed_run,
     test_route_add_support_inherits_site_cost_side_and_shows_in_grid,
+    test_route_product_cell_same_day_keeps_reason_and_logs,
+    test_route_product_cell_retro_only_save_leaves_description_alone,
+    test_route_product_settings_retro_remove_clears_stale_pct,
+    test_set_product_retro_remove_clears_stale_pct,
+    test_render_master_pivot_grid_js_guards_zero_retro_and_live_margins,
 ]
 
 

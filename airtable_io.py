@@ -29,6 +29,7 @@ from reconcile import (  # type: ignore
     Mismatch,
     Rule,
     _parse_date,
+    cost_successor,
     is_support_rule,
     successor_bases,
     support_cost_patch,
@@ -678,6 +679,24 @@ def update_product(
     return rewritten
 
 
+def set_product_retro_fields(code: str, retro_per_keg: float) -> str:
+    """PATCH ONLY a product's retro figure (Products.retro_per_keg +
+    retro_eligible) — never its description, so a retro-only save can't
+    rewrite the product name (or stamp the code into a blank one). Returns
+    the Products record id; raises ValueError if the product is unknown."""
+    from reconcile import _to_str_code
+    code = _to_str_code(code)
+    retro = float(retro_per_keg or 0.0)
+    rec_id = _product_lookup().get(code)
+    if not rec_id:
+        raise ValueError(f"product {code!r} is not in the master")
+    _batch(
+        [{"id": rec_id, "fields": {"retro_per_keg": retro, "retro_eligible": retro > 0}}],
+        "update", T["Products"],
+    )
+    return rec_id
+
+
 def set_product_retro(
     code: str, retro_per_keg: float, effective: date, source: str
 ) -> int:
@@ -699,13 +718,7 @@ def set_product_retro(
     from reconcile import _to_str_code
     code = _to_str_code(code)
     retro = float(retro_per_keg or 0.0)
-    rec_id = _product_lookup().get(code)
-    if not rec_id:
-        raise ValueError(f"product {code!r} is not in the master")
-    _batch(
-        [{"id": rec_id, "fields": {"retro_per_keg": retro, "retro_eligible": retro > 0}}],
-        "update", T["Products"],
-    )
+    set_product_retro_fields(code, retro)
     successors: list[Rule] = []
     support_patches: list[Rule] = []
     product_rules = [r for r in load_rules_from_airtable() if r.product_code == code]
@@ -726,14 +739,24 @@ def set_product_retro(
     # the successor's rule_key.
     for r, _stragglers in successor_bases(product_rules, effective).values():
         new_retro_pct = (retro / r.fb_price) if (r.fb_price and retro) else 0.0
-        successors.append(Rule(
-            site_id=r.site_id, product_code=code, product_desc=r.product_desc,
-            tenant_price=r.tenant_price, fb_price=r.fb_price, retro_pct=new_retro_pct,
-            valid_from=effective, valid_to=None, status="tenanted",
+        successors.append(cost_successor(
+            r, effective=effective, fb_price=r.fb_price, retro_pct=new_retro_pct,
+            product_code=code,
             reason=f"retro set to £{retro:g}/keg (product-level)", source=source,
         ))
     if successors or support_patches:
         upsert_pricing_rules(successors + support_patches, effective)
+        if not retro:
+            # Retro REMOVAL: the upsert never sends a zero retro_pct, so rows
+            # updated in place (a same-day successor, a support's cost-side
+            # rewrite) would keep the old percentage — clear it explicitly on
+            # exactly the keys just written.
+            clear_rule_retro_pcts(
+                [(r.site_id, code) for r in successors], effective,
+                rule_keys=[
+                    _rule_key(p.site_id, p.product_code, p.valid_from) for p in support_patches
+                ],
+            )
     invalidate_master_cache()
     return len(successors) + len(support_patches)
 

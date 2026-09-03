@@ -69,6 +69,7 @@ from reconcile import (  # noqa: E402
     _to_str_code,
     Rule,
     active_supports,
+    cost_successor,
     is_support_rule,
     successor_bases,
     support_cost_patch,
@@ -80,6 +81,7 @@ from support_parser import parse_support_request, validate_support_fields  # noq
 from deal_products import build_deal_products_payload, token_ok  # noqa: E402
 from airtable_io import (  # noqa: E402
     clear_rule_retro_pcts,
+    set_product_retro_fields,
     create_site,
     delete_product,
     delete_site,
@@ -2227,10 +2229,9 @@ async def master_product_apply(
         for r, _stragglers in bases.values():
             fb = new_fb if new_fb is not None else r.fb_price
             retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
-            successors.append(Rule(
-                site_id=r.site_id, product_code=new_code, product_desc=new_desc,
-                tenant_price=r.tenant_price, fb_price=fb, retro_pct=retro_pct,
-                valid_from=today, valid_to=None, status="tenanted",
+            successors.append(cost_successor(
+                r, effective=today, fb_price=fb, retro_pct=retro_pct,
+                product_code=new_code, product_desc=new_desc,
                 reason=f"product edit: list/retro updated (was fb {r.fb_price}, retro £{cur_retro:g})",
                 source=f"product-edit:{principal.email}",
             ))
@@ -2246,6 +2247,21 @@ async def master_product_apply(
                 await run_in_threadpool(upsert_pricing_rules, successors, today)
             except Exception:
                 logger.exception("product fb/retro rules rewrite failed")
+                return _error_page(_GENERIC_ERR)
+        if retro_changed and retro_final == 0 and successors:
+            # Retro REMOVAL: the upsert never sends a zero retro_pct, so rows
+            # updated in place (a same-day successor, a support's cost-side
+            # rewrite) would keep the old percentage — clear it explicitly on
+            # exactly the keys just written (the grid route does the same).
+            try:
+                await run_in_threadpool(
+                    clear_rule_retro_pcts,
+                    [(s.site_id, s.product_code) for s in successors if not is_support_rule(s)],
+                    today,
+                    rule_keys=[master_pages.rule_key_of(s) for s in successors if is_support_rule(s)],
+                )
+            except Exception:
+                logger.exception("product retro_pct clear failed")
                 return _error_page(_GENERIC_ERR)
 
     try:
@@ -2450,11 +2466,9 @@ async def master_product_cell_apply(
     for r, _stragglers in bases.values():
         fb = new_fb if new_fb is not None else r.fb_price
         retro_pct = (retro_final / fb) if (fb and retro_final) else 0.0
-        successors.append(Rule(
-            site_id=r.site_id, product_code=product_code,
+        successors.append(cost_successor(
+            r, effective=today, fb_price=fb, retro_pct=retro_pct,
             product_desc=r.product_desc or desc,
-            tenant_price=r.tenant_price, fb_price=fb, retro_pct=retro_pct,
-            valid_from=today, valid_to=None, status="tenanted",
             reason=f"grid: list/retro updated (was fb {r.fb_price}, retro £{cur_retro:g})",
             source=f"product-cell:{principal.email}",
         ))
@@ -2479,10 +2493,10 @@ async def master_product_cell_apply(
     to_write = successors + support_patches
 
     if retro_changed:
+        # Retro-only figure: PATCH just Products.retro_per_keg/retro_eligible —
+        # never the description (a blank one used to get the code written in).
         try:
-            await run_in_threadpool(
-                update_product, product_code, product_code, desc, retro_final
-            )
+            await run_in_threadpool(set_product_retro_fields, product_code, retro_final)
         except ValueError as exc:
             return _rerender([str(exc)])
         except Exception:
@@ -2490,9 +2504,12 @@ async def master_product_cell_apply(
             if wants_json:
                 return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
             return _error_page(_GENERIC_ERR)
+    created = updated = closed = 0
     if to_write:
         try:
-            await run_in_threadpool(upsert_pricing_rules, to_write, today)
+            created, updated, closed = await run_in_threadpool(
+                upsert_pricing_rules, to_write, today
+            )
         except Exception:
             logger.exception("product cell fb/retro rules rewrite failed")
             if wants_json:
@@ -2515,6 +2532,13 @@ async def master_product_cell_apply(
             if wants_json:
                 return JSONResponse({"ok": False, "errors": [_GENERIC_ERR]}, status_code=500)
             return _error_page(_GENERIC_ERR)
+
+    logger.info(
+        "product-cell %s by %s: fb %s -> %s, retro £%g -> £%g; %d created, %d updated, "
+        "%d closed (%d support cost patch(es))",
+        product_code, principal.email, cur_fb, new_fb if new_fb is not None else cur_fb,
+        cur_retro, retro_final, created, updated, closed, len(support_patches),
+    )
 
     from dataclasses import replace as _dc_replace
     try:
