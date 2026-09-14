@@ -131,8 +131,23 @@ Key facts:
   valid_from). This is the upsert/dedupe key.
 - **Files dedupe by `raw_hash`** (sha256). Re-uploading the same file returns
   the existing record id (idempotent).
-- `Mismatches.mismatch_key` uniqueness: LWC `fileid|NNNN|site|product|invoice|type`;
+- `Mismatches.mismatch_key` uniqueness: LWC `fileid|NNNN|site|product|invoice|type`
+  where **NNNN is the line's row in the source sheet** (`InvoiceLine.row_no`,
+  set by `parse_lwc_sales`; hand-built lines fall back to the occurrence
+  within the `(site, product, invoice, type)` group) — stable across re-runs
+  of the same file. Before 2026-09-14 it was the finding's running index,
+  which shifted whenever a master correction removed an earlier finding.
   Tennents `fileid|tennents|prefix|bits`; retro `fileid|retro|prefix|code`.
+- **Every findings write is a per-file sync** (`_sync_file_findings`, shared
+  by the three writers; scoped to the file's `fileid|` keys): a reproduced key
+  keeps its row (operator `status`/`notes` untouched, figures refreshed, a
+  `superseded` row reopened); an un-reproduced row is paired in line order
+  with a new finding of the same identity (key minus NNNN) and re-keyed when
+  there is one, else — if `open` — set `status=superseded` with a dated note
+  (never deleted; acknowledged/resolved rows are left alone). An empty run
+  supersedes everything still open for the file, so re-uploading a corrected
+  file shows it reconciling clean. `status` options: open / acknowledged /
+  resolved / superseded.
 - All writes go through `_batch` (chunks of `BATCH_SIZE=10`, `typecast:True`,
   0.25s sleep between chunks). `typecast:True` auto-creates new singleSelect
   options on the fly.
@@ -151,8 +166,10 @@ Key facts:
   precedence order]}`; `reconcile_lines` checks each line against the rule in
   force on the RUN date (`as_of`, default today) — NOT the invoice date — so a
   master correction is verified by re-uploading the same file (see §6).
-- Output: `write_mismatches` → Mismatches; `summary.build_summary` +
-  `render_summary_html`. Local CLI writes `outputs/<stem>__mismatches.csv`.
+- Output: `write_mismatches` → Mismatches (a per-file sync, called even when
+  the run is clean so a corrected file's earlier open rows are superseded —
+  §4); `summary.build_summary` + `render_summary_html`. Local CLI writes
+  `outputs/<stem>__mismatches.csv`.
 
 ### 5b. LWC monthly retro — `POST /upload-retro`
 - Inputs: monthly "Rate Per Keg" `.xlsx` → `retro.parse_lwc_retro` →
@@ -492,6 +509,14 @@ upload blocking the worker.
   no_agreed_rate) — not actual FB prices.
 - `typecast:True` on every write auto-creates new singleSelect options — typos
   in a `type` value silently create a new option.
+- Mismatch rows written before 2026-09-14 carry running-index keys. The first
+  re-upload of such a file pairs each old row with the new finding of the same
+  `(site, product, invoice, type)` in line order and re-keys it in place, so
+  its status/notes survive; when one invoice has several lines of one product
+  the pairing is by order, not by row, so an annotation can land on the
+  sibling line's row. Old open rows the re-run no longer reproduces are
+  superseded like any other; the findings-count on the results page is the
+  number of NEW rows only (refreshes/supersedes are logged, not shown).
 - `parse_fb_cost_file` is **positional**: header row index 1, data from row 2,
   cols 0–4 fixed (code/name/list/retro/net), sites from col 5; site_id is the
   first standalone 3-digit token `\b(\d{3})\b` per header cell (excludes e.g.
@@ -535,9 +560,8 @@ upload blocking the worker.
 - Three identically-named `render_summary_html` (tennents.py + summary.py) and
   three `_money`/`_money_neutral` copies exist — don't confuse imports.
 - Unreachable `return 2` after `sys.exit` in the build-master valid_from guard.
-- Re-uploading a file after a master correction writes only NEW findings
-  (`_create_mismatches_deduped` skips existing `mismatch_key`s) and never
-  removes the earlier run's rows from Mismatches; and because the key carries
-  the running line index (`fileid|NNNN|…`), a finding that survives the
-  correction can shift index and be created AGAIN under a new key. The
-  findings PAGE is always computed fresh; the Airtable table is append-only.
+- The findings PAGE is always computed fresh from the run; the Airtable
+  Mismatches table is brought in line by the per-file sync (§4) — it is no
+  longer append-only, but only `open` rows are ever superseded, so a finding
+  the operator resolved and that the corrected master no longer produces
+  stays `resolved` with its old figures.

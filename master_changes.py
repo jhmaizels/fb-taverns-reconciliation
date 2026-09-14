@@ -418,11 +418,14 @@ def validate_master_change(
             if change.tenant_price is None and change.fb_price is None \
                     and change.retro_pct is None and change.status == target.status:
                 errors.append("nothing to change — set at least one field")
-        # §2.2 caveat: history rewrite does not recompute persisted Mismatches.
+        # §2.2 caveat: history rewrite does not recompute persisted Mismatches
+        # by itself — a re-upload of the affected file does (per-file sync:
+        # findings the fix removes are superseded, the rest keep their rows).
         warnings.append(
             "fix-in-place rewrites history: already-persisted Mismatches rows are NOT "
-            "recomputed, and re-uploading an affected weekly file will create duplicate "
-            "mismatch rows"
+            "recomputed until the affected weekly file is re-uploaded — the re-upload "
+            "marks the findings this fix removes as superseded and keeps the rest "
+            "(no duplicate rows)"
         )
 
     # A newer OPEN rule survives the close pass (which only closes open rules

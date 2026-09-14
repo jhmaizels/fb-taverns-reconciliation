@@ -854,7 +854,7 @@ def upload(
 
     return f"""{render_head(principal.email, principal.role)}
 <h1>Reconciliation complete</h1>
-<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} mismatches inserted</p>
+<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} new mismatch rows (a re-upload refreshes or supersedes the earlier rows)</p>
 {_master_banner_html(snap.banner_info)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
@@ -1320,7 +1320,7 @@ def upload_retro(
     summary_html = render_retro_summary_html(summary)
     return f"""{render_head(principal.email, principal.role)}
 <h1>Retro reconciliation complete</h1>
-<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
+<p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} new findings rows (a re-upload refreshes or supersedes the earlier rows)</p>
 {_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
@@ -3550,7 +3550,7 @@ def upload_tennents(
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
 <h1>Tennents reconciliation complete</h1>
-<p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} findings inserted</p>
+<p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} new findings rows (a re-upload refreshes or supersedes the earlier rows)</p>
 {_tennents_master_banner_html()}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>

@@ -443,7 +443,7 @@ def test_validate_table():
          _mc(op="fix_in_place", valid_from=date(2026, 1, 1), tenant_price=None),
          "nothing to change", None),
         ("fix_in_place mismatches caveat surfaced (§2.2)", snap_open,
-         _mc(op="fix_in_place", valid_from=date(2026, 1, 1)), None, "duplicate mismatch"),
+         _mc(op="fix_in_place", valid_from=date(2026, 1, 1)), None, "re-upload"),
         ("status typo blocks pre-typecast (inv 9)", snap_open,
          _mc(status="Tenanted"), "status", None),
         ("managed warns (§2.1)", snap_open, _mc(status="managed"), None, "managed"),
@@ -869,26 +869,124 @@ def _grid_rule(rec_id: str = "rec_open", vf: str = "2026-01-01") -> dict:
     return rec
 
 
+MM = lambda: airtable_io.T["Mismatches"]  # noqa: E731
+
+
+def _mismatch_updates(fa: FakeAirtable) -> dict[str, dict]:
+    """Recorded Mismatches PATCHes by record id (a row is PATCHed at most once per run)."""
+    out: dict[str, dict] = {}
+    for op, t, recs in fa.calls:
+        if op == "update" and t == MM():
+            for r in recs:
+                assert r["id"] not in out, f"row PATCHed twice in one run: {r['id']}"
+                out[r["id"]] = r["fields"]
+    return out
+
+
+def _land_mismatch_updates(fa: FakeAirtable) -> None:
+    """Apply the recorded PATCHes to the fake's table (it persists creates
+    only) and clear the call log, so the next run sees the landed state."""
+    by_id = {rec["id"]: rec for rec in fa.tables[MM()]}
+    for rid, fields in _mismatch_updates(fa).items():
+        by_id[rid]["fields"].update(fields)
+    fa.calls.clear()
+
+
 def test_mismatch_writer_is_idempotent_on_reupload():
     """Re-uploading the same supplier file (deduped by content hash -> same
     deterministic mismatch_keys) must NOT duplicate mismatch rows — the fix for
-    a bookkeeper re-uploading after a proxy timeout."""
+    a bookkeeper re-uploading after a proxy timeout — and, with nothing
+    changed, must not PATCH anything either."""
     def payload():
         return [
-            {"fields": {"mismatch_key": "fileA|0001|001|PKEG1|INV1|wrong_price", "type": "x", "status": "open"}},
-            {"fields": {"mismatch_key": "fileA|0002|001|PKEG2|INV2|wrong_price", "type": "y", "status": "open"}},
+            {"fields": {"mismatch_key": "fileA|0001|001|PKEG1|INV1|wrong_price", "type": "x",
+                        "status": "open", "delta_total": 1.5}},
+            {"fields": {"mismatch_key": "fileA|0002|001|PKEG2|INV2|wrong_price", "type": "y",
+                        "status": "open", "delta_total": 2.5}},
         ]
     with FakeAirtable([]) as fa:
-        fa.tables[airtable_io.T["Mismatches"]] = []  # empty findings table
-        n1 = airtable_io._create_mismatches_deduped(payload())
-        n2 = airtable_io._create_mismatches_deduped(payload())  # re-upload
+        fa.tables[MM()] = []  # empty findings table
+        n1 = airtable_io._sync_file_findings(payload(), "fileA")
+        n2 = airtable_io._sync_file_findings(payload(), "fileA")  # re-upload
     assert n1 == 2, "first upload writes both findings"
     assert n2 == 0, "re-upload of the same file writes nothing (no duplicates)"
-    creates = [
-        r for op, t, recs in fa.calls
-        if op == "create" and t == airtable_io.T["Mismatches"] for r in recs
+    assert len(_creates(fa, MM())) == 2, "only the first upload's two rows were ever created"
+    assert not _mismatch_updates(fa), "an unchanged re-run must not PATCH anything"
+
+
+def test_mismatch_key_uses_source_row_or_occurrence_within_group():
+    """NNNN is the line's sheet row when the parser carried it (above); lines
+    built without one fall back to the occurrence within
+    (site, product, invoice, type) — never the running index over the whole
+    findings list, which shifted whenever an earlier finding was fixed."""
+    today = date.today()
+    ids = dict(site_ids={SITE_ID: SITE_REC}, product_ids={PROD_CODE: PROD_REC}, rule_ids={})
+    sites = {SITE_ID: {"status": "tenanted"}}
+    lines = [_invoice(today, 185.0, 120.0), _invoice(today, 190.0, 120.0)]  # both INV1, no rows
+    with FakeAirtable([_grid_rule("rec_rule")]) as fa:
+        fa.tables[MM()] = []
+        ms = reconcile_lines(lines, airtable_io.load_rules_from_airtable(), sites)
+        assert airtable_io.write_mismatches(ms, "fileA", **ids) == 2
+        keys = [r["fields"]["mismatch_key"] for r in fa.tables[MM()]]
+    assert keys == [
+        f"fileA|0001|{SITE_ID}|{PROD_CODE}|INV1|wrong_tenant_price",
+        f"fileA|0002|{SITE_ID}|{PROD_CODE}|INV1|wrong_tenant_price",
+    ], keys
+
+
+def test_sync_pairs_legacy_keys_reopens_superseded_and_scopes_to_the_file():
+    """_sync_file_findings over rows that predate the stable key (running-index
+    NNNN): an un-reproduced row is paired, in line order, with the new finding
+    of the same identity and re-keyed — status and notes untouched, figures
+    refreshed — instead of being re-issued; a row an earlier re-run superseded
+    is reopened when its finding comes back; acknowledged/resolved rows the
+    run dropped are left alone; another file's rows are out of scope; and the
+    pass is idempotent once its writes have landed."""
+    def row(rid, key, status="open", notes="", **f):
+        return {"id": rid, "fields": {"mismatch_key": key, "type": "wrong_tenant_price",
+                                      "status": status, "notes": notes, "delta_total": 40.0, **f}}
+
+    def finding(key, **f):
+        return {"fields": {"mismatch_key": key, "type": "wrong_tenant_price", "status": "open",
+                           "notes": "note from this run", "delta_total": 40.0, **f}}
+
+    def ident(inv, t="wrong_tenant_price"):
+        return f"{SITE_ID}|{PROD_CODE}|{inv}|{t}"
+
+    seeded = [
+        row("rec_l1", f"fileA|0001|{ident('INV1')}", "resolved", "chased 1 Sep"),
+        row("rec_l2", f"fileA|0002|{ident('INV1')}", "open", "second line of INV1"),
+        row("rec_gone", f"fileA|0003|{ident('INV2')}", "open", "will be fixed"),
+        row("rec_sup", f"fileA|0004|{ident('INV3')}", "superseded", "[superseded 2026-09-10 09:00: …] earlier note"),
+        row("rec_ack", f"fileA|0005|{ident('INV4')}", "acknowledged", "seen"),
+        row("rec_other", f"fileB|0001|{ident('INV1')}", "open", "another file"),
     ]
-    assert len(creates) == 2, "only the first upload's two rows were ever created"
+    payload = [
+        finding(f"fileA|0007|{ident('INV1')}", delta_total=20.0),  # row 7  -> rec_l1 (1st of INV1)
+        finding(f"fileA|0008|{ident('INV1')}"),                    # row 8  -> rec_l2 (2nd of INV1)
+        finding(f"fileA|0012|{ident('INV3')}"),                    # row 12 -> rec_sup, reopened
+        finding(f"fileA|0020|{ident('INV9', 'wrong_fb_price')}"),  # genuinely new
+    ]
+    with FakeAirtable([]) as fa:
+        fa.tables[MM()] = seeded
+        assert airtable_io._sync_file_findings(payload, "fileA") == 1
+        assert [c["fields"]["mismatch_key"] for c in _creates(fa, MM())] == [
+            f"fileA|0020|{ident('INV9', 'wrong_fb_price')}"
+        ]
+        ups = _mismatch_updates(fa)
+        assert set(ups) == {"rec_l1", "rec_l2", "rec_gone", "rec_sup"}, sorted(ups)
+        assert ups["rec_l1"] == {"mismatch_key": f"fileA|0007|{ident('INV1')}", "delta_total": 20.0}, ups["rec_l1"]
+        assert ups["rec_l2"] == {"mismatch_key": f"fileA|0008|{ident('INV1')}"}, ups["rec_l2"]
+        sup = ups["rec_sup"]
+        assert sup["mismatch_key"] == f"fileA|0012|{ident('INV3')}" and sup["status"] == "open", sup
+        assert sup["notes"].startswith("[reopened ") and sup["notes"].endswith("earlier note"), sup
+        gone = ups["rec_gone"]
+        assert set(gone) == {"status", "notes"} and gone["status"] == "superseded", gone
+        assert gone["notes"].startswith("[superseded ") and gone["notes"].endswith("will be fixed"), gone
+        # idempotent once landed: the identical run writes nothing at all
+        _land_mismatch_updates(fa)
+        assert airtable_io._sync_file_findings(payload, "fileA") == 0
+        assert not _creates(fa, MM()) and not _mismatch_updates(fa)
 
 
 def test_set_product_retro_updates_product_and_reflows_rules():
@@ -2271,6 +2369,64 @@ def test_reconcile_checks_lines_against_the_current_rule():
     assert [m.type for m in ms] == ["unknown_site"], ms
 
 
+def test_reupload_after_master_correction_supersedes_and_keeps_survivors():
+    """The Airtable side of the loop above: upload → see stale-master findings
+    → correct the master → re-upload the SAME file. The mismatch key is on the
+    line's sheet row, so the finding that survives the correction keeps its
+    row (figures refreshed, no duplicate) and the one the correction removed
+    is marked superseded with a dated note — not left open, not deleted,
+    operator notes kept. A run that reconciles clean supersedes whatever is
+    still open for the file. (Last week's deliveries; the correction is a
+    fix-in-place of the current rule, which every line is checked against.)"""
+    today = date.today()
+    last_week = today - timedelta(days=7)
+    ids = dict(site_ids={SITE_ID: SITE_REC}, product_ids={PROD_CODE: PROD_REC}, rule_ids={})
+    sites = {SITE_ID: {"status": "tenanted"}}
+    # two lines of one file, sheet rows 2 and 3, different invoices
+    line_a = replace(_invoice(last_week, 185.0, 120.0), invoice_no="INV1", row_no=2)
+    line_b = replace(_invoice(last_week, 190.0, 120.0), invoice_no="INV2", row_no=3)
+    key_a = f"fileA|0002|{SITE_ID}|{PROD_CODE}|INV1|wrong_tenant_price"
+    key_b = f"fileA|0003|{SITE_ID}|{PROD_CODE}|INV2|wrong_tenant_price"
+    with FakeAirtable([_grid_rule("rec_rule")]) as fa:      # master says £180
+        fa.tables[MM()] = []
+        ms = reconcile_lines([line_a, line_b], airtable_io.load_rules_from_airtable(), sites)
+        assert [m.type for m in ms] == ["wrong_tenant_price"] * 2, ms
+        assert airtable_io.write_mismatches(ms, "fileA", **ids) == 2
+        rows = {r["fields"]["mismatch_key"]: r for r in fa.tables[MM()]}
+        assert set(rows) == {key_a, key_b}, sorted(rows)
+        assert rows[key_b]["fields"]["delta_total"] == 40.0
+        # the operator annotates both rows before the master is corrected
+        rows[key_a]["fields"]["notes"] = "queried with LWC 1 Sep"
+        rows[key_b]["fields"]["notes"] = "awaiting credit"
+        fa.calls.clear()
+
+        # the correction: the stored £180 was a typo for £185 (fix in place)
+        fa.tables[PR()][0]["fields"]["tenant_price"] = 185.0
+        ms2 = reconcile_lines([line_a, line_b], airtable_io.load_rules_from_airtable(), sites)
+        assert [(m.type, m.line.invoice_no) for m in ms2] == [("wrong_tenant_price", "INV2")], ms2
+        assert airtable_io.write_mismatches(ms2, "fileA", **ids) == 0, "the survivor keeps its row"
+        assert not _creates(fa, MM()), "no duplicate row for the surviving finding"
+        assert len(fa.tables[MM()]) == 2, "exactly one row per finding ever raised"
+        ups = _mismatch_updates(fa)
+        assert set(ups) == {rows[key_a]["id"], rows[key_b]["id"]}, ups
+        gone = ups[rows[key_a]["id"]]
+        assert set(gone) == {"status", "notes"}, f"a superseded row keeps its figures: {gone}"
+        assert gone["status"] == "superseded", gone
+        assert gone["notes"].startswith("[superseded ") and "re-run" in gone["notes"], gone
+        assert gone["notes"].endswith("queried with LWC 1 Sep"), "operator note kept"
+        kept = ups[rows[key_b]["id"]]
+        assert "status" not in kept and "notes" not in kept, f"operator fields untouched: {kept}"
+        assert (kept["expected_tenant_price"], kept["delta_per_unit"], kept["delta_total"]) == (185.0, 5.0, 20.0), kept
+
+        # the next re-upload reconciles clean (B fixed too): only B is still open
+        _land_mismatch_updates(fa)
+        assert airtable_io.write_mismatches([], "fileA", **ids) == 0
+        ups3 = _mismatch_updates(fa)
+        assert set(ups3) == {rows[key_b]["id"]}, f"A is already superseded: {ups3}"
+        assert ups3[rows[key_b]["id"]]["status"] == "superseded"
+        assert ups3[rows[key_b]["id"]]["notes"].endswith("awaiting credit")
+
+
 def test_route_product_cell_fb_change_keeps_support():
     """THE DEFECT through the grid's Price cell: the standing price is
     re-dated to today as before, but the in-window support keeps winning for
@@ -2982,6 +3138,7 @@ TESTS = [
     test_route_cross_origin_post_rejected,
     test_lookup_rule_in_window_support_outranks_later_tenanted,
     test_reconcile_checks_lines_against_the_current_rule,
+    test_reupload_after_master_correction_supersedes_and_keeps_survivors,
     test_route_product_cell_fb_change_keeps_support,
     test_route_product_settings_fb_change_keeps_support,
     test_set_product_retro_keeps_support_and_moves_its_retro,
@@ -3003,6 +3160,8 @@ TESTS = [
     test_route_product_settings_retro_remove_clears_stale_pct,
     test_set_product_retro_remove_clears_stale_pct,
     test_render_master_pivot_grid_js_guards_zero_retro_and_live_margins,
+    test_mismatch_key_uses_source_row_or_occurrence_within_group,
+    test_sync_pairs_legacy_keys_reopens_superseded_and_scopes_to_the_file,
 ]
 
 

@@ -2000,26 +2000,173 @@ def list_tennents_monthly_volumes() -> list[dict]:
     return [best[k] for k in sorted(best)]
 
 
-def _create_mismatches_deduped(payload: list[dict]) -> int:
-    """Create Mismatches rows, skipping any mismatch_key already present.
+def _findings_loose_key(key: str) -> str:
+    """A mismatch_key minus its per-file disambiguator (segment 2) — the
+    finding's identity on the invoice.
 
-    Every finding-writer builds a DETERMINISTIC mismatch_key and the Files row
-    is deduped by content hash, so re-uploading the same file (the natural user
-    response to a hub-proxy timeout) yields identical keys. Skipping existing
-    keys makes re-upload idempotent — no duplicated rows — and preserves the
-    status of any finding already resolved (it isn't recreated as 'open')."""
+    LWC keys are ``fileid|row|site|product|invoice|type``, so the loose key is
+    ``fileid|site|product|invoice|type``. Tennents / retro keys carry a constant
+    flow name in segment 2 (``tennents`` / ``retro``), so their loose key is
+    unique per exact key and pairing never fires for them."""
+    parts = key.split("|")
+    return "|".join(parts[:1] + parts[2:])
+
+
+def _findings_row_order(key: str) -> int:
+    """Sort key for stale rows of one identity: the disambiguator as a number
+    (legacy running index or source row), so pairing runs in line order."""
+    parts = key.split("|")
+    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
+def _same_value(a, b) -> bool:
+    numeric = (int, float)
+    if isinstance(a, numeric) and isinstance(b, numeric) \
+            and not isinstance(a, bool) and not isinstance(b, bool):
+        return abs(float(a) - float(b)) <= 1e-6
+    return a == b
+
+
+def _stamp_notes(notes, marker: str) -> str:
+    """Prepend a dated marker to a row's notes, keeping whatever the operator wrote."""
+    notes = (notes or "").strip()
+    return f"{marker} {notes}" if notes else marker
+
+
+# Columns the operator owns on a Mismatches row. The sync pass never rewrites
+# them from a run: status only moves open <-> superseded, notes only gain a
+# dated marker in front of the existing text.
+_FINDINGS_OPERATOR_FIELDS = frozenset({"status", "notes"})
+
+
+def _sync_file_findings(payload: list[dict], file_record_id: str) -> int:
+    """Make one file's Mismatches rows mirror ``payload`` — the findings of the
+    run that just completed. Returns the number of rows CREATED.
+
+    The operating loop is upload → see stale-master findings → correct the
+    master → re-upload the SAME file to see it reconcile clean. The Files row
+    dedupes by content hash, so every run lands on the same file record, and
+    every finding-writer builds a deterministic mismatch_key starting
+    ``fileid|`` — so this pass is scoped to the file's own rows and:
+
+      - a key the run reproduced keeps its row (operator status / notes are
+        untouched); figures that changed since the last run are refreshed, and
+        a row an earlier re-run had marked ``superseded`` is reopened;
+      - a row the run did NOT reproduce is paired, in line order, with a new
+        finding of the same identity (``_findings_loose_key``) when there is
+        one, and re-keyed onto it — which is also how rows written under the
+        pre-2026-09 running-index keys migrate onto the stable key without
+        being re-issued;
+      - otherwise an OPEN row is marked ``status=superseded`` with a dated
+        note. Never deleted — operators annotate rows. acknowledged / resolved
+        rows are the operator's record and are left exactly as they are;
+      - everything else is created.
+
+    Idempotent: a plain re-upload (a proxy timeout, no master change) writes
+    nothing; an EMPTY payload after a successful correction supersedes every
+    open row of the file instead of leaving them standing."""
     table_id = T["Mismatches"]
-    if not payload:
-        return 0
-    existing_keys = {
-        rec["fields"].get("mismatch_key")
-        for rec in _list_all(table_id, fields=["mismatch_key"])
-        if rec["fields"].get("mismatch_key")
-    }
-    fresh = [p for p in payload if p["fields"].get("mismatch_key") not in existing_keys]
-    if not fresh:
-        return 0
-    return len(_batch(fresh, "create", table_id))
+    wanted: dict[str, dict] = {}
+    for p in payload:
+        key = p["fields"].get("mismatch_key")
+        if key:
+            wanted.setdefault(key, p)
+
+    prefix = f"{file_record_id}|"
+    projection = sorted(
+        {k for p in payload for k in p["fields"]} | {"mismatch_key"} | _FINDINGS_OPERATOR_FIELDS
+    )
+    # Server-side scope to this file's rows (the table grows by every weekly
+    # and monthly run); the prefix check makes the scope hold even when the
+    # formula is not applied (the offline fakes return the whole table).
+    existing = [
+        rec for rec in _list_all(
+            table_id, fields=projection,
+            filter_by_formula=f'LEFT({{mismatch_key}}, {len(prefix)}) = "{prefix}"',
+        )
+        if (rec["fields"].get("mismatch_key") or "").startswith(prefix)
+    ]
+    by_key: dict[str, dict] = {}
+    for rec in existing:
+        by_key.setdefault(rec["fields"]["mismatch_key"], rec)
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    creates: list[dict] = []
+    updates: list[dict] = []
+    counts = Counter()
+
+    def _keep(rec: dict, p: dict, rekey_to: str | None = None) -> None:
+        """The run reproduced this row (exactly, or by identity pairing)."""
+        cur = rec["fields"]
+        patch = {
+            k: v for k, v in p["fields"].items()
+            if k not in _FINDINGS_OPERATOR_FIELDS and k not in ("mismatch_key", "file")
+            and not _same_value(cur.get(k), v)
+        }
+        if patch:
+            counts["refreshed"] += 1
+        if rekey_to is not None:
+            patch["mismatch_key"] = rekey_to
+            counts["rekeyed"] += 1
+        if cur.get("status") == "superseded":
+            patch["status"] = "open"
+            patch["notes"] = _stamp_notes(
+                cur.get("notes"),
+                f"[reopened {stamp}: reproduced by a re-run against the current master]",
+            )
+            counts["reopened"] += 1
+        if patch:
+            updates.append({"id": rec["id"], "fields": patch})
+
+    matched: set[str] = set()
+    unmatched: list[dict] = []
+    for key, p in wanted.items():
+        rec = by_key.get(key)
+        if rec is None:
+            unmatched.append(p)
+        else:
+            matched.add(rec["id"])
+            _keep(rec, p)
+
+    pool: dict[str, list[dict]] = {}
+    for rec in existing:
+        if rec["id"] not in matched:
+            pool.setdefault(_findings_loose_key(rec["fields"]["mismatch_key"]), []).append(rec)
+    for recs in pool.values():
+        recs.sort(key=lambda r: _findings_row_order(r["fields"]["mismatch_key"]))
+    for p in unmatched:
+        key = p["fields"]["mismatch_key"]
+        candidates = pool.get(_findings_loose_key(key))
+        if candidates:
+            rec = candidates.pop(0)
+            matched.add(rec["id"])
+            _keep(rec, p, rekey_to=key)
+        else:
+            creates.append(p)
+
+    for rec in existing:
+        if rec["id"] in matched or (rec["fields"].get("status") or "open") != "open":
+            continue
+        updates.append({"id": rec["id"], "fields": {
+            "status": "superseded",
+            "notes": _stamp_notes(
+                rec["fields"].get("notes"),
+                f"[superseded {stamp}: not reproduced when the file was re-run "
+                f"against the current master]",
+            ),
+        }})
+        counts["superseded"] += 1
+
+    if updates:
+        _batch(updates, "update", table_id)
+    created = _batch(creates, "create", table_id) if creates else []
+    logger.info(
+        "SYNC Mismatches file=%s findings=%d created=%d refreshed=%d rekeyed=%d "
+        "reopened=%d superseded=%d",
+        file_record_id, len(wanted), len(created), counts["refreshed"],
+        counts["rekeyed"], counts["reopened"], counts["superseded"],
+    )
+    return len(created)
 
 
 def write_tennents_findings(summary, file_record_id: str) -> int:
@@ -2191,7 +2338,7 @@ def write_tennents_findings(summary, file_record_id: str) -> int:
     for p in payload:
         p["fields"] = {k: v for k, v in p["fields"].items() if v is not None}
 
-    return _create_mismatches_deduped(payload)
+    return _sync_file_findings(payload, file_record_id)
 
 
 def write_retro_findings(retro_summary, file_record_id: str) -> int:
@@ -2260,7 +2407,7 @@ def write_retro_findings(retro_summary, file_record_id: str) -> int:
             fields["product"] = [product_ids[r.product_code]]
         payload.append({"fields": fields})
 
-    return _create_mismatches_deduped(payload)
+    return _sync_file_findings(payload, file_record_id)
 
 
 def write_mismatches(
@@ -2270,8 +2417,12 @@ def write_mismatches(
     product_ids: dict | None = None,
     rule_ids: dict | None = None,
 ) -> int:
+    """Persist one LWC file's findings; returns the number of rows created.
+
+    Called with an EMPTY list too: a clean re-run of a corrected file must
+    still supersede the previous run's open rows (see _sync_file_findings)."""
     if not mismatches:
-        return 0
+        return _sync_file_findings([], file_record_id)
     # Reuse the caller's master-snapshot maps when provided (the /upload path);
     # otherwise fall back to standalone lookups (CLI / other callers).
     if site_ids is None:
@@ -2280,13 +2431,24 @@ def write_mismatches(
         product_ids = _product_lookup()
     if rule_ids is None:
         rule_ids = _rule_lookup()
-    table_id = T["Mismatches"]
 
+    # mismatch_key = fileid|NNNN|site|product|invoice|type. NNNN is the line's
+    # row in the source sheet, so the same line gets the same key on every
+    # re-run of the file however many earlier findings a master correction
+    # removed. (Before 2026-09 it was the finding's running index, which
+    # shifted with every removal and re-issued the survivors as new rows.)
+    # Lines built without a row fall back to their occurrence within the
+    # (site, product, invoice, type) group, which is stable in the same way.
+    use_rows = all(m.line.row_no is not None for m in mismatches)
+    seq: Counter = Counter()
     payload: list[dict] = []
-    for i, m in enumerate(mismatches, 1):
+    for m in mismatches:
         line = m.line
+        group = (line.site_id, line.product_code, line.invoice_no, m.type)
+        seq[group] += 1
+        n = line.row_no if use_rows else seq[group]
         key = (
-            f"{file_record_id}|{i:04d}|{line.site_id}|{line.product_code}|"
+            f"{file_record_id}|{n:04d}|{line.site_id}|{line.product_code}|"
             f"{line.invoice_no}|{m.type}"
         )
         fields: dict = {
@@ -2321,4 +2483,4 @@ def write_mismatches(
         fields = {k: v for k, v in fields.items() if v is not None}
         payload.append({"fields": fields})
 
-    return _create_mismatches_deduped(payload)
+    return _sync_file_findings(payload, file_record_id)

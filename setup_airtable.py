@@ -146,7 +146,9 @@ def mismatches_table_spec(sites_id, products_id, rules_id, files_id):
             f_currency("actual_fb_price"),
             f_currency("delta_per_unit"),
             f_currency("delta_total"),
-            f_select("status", ["open", "acknowledged", "resolved"]),
+            # superseded: set by airtable_io._sync_file_findings when a re-run
+            # of the same file no longer reproduces an open finding.
+            f_select("status", ["open", "acknowledged", "resolved", "superseded"]),
             f_long("notes"),
         ],
     }
