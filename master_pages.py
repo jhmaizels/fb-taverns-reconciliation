@@ -1538,8 +1538,9 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
 <form method="post" action="{preview_url}">
   <h3>Change price from a date</h3>
   <p class="help">The normal case: the price genuinely changed. The current rule is closed at the
-  effective date and a new rule takes over from it (an invoice dated exactly that day gets the <strong>new</strong> price).
-  History is preserved.</p>
+  effective date and a new rule takes over from it. History is preserved. The reconciliation checks every
+  delivery against the price <strong>current on the day it runs</strong>, whatever the delivery date, so
+  re-uploading a weekly file after this change verifies it.</p>
   {_hidden({**common_hidden, "op": "price_change"})}
   <label for="pc-tp">New tenant price (£)</label>
   <input type="number" step="0.01" min="0" name="tenant_price" id="pc-tp" value="{escape(tenant_val)}" required style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
@@ -1621,7 +1622,7 @@ def render_end_page(snap: MasterSnapshot, rule: Rule) -> str:
   site will flag as missing. Use for genuine delists or to repair an open-ended support rule. Nothing new is created.</p>
   <label for="er-vt">End date (valid_to)</label>
   <input type="date" name="valid_to" id="er-vt" value="{today_iso}" required style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">
-  <p class="help">Half-open: a delivery dated exactly the end date is <strong>not</strong> covered by this rule.</p>
+  <p class="help">Half-open: the rule is <strong>not</strong> in force on the end date itself.</p>
   {_hidden(hidden)}
   <label for="er-reason">Reason (required)</label>
   <textarea name="reason" id="er-reason" required placeholder="e.g. delisted — site no longer stocks this line"></textarea>

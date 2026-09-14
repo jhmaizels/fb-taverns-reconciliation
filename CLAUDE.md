@@ -147,8 +147,10 @@ Key facts:
   `FB_Taverns_Del_Date` / `Del_Date`, else first sheet with `Date` and not
   `Pivot`). Older `Diff. From Master` format is **unsupported** (hard exit).
 - Master: `load_rules_from_airtable()` + `load_sites_from_airtable()`.
-- Match: `_index_rules` builds `{(site_id, product_code): [rules sorted newest
-  valid_from first]}`; `reconcile_lines` compares each line.
+- Match: `_index_rules` builds `{(site_id, product_code): [rules in
+  precedence order]}`; `reconcile_lines` checks each line against the rule in
+  force on the RUN date (`as_of`, default today) — NOT the invoice date — so a
+  master correction is verified by re-uploading the same file (see §6).
 - Output: `write_mismatches` → Mismatches; `summary.build_summary` +
   `render_summary_html`. Local CLI writes `outputs/<stem>__mismatches.csv`.
 
@@ -238,22 +240,35 @@ Key facts:
 ## 6. Business rules that matter
 
 **Rule/price selection (`_lookup_rule`):** key on `(site_id, product_code)`,
-then pick the rule whose date range contains `invoice_date`, **half-open**:
-`valid_from <= date < valid_to` (defaults: `valid_from`→date.min,
-`valid_to`→date.max). Among containing rules the precedence is
-**status-aware** (`reconcile.rule_precedence`, since 2026-09-02): an
-in-window `supported` rule wins over the standing rule (`tenanted` or
-`managed`) whatever their `valid_from` dates; within a tier the **newest
-valid_from** wins. `managed` ranks with `tenanted` (it is the standing rule
-at a managed site, not an override; the cost paths never re-date it).
-Rationale: every cost change re-dates the standing rule to today, so plain
-newest-first let any FB list/retro edit silently cancel an active support
-(the master expected the standard price while LWC kept invoicing the agreed
-support price → false `wrong_tenant_price`). The same selection
-(`reconcile.select_winners` / `winning_rule`) drives the `/master` grid and
-list view, the editor previews and `/export-master`, so they cannot
-disagree. If `invoice_date` is None → newest rule. A line dated exactly on a
-rule's `valid_to` falls into the next rule.
+then pick the rule whose date range contains the **run date** (`as_of`,
+default today — see next paragraph), **half-open**: `valid_from <= date <
+valid_to` (defaults: `valid_from`→date.min, `valid_to`→date.max). Among
+containing rules the precedence is **status-aware**
+(`reconcile.rule_precedence`, since 2026-09-02): an in-window `supported`
+rule wins over the standing rule (`tenanted` or `managed`) whatever their
+`valid_from` dates; within a tier the **newest valid_from** wins. `managed`
+ranks with `tenanted` (it is the standing rule at a managed site, not an
+override; the cost paths never re-date it). Rationale: every cost change
+re-dates the standing rule to today, so plain newest-first let any FB
+list/retro edit silently cancel an active support (the master expected the
+standard price while LWC kept invoicing the agreed support price → false
+`wrong_tenant_price`). The same selection (`reconcile.select_winners` /
+`winning_rule`) drives the `/master` grid and list view, the editor previews
+and `/export-master`, so they cannot disagree. A rule is not in force on its
+own `valid_to` date.
+
+**The invoice date does NOT pick the rule (since 2026-09-14, operator
+direction):** `reconcile_lines(..., as_of=None)` checks EVERY line against
+the rule in force on the run date (today — the price the `/master` grid
+shows), whatever the line's `invoice_date`. The operating loop is: findings
+show a stale master → correct it (grid cell, findings-page accept,
+`/upload-master`) → re-upload the same weekly file → it reconciles against
+the corrected master. Consequences: a from-today price change clears last
+week's findings on the re-run (no backdating needed); a support that has
+ENDED no longer covers deliveries made during its window; a future-dated
+rule is ignored until it starts. Pass an explicit `as_of` to reproduce the
+dated view. The dated windows still record history and drive the grid's
+"effective on" view and the export.
 
 **Supports through cost changes:** a support keeps its agreed tenant price
 and its window. Every cost path (grid Price/Retro cells, product settings,
@@ -520,3 +535,9 @@ upload blocking the worker.
 - Three identically-named `render_summary_html` (tennents.py + summary.py) and
   three `_money`/`_money_neutral` copies exist — don't confuse imports.
 - Unreachable `return 2` after `sys.exit` in the build-master valid_from guard.
+- Re-uploading a file after a master correction writes only NEW findings
+  (`_create_mismatches_deduped` skips existing `mismatch_key`s) and never
+  removes the earlier run's rows from Mismatches; and because the key carries
+  the running line index (`fileid|NNNN|…`), a finding that survives the
+  correction can shift index and be created AGAIN under a new key. The
+  findings PAGE is always computed fresh; the Airtable table is append-only.

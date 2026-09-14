@@ -875,7 +875,9 @@ async def _accept_price_change_from_today(
     returns JSON for the in-page fetch. Mirrors /master/cell/apply's op routing
     (price_change, or fix_in_place when the live rule already starts today) so
     the same key never collides, and flows through the same master_changes seam.
-    Never backdates: past invoices reconciled against the old price stay put."""
+    Never backdates the master's history; the reconciler checks every line
+    against the CURRENT rule (reconcile_lines as_of=today), so re-uploading the
+    same weekly file then reconciles against the accepted price."""
     try:
         snap = await run_in_threadpool(load_master_snapshot)
     except Exception:
@@ -1014,8 +1016,10 @@ async def accept_master_rule(
 
     # A tenant pricing MISMATCH line already has a live agreed price. Its button
     # sends overwrite=1: accept the charged price as a price change FROM TODAY
-    # (operator choice 2026-07-13 — never backdated, so past reconciliations are
-    # untouched). This is the deliberate exception to the add_rule path below,
+    # (operator choice 2026-07-13 — the master's history is never backdated;
+    # since 2026-09-14 the reconciler checks lines against the CURRENT rule, so
+    # a re-upload of the file reconciles against the accepted price). This is
+    # the deliberate exception to the add_rule path below,
     # which refuses to overwrite a live price; here overwriting IS the intent, so
     # will_close is expected. The write still runs through the same
     # validate -> apply -> patch seam.
