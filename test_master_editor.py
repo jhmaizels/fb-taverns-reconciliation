@@ -2236,6 +2236,41 @@ def test_lookup_rule_in_window_support_outranks_later_tenanted():
     assert (SITE_ID, PROD_CODE) not in select_winners([sup], today + timedelta(days=30))
 
 
+def test_reconcile_checks_lines_against_the_current_rule():
+    """reconcile_lines evaluates EVERY line on the run date (as_of, default
+    today), never on the line's invoice date (operator direction 2026-09-14):
+    a from-today price change must clear last week's findings when the same
+    file is re-uploaded. Windows still bound supports and future-dated rules
+    on the run date; an explicit as_of reproduces the dated view."""
+    today = date.today()
+    last_week = today - timedelta(days=7)
+    sites = {SITE_ID: {"status": "tenanted"}}
+    old = _rule(vf=date(2026, 1, 1), vt=today, tenant=180.0, fb=120.0)  # closed today by the grid save
+    new = _rule(vf=today, tenant=190.0, fb=120.0)                       # the today-dated successor
+    # Last week's delivery at the NEW price is clean against the CURRENT master...
+    assert reconcile_lines([_invoice(last_week, 190.0, 120.0)], [old, new], sites) == []
+    # ...and one at the OLD price is the mismatch, against the current rule.
+    ms = reconcile_lines([_invoice(last_week, 180.0, 120.0)], [old, new], sites)
+    assert [m.type for m in ms] == ["wrong_tenant_price"], ms
+    assert ms[0].rule is new and ms[0].expected_tenant_price == 190.0, ms[0]
+    # The dated view is still available explicitly.
+    assert reconcile_lines([_invoice(last_week, 180.0, 120.0)], [old, new], sites, as_of=last_week) == []
+    # A future-dated rule is not current yet.
+    future = _rule(vf=today + timedelta(days=10), tenant=200.0, fb=120.0)
+    assert reconcile_lines([_invoice(last_week, 190.0, 120.0)], [old, new, future], sites) == []
+    # A support in window today wins whatever the invoice date...
+    sup = _rule(vf=today - timedelta(days=30), vt=today + timedelta(days=30), tenant=150.0, status="supported")
+    ms = reconcile_lines([_invoice(last_week, 190.0, 120.0)], [old, new, sup], sites)
+    assert [m.type for m in ms] == ["wrong_tenant_price"] and ms[0].rule is sup, ms
+    # ...and a support that has ENDED no longer covers a delivery made inside its window.
+    ended = _rule(vf=today - timedelta(days=30), vt=today, tenant=150.0, status="supported")
+    ms = reconcile_lines([_invoice(last_week, 150.0, 120.0)], [old, new, ended], sites)
+    assert [m.type for m in ms] == ["wrong_tenant_price"] and ms[0].rule is new, ms
+    # Every rule closed -> nothing current: the no-rule buckets, not a stale price.
+    ms = reconcile_lines([_invoice(last_week, 180.0, 120.0)], [old], sites)
+    assert [m.type for m in ms] == ["unknown_site"], ms
+
+
 def test_route_product_cell_fb_change_keeps_support():
     """THE DEFECT through the grid's Price cell: the standing price is
     re-dated to today as before, but the in-window support keeps winning for
@@ -2946,6 +2981,7 @@ TESTS = [
     test_findings_overwrite_button_render_and_guards,
     test_route_cross_origin_post_rejected,
     test_lookup_rule_in_window_support_outranks_later_tenanted,
+    test_reconcile_checks_lines_against_the_current_rule,
     test_route_product_cell_fb_change_keeps_support,
     test_route_product_settings_fb_change_keeps_support,
     test_set_product_retro_keeps_support_and_moves_its_retro,
