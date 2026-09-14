@@ -99,6 +99,7 @@ python reconcile.py reconcile path/to/sales.xlsx --use-airtable
 ```
 
 Defaults: `--master master_pricing.csv`, `--sites sites.csv`, `--tolerance 0.01` (per-unit £).
+Every line is checked against the rule **current on the day you run it** (today), not the rule in force on the line's invoice date — so after correcting the master, re-run the same file to verify the correction.
 The CSV mismatch report is always written to `outputs/<sales_filename>__mismatches.csv`. With `--use-airtable`, mismatches are also inserted into the **Mismatches** table with linked records to **Files**, **Sites**, **Products**, and **PricingRules**.
 
 ### Mismatch types
@@ -109,7 +110,7 @@ The CSV mismatch report is always written to `outputs/<sales_filename>__mismatch
 | `wrong_fb_price` | LWC's `MASTER` ≠ master `fb_price` (delta > tolerance) |
 | `site_should_be_managed` | `sites.csv` says managed but the line is charged with a margin |
 | `unknown_site` | `SITE ID` doesn't exist in the master at all |
-| `no_rule_for_line` | Site is known but no rule for this product on this date — master needs updating |
+| `no_rule_for_line` | Site is known but has no current rule for this product — master needs updating |
 | `lwc_arithmetic_error` | LWC's own `DIFF. MASTER` ≠ `(UNIT − MASTER) × QTY` (sanity check) |
 
 Severity bands on `delta_total`: `low` < £0.05, `medium` < £0.50, `high` ≥ £0.50.

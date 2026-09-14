@@ -667,9 +667,10 @@ def render_summary_html(
         if can_accept:
             parts.append(
                 "<p class='sub'>The <strong>Set master to charged</strong> button accepts LWC's "
-                "charged price into the master as a change <strong>from today</strong> (past invoices "
-                "unaffected). Use it only when the price legitimately changed and the master is stale — "
-                "not to paper over an LWC error.</p>"
+                "charged price into the master as a change <strong>from today</strong>; the "
+                "reconciliation always checks against the current master price, so re-uploading "
+                "this file afterwards verifies the change. Use it only when the price legitimately "
+                "changed and the master is stale — not to paper over an LWC error.</p>"
             )
         for b in s.tenant_blocks:
             # A (site, product) can appear on more than one line; only offer a
@@ -1058,7 +1059,7 @@ _FINDINGS_JS = """<script>
         'Site ' + d.site + ' ' + d.sitename + '\\n' +
         'Product ' + d.product + ' ' + d.desc + '\\n' +
         'From ' + money(d.expected) + ' to ' + money(d.charged) + '\\n' +
-        'Effective today \\u2014 past invoices are unaffected.';
+        'Effective today. Re-upload the file to check it reconciles against the new price.';
     } else if (suggestedMode) {
       msg = 'Add to the live pricing master at this price?\\n\\n' +
         'Site ' + d.site + ' ' + d.sitename + '\\n' +

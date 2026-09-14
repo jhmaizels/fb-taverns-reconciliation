@@ -642,6 +642,14 @@ def _severity(delta_total: float) -> str:
 # Every winner selection — the reconciler, the /master grid and list view, the
 # editor previews and the export — goes through these helpers so they cannot
 # disagree about which price bills.
+#
+# The reconciler evaluates every invoice line on its RUN date (reconcile_lines
+# ``as_of``, default today), NOT the line's invoice date (operator direction
+# 2026-09-14): the master is corrected, the same weekly file is re-uploaded,
+# and the findings must reflect the corrected master — so a from-today price
+# change clears last week's findings on the re-run. The dated windows still
+# record history (the /master "effective on" view, the export); they no longer
+# decide what a past-dated delivery is checked against.
 
 def is_support_rule(r: Rule) -> bool:
     return (r.status or "tenanted") == "supported"
@@ -803,7 +811,7 @@ def _lookup_rule(
     if not candidates:
         return None
     if on_date is None:
-        # No invoice date to place in a window: fall back to the newest rule.
+        # No date to place in a window: fall back to the newest rule.
         return max(candidates, key=lambda x: x.valid_from or date.min)
     for r in candidates:
         if rule_contains(r, on_date):
@@ -817,15 +825,23 @@ def reconcile_lines(
     sites: dict[str, dict],
     tolerance: float = 0.01,
     fb_tolerance: float | None = None,
+    as_of: date | None = None,
 ) -> list[Mismatch]:
     """
     tolerance     — per-unit £ tolerance for tenant_price comparisons (default 1p).
     fb_tolerance  — per-unit £ tolerance for fb_price comparisons. Defaults to 5p
                     because LWC's MASTER column is rounded to 2dp while our list
                     price can be a formula result with sub-penny artefacts.
+    as_of         — the date the master is read on. EVERY line is checked against
+                    the rule in force on this date (default today — the price the
+                    /master grid shows), never against the rule in force on the
+                    line's own invoice date. So correcting the master and
+                    re-uploading the same weekly file verifies the correction.
     """
     if fb_tolerance is None:
         fb_tolerance = 0.05
+    if as_of is None:
+        as_of = date.today()
     idx = _index_rules(rules)
     # Only count CURRENTLY-active rules (valid_to is None) when deciding what's
     # "on the master" — historical rules that have been superseded shouldn't
@@ -854,7 +870,7 @@ def reconcile_lines(
                 )
             )
 
-        rule = _lookup_rule(idx, line.site_id, line.product_code, line.invoice_date)
+        rule = _lookup_rule(idx, line.site_id, line.product_code, as_of)
 
         if not rule:
             if site_status == "managed":
