@@ -82,10 +82,17 @@ def main() -> int:
         except SystemExit:
             check("missing line sheet must not raise SystemExit", False)
 
-        # 3. Canonical sheet name still wins.
+        # 3. Canonical sheet name still wins; each line carries its sheet row
+        #    (header on row 1, so data starts at 2) and a skipped row (no
+        #    product code) does not shift the rows after it — row_no is the
+        #    stable per-file disambiguator in Mismatches.mismatch_key.
         p = td / "named.xlsx"
-        _write(p, [("FB_Taverns_Del_Date", [HEADERS, ROW])])
-        check("canonical FB_Taverns_Del_Date still parsed", len(parse_lwc_sales(str(p))) == 1)
+        skipped = ROW[:4] + [None] + ROW[5:]
+        _write(p, [("FB_Taverns_Del_Date", [HEADERS, ROW, skipped, ROW])])
+        lines = parse_lwc_sales(str(p))
+        check("canonical FB_Taverns_Del_Date still parsed", len(lines) == 2)
+        check("lines carry their sheet row (skipped rows keep their number)",
+              [ln.row_no for ln in lines] == [2, 4])
 
         # 4. Name-matched sheet missing required columns — LwcParseError.
         p = td / "missing_cols.xlsx"

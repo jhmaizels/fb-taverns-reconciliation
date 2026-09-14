@@ -1565,8 +1565,9 @@ def render_edit_page(snap: MasterSnapshot, rule: Rule) -> str:
 <form method="post" action="{preview_url}">
   <h3>Fix a mistake <span class="support-tag">REWRITES HISTORY</span></h3>
   <p class="help"><strong>The old figure is treated as never true.</strong> The rule keeps its key and dates —
-  only the figures are rewritten. Already-recorded mismatches are NOT recomputed, and re-uploading an
-  affected weekly file will create duplicate mismatch rows.</p>
+  only the figures are rewritten. Already-recorded mismatches are NOT recomputed until you re-upload the
+  affected weekly file: the re-upload marks the findings this fix removes as <em>superseded</em> (notes kept)
+  and leaves the rest on their existing rows — no duplicates.</p>
   {_hidden({**common_hidden, "op": "fix_in_place", "valid_from": _date_str(rule.valid_from)})}
   <label for="fx-tp">Corrected tenant price (£)</label>
   <input type="number" step="0.01" min="0" name="tenant_price" id="fx-tp" value="{escape(tenant_val)}" style="padding:0.45em; width:100%; box-sizing:border-box; margin-bottom:1em">

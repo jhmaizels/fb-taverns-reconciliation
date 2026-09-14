@@ -475,6 +475,12 @@ class InvoiceLine:
     master_price: float
     diff_master: float
     account_no: str = ""  # LWC customer account number (ACCOUNT NO column), if present
+    # 1-based row of this line in the source sheet (the Excel row number).
+    # parse_lwc_sales always sets it; it is the stable per-file disambiguator
+    # in Mismatches.mismatch_key (airtable_io.write_mismatches). None when a
+    # line is built by hand (tests) — the writer then falls back to the line's
+    # occurrence within its (site, product, invoice, type) group.
+    row_no: int | None = None
 
 
 class LwcParseError(ValueError):
@@ -536,7 +542,7 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
         )
 
     lines: list[InvoiceLine] = []
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         if pd.isna(row.get("site_id")) or pd.isna(row.get("product_code")):
             continue
         try:
@@ -559,6 +565,9 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
                 master_price=master,
                 diff_master=diff,
                 account_no=_to_str_code(row.get("account_no")) if not pd.isna(row.get("account_no")) else "",
+                # Default RangeIndex: idx is the 0-based data row; the header
+                # sits on Excel row 1, so the line is on row idx + 2.
+                row_no=int(idx) + 2,
             )
         )
     return lines
