@@ -110,6 +110,7 @@ The CSV mismatch report is always written to `outputs/<sales_filename>__mismatch
 | `wrong_fb_price` | LWC's `MASTER` ≠ master `fb_price` (delta > tolerance) |
 | `site_should_be_managed` | `sites.csv` says managed but the line is charged with a margin |
 | `unknown_site` | `SITE ID` doesn't exist in the master at all |
+| `line_without_site` | The line carries no `SITE ID` (blank or zero) — it belongs to no pub and nothing on it was price-checked; attribute it at source rather than adding a site |
 | `no_rule_for_line` | Site is known but has no current rule for this product — master needs updating |
 | `lwc_arithmetic_error` | LWC's own `DIFF. MASTER` ≠ `(UNIT − MASTER) × QTY` (sanity check) |
 

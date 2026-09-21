@@ -77,6 +77,7 @@ class OtherFindingRow:
     charged: float = 0.0   # qty-weighted invoiced unit price (LWC UNIT)
     cost: float = 0.0      # qty-weighted FB cost basis (LWC MASTER)
     mixed: bool = False    # True when the source lines had differing unit prices
+    invoice_no: str = ""   # set only where the LINE, not the site/product, is the unit
 
 
 @dataclass
@@ -93,6 +94,10 @@ class Summary:
     other_counts: dict[str, int]  # everything else (arithmetic_error, etc.)
     total_tenant_delta: float = 0.0
     total_fb_delta: float = 0.0
+    # Sibling of sites_in_sales_not_on_master; defaulted so a Summary built
+    # without it (tests, any older caller) is simply empty rather than a
+    # TypeError.
+    lines_without_site: list[OtherFindingRow] = field(default_factory=list)
 
 
 # ---------- builder ----------
@@ -200,6 +205,7 @@ def build_summary(
     # the qty-weighted charged price (LWC UNIT) and cost basis (LWC MASTER) — the
     # basis for the margin shown and the "accept into master" button.
     sites_in_sales_not_on_master: list[OtherFindingRow] = []
+    lines_without_site: list[OtherFindingRow] = []
     seen_unknown_site_keys: set[tuple[str, str]] = set()
     other_counts: dict[str, int] = {}
     _pnm: dict[tuple[str, str], dict] = {}
@@ -266,6 +272,17 @@ def build_summary(
             _accumulate(_pnm, line)
         elif t == "tenant_price_missing":
             _accumulate(_tpm, line)
+        elif t == "line_without_site":
+            # Deliberately NOT deduped the way unknown_site is: there is no site
+            # to group by, and the operator needs each line's own invoice and
+            # product to find it in the source file. It also keeps this block's
+            # row count equal to its share of the headline mismatch count.
+            lines_without_site.append(OtherFindingRow(
+                site_id=line.site_id, site_name=line.site_name,
+                product_code=line.product_code, product_desc=line.product_desc,
+                qty=line.qty, notes=m.notes, charged=line.unit_price,
+                cost=line.master_price, invoice_no=line.invoice_no,
+            ))
         elif t == "unknown_site":
             key = (line.site_id, line.site_name)
             if key not in seen_unknown_site_keys:
@@ -294,6 +311,7 @@ def build_summary(
         products_not_on_master=products_not_on_master,
         tenant_price_missing=tenant_price_missing,
         sites_in_sales_not_on_master=sites_in_sales_not_on_master,
+        lines_without_site=lines_without_site,
         other_counts=other_counts,
         total_tenant_delta=sum(b.total_delta for b in tenant_blocks),
         total_fb_delta=sum(b.total_delta for b in fb_blocks),
@@ -837,6 +855,30 @@ def render_summary_html(
         parts.append("<table><thead><tr><th>Site</th><th>Site name</th></tr></thead><tbody>")
         for r in s.sites_in_sales_not_on_master:
             parts.append(f"<tr><td>{escape(r.site_id)}</td><td>{escape(r.site_name)}</td></tr>")
+        parts.append("</tbody></table>")
+
+    if s.lines_without_site:
+        parts.append(
+            f"<h3>Lines with no site ID <span class='pill'>{len(s.lines_without_site)}</span></h3>"
+        )
+        parts.append(
+            "<p class='sub'>These lines carry no SITE ID, so they belong to no pub and "
+            "<strong>nothing on them was price-checked</strong>. This is not a site missing "
+            "from the master &mdash; there is no pub to add, and adding one would not fix "
+            "them. Attribute them at source, then re-upload. One row per line, by invoice "
+            "and product, so they can be found in the file.</p>"
+        )
+        parts.append(
+            "<table><thead><tr><th>Invoice</th><th>Product</th><th>Description</th>"
+            "<th class='r'>Qty</th><th class='r'>Charged</th></tr></thead><tbody>"
+        )
+        for r in s.lines_without_site:
+            parts.append(
+                f"<tr><td>{escape(r.invoice_no)}</td><td>{escape(r.product_code)}</td>"
+                f"<td>{escape(r.product_desc)}</td>"
+                f"<td class='r'>{r.qty:g}</td>"
+                f"<td class='r'>{_money_neutral(r.charged)}</td></tr>"
+            )
         parts.append("</tbody></table>")
 
     if s.other_counts:

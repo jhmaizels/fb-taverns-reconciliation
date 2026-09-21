@@ -48,6 +48,7 @@ from reconcile import (  # noqa: E402
     Rule,
     _index_rules,
     _lookup_rule,
+    names_no_site,
     reconcile_lines,
 )
 
@@ -2398,6 +2399,67 @@ def test_reconcile_flags_a_rule_in_force_with_no_tenant_price():
     # DESIGN — it keeps its own branch and must not join the missing bucket.
     managed = _rule(vf=date(2026, 1, 1), tenant=None, fb=120.0, status="managed")
     assert reconcile_lines([_invoice(last_week, 120.0, 120.0)], [managed], sites) == []
+
+
+def test_a_siteless_line_is_named_not_filed_as_a_site_missing_from_the_master():
+    """An invoice line carrying no SITE ID belongs to no pub, so nothing on it
+    is price-checked. It used to report as `unknown_site` — "sites in sales but
+    not on master" — which reads as an invitation to add site 0 to the master,
+    a site that does not exist and would fix nothing. It gets its own type and
+    its own remedy: attribute the line at source."""
+    today = date.today()
+    last_week = today - timedelta(days=7)
+    sites = {SITE_ID: {"status": "tenanted"}}
+    rule = _rule(vf=date(2026, 1, 1), tenant=190.0, fb=120.0)
+
+    def at(site_id, name=""):
+        return replace(_invoice(last_week, 190.0, 120.0), site_id=site_id, site_name=name)
+
+    assert [names_no_site(x) for x in ("", "0", "00", "0.0", " 0 ")] == [True] * 5
+    assert [names_no_site(x) for x in ("801", "0a", "abc")] == [False] * 3
+
+    ms = reconcile_lines([at("0")], [rule], sites)
+    assert [m.type for m in ms] == ["line_without_site"], ms
+    assert "do NOT add a site" in ms[0].notes, ms[0].notes
+
+    # A real site number that is simply not on the master still reports as one.
+    ms = reconcile_lines([at("999", "Some Pub")], [rule], sites)
+    assert [m.type for m in ms] == ["unknown_site"], ms
+
+    # A site that IS on the master never reaches the test — priced as before.
+    assert reconcile_lines([at(SITE_ID)], [rule], sites) == []
+
+
+def test_summary_lists_every_siteless_line_by_invoice():
+    """One row per LINE. `unknown_site` dedupes by (site, name) because the
+    site is the actionable unit; here there is no site to group by and the
+    operator needs each invoice to find the line in the workbook — which also
+    keeps this block's row count equal to its share of the headline count."""
+    from summary import build_summary, render_summary_html
+
+    last_week = date.today() - timedelta(days=7)
+    sites_master = {SITE_ID: {"name": "Test Tavern", "status": "tenanted"}}
+    rule = _rule(vf=date(2026, 1, 1), tenant=190.0, fb=120.0)
+    lines = [
+        replace(_invoice(last_week, 190.0, 120.0), site_id="0", site_name="",
+                invoice_no="INV1"),
+        replace(_invoice(last_week, 190.0, 120.0), site_id="0", site_name="",
+                invoice_no="INV2"),
+    ]
+    ms = reconcile_lines(lines, [rule], sites_master)
+    assert [m.type for m in ms] == ["line_without_site"] * 2, ms
+
+    s = build_summary("wk.xlsx", lines, ms, sites_master, {SITE_ID})
+    # Two lines -> two rows (the old bucket would have collapsed them to one),
+    # and they are NOT offered as a site to add to the master.
+    assert len(s.lines_without_site) == 2, s.lines_without_site
+    assert [r.invoice_no for r in s.lines_without_site] == ["INV1", "INV2"]
+    assert s.sites_in_sales_not_on_master == []
+    assert s.mismatch_count == len(s.lines_without_site)
+
+    html = render_summary_html(s)
+    assert "Lines with no site ID" in html
+    assert "INV1" in html and "INV2" in html
 
 
 def test_reupload_after_master_correction_supersedes_and_keeps_survivors():

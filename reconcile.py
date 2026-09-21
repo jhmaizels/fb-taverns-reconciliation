@@ -651,6 +651,26 @@ def _severity(delta_total: float) -> str:
 # record history (the /master "effective on" view, the export); they no longer
 # decide what a past-dated delivery is checked against.
 
+def names_no_site(site_id: str) -> bool:
+    """True when a line's SITE ID names no pub at all — blank, or a zero in
+    any spelling ("0", "00", "0.0").
+
+    LWC's export carries these on lines booked without an account. They are
+    NOT a site missing from the master: there is no pub to add, so filing them
+    with `unknown_site` invites someone to create site 0. Only consulted for a
+    line that already failed the master lookup, so a real site that somehow
+    used one of these codes and HAS rules is priced normally and never reaches
+    this test.
+    """
+    s = (site_id or "").strip()
+    if not s:
+        return True
+    try:
+        return float(s) == 0.0
+    except ValueError:
+        return False
+
+
 def is_support_rule(r: Rule) -> bool:
     return (r.status or "tenanted") == "supported"
 
@@ -889,6 +909,24 @@ def reconcile_lines(
                     )
                 continue
             if line.site_id not in sites_with_rules:
+                # A line naming no pub is a different problem from a pub that
+                # is missing from the master, and has a different remedy: the
+                # line needs attributing at source, not a new site record.
+                if names_no_site(line.site_id):
+                    mismatches.append(
+                        Mismatch(
+                            type="line_without_site",
+                            severity="medium",
+                            line=line,
+                            notes=(
+                                f"Invoice line carries no site ID "
+                                f"({line.site_id!r}), so it belongs to no pub and "
+                                "was priced against nothing — attribute it in the "
+                                "source file; do NOT add a site for it."
+                            ),
+                        )
+                    )
+                    continue
                 mismatches.append(
                     Mismatch(
                         type="unknown_site",
