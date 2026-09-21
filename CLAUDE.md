@@ -325,10 +325,17 @@ that close, never compounding it.
    `product_not_on_master` (medium); else → `tenant_price_missing` (medium).
    If rule found and `status=='managed'` → `site_should_be_managed` (skips price
    checks).
-3. `wrong_tenant_price` if tenant_price set and `abs(unit-tenant_price)>tolerance`
+3. If a rule is found but its **tenant_price is blank** → `tenant_price_missing`
+   (medium). The rule is in force and there is still nothing to compare the
+   charged price against; every other uncomparable case reports, so this one
+   does too — a silent pass reads on the summary as "LWC charged correctly".
+   Same bucket and same remedy as the no-rule case in step 2: fill the cell.
+   A `managed` rule is exempt — it asserts a zero margin and carries no tenant
+   price by design, and step 2 has already handled it.
+4. `wrong_tenant_price` if tenant_price set and `abs(unit-tenant_price)>tolerance`
    (if `status=='supported'`, a support_note is attached).
-4. `wrong_fb_price` if fb_price set and `abs(master-fb_price)>fb_tolerance`.
-   Steps 3 and 4 are independent — both can fire on one line.
+5. `wrong_fb_price` if fb_price set and `abs(master-fb_price)>fb_tolerance`.
+   Steps 4 and 5 are independent — both can fire on one line.
 
 **`fb_price` = LIST price** (FB cost file col 2), NOT Net price (col 4,
 post-retro). Net price is deliberately ignored. `retro_pct = retro_per_keg /

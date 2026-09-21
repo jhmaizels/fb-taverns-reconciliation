@@ -945,6 +945,28 @@ def reconcile_lines(
                 )
             continue
 
+        # A rule can be in force and still carry no tenant price (the cell is
+        # blank). There is then nothing to compare the charged price against —
+        # and without this branch the line would pass in SILENCE, the only
+        # uncomparable case that raises no finding: a missing rule, a product
+        # off the master and a rule whose window has not opened all report.
+        # Same type and same remedy as the no-rule case (populate the cell), so
+        # it lands in the section and the accept flow that already exist.
+        if rule.tenant_price is None:
+            mismatches.append(
+                Mismatch(
+                    type="tenant_price_missing",
+                    severity="medium",
+                    line=line,
+                    rule=rule,
+                    notes=(
+                        f"Site {line.site_id} ({line.site_name}) has a master rule "
+                        f"for {line.product_code} but no tenant price on it — "
+                        "populate the cell."
+                    ),
+                )
+            )
+
         if rule.tenant_price is not None:
             delta_unit = line.unit_price - rule.tenant_price
             if abs(delta_unit) > tolerance:
