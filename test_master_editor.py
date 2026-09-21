@@ -2369,6 +2369,37 @@ def test_reconcile_checks_lines_against_the_current_rule():
     assert [m.type for m in ms] == ["unknown_site"], ms
 
 
+def test_reconcile_flags_a_rule_in_force_with_no_tenant_price():
+    """A rule can be in force with a BLANK tenant price, and then there is
+    nothing to compare the charged price against. Every other uncomparable
+    case reports, so this one must too — silence here reads on the summary as
+    "LWC charged this correctly". It lands in the existing
+    tenant_price_missing bucket: same remedy (fill the cell), same section,
+    same accept flow."""
+    today = date.today()
+    last_week = today - timedelta(days=7)
+    sites = {SITE_ID: {"status": "tenanted"}}
+    priced = _rule(vf=date(2026, 1, 1), tenant=190.0, fb=120.0)
+    blank = _rule(vf=date(2026, 1, 1), tenant=None, fb=120.0)
+
+    # Control: the same delivery against a priced rule at that price is clean.
+    assert reconcile_lines([_invoice(last_week, 190.0, 120.0)], [priced], sites) == []
+
+    ms = reconcile_lines([_invoice(last_week, 190.0, 120.0)], [blank], sites)
+    assert [m.type for m in ms] == ["tenant_price_missing"], ms
+    assert ms[0].rule is blank and ms[0].expected_tenant_price is None, ms[0]
+    assert "no tenant price" in ms[0].notes, ms[0].notes
+
+    # The cost side is judged independently of the blank tenant cell.
+    ms = reconcile_lines([_invoice(last_week, 190.0, 200.0)], [blank], sites)
+    assert sorted(m.type for m in ms) == ["tenant_price_missing", "wrong_fb_price"], ms
+
+    # A managed rule asserts a zero margin and carries no tenant price BY
+    # DESIGN — it keeps its own branch and must not join the missing bucket.
+    managed = _rule(vf=date(2026, 1, 1), tenant=None, fb=120.0, status="managed")
+    assert reconcile_lines([_invoice(last_week, 120.0, 120.0)], [managed], sites) == []
+
+
 def test_reupload_after_master_correction_supersedes_and_keeps_survivors():
     """The Airtable side of the loop above: upload → see stale-master findings
     → correct the master → re-upload the SAME file. The mismatch key is on the
