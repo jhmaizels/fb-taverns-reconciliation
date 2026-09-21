@@ -119,7 +119,8 @@ Key facts:
   table**, differentiated by the `type` singleSelect. There is no separate
   retro or Tennents findings table. Types: LWC (`wrong_tenant_price`,
   `wrong_fb_price`, `site_should_be_managed`, `unknown_site`,
-  `product_not_on_master`, `tenant_price_missing`, `lwc_arithmetic_error`);
+  `line_without_site`, `product_not_on_master`, `tenant_price_missing`,
+  `lwc_arithmetic_error`);
   Tennents (`tennents_wrong_discount`, `_exception_pending`,
   `_exception_resolved`, `_retro_arithmetic`, `_line_arithmetic`,
   `_managed_retro_split`, `_no_agreed_rate`, `_not_on_master`,
@@ -320,8 +321,13 @@ that close, never compounding it.
 **Per-line checks, in order:**
 1. `lwc_arithmetic_error` if `abs((unit-master)*qty - diff_master) > 0.02`.
 2. Rule lookup. If **no rule**: managed site → `site_should_be_managed` (when
-   `abs(unit-master)>tolerance`); else no active rules for site →
-   `unknown_site` (medium); else product not in active master →
+   `abs(unit-master)>tolerance`); else no active rules for site → either
+   `line_without_site` (medium) when the SITE ID names no pub at all —
+   blank or a zero in any spelling, `names_no_site` — or `unknown_site`
+   (medium) for a real site number that is simply not on the master. The
+   split matters because the remedies differ: a siteless line is attributed
+   at source, and filing it as a missing site invites someone to create
+   site 0. Else product not in active master →
    `product_not_on_master` (medium); else → `tenant_price_missing` (medium).
    If rule found and `status=='managed'` → `site_should_be_managed` (skips price
    checks).
@@ -349,8 +355,8 @@ appears in **two** places: no-rule + sites.csv/Sites.status `managed`, and a
 matched rule with `status=='managed'`.
 
 **Severity (`_severity`, £ on delta_total):** `<0.05` low, `<0.50` medium, else
-high. unknown_site / product_not_on_master / tenant_price_missing are hardcoded
-`medium` (no £ basis).
+high. unknown_site / line_without_site / product_not_on_master /
+tenant_price_missing are hardcoded `medium` (no £ basis).
 
 **"On the master" membership** counts only currently-active rules (`valid_to is
 None`), so superseded/dropped products don't look present.
