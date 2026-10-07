@@ -15,8 +15,11 @@ The workbook's own README §4 is the reconciliation spec:
   - tolerance ±£0.50/brl;
   - retro due must equal retro £/brl × barrels EXACTLY;
   - managed sites: zero retro + full discount off-invoice is CORRECT;
-  - Gartocher (flat £200/brl retro construct): validate total discount,
-    not the split.
+  - Gartocher (flat £200/brl retro construct): validate total discount;
+    its split is judged against the flat retro.
+  - The split (FB addition, 2026-10): once a line's total is right, the
+    tenant's off-invoice (Off + AOD) must match our price file's Site_Prices
+    figure for that (site, SKU), ±£0.50/brl — section 6b of the findings.
 
 Monthly-file conventions:
   - Discounts and Retro Due are NEGATIVE in the report; the master holds
@@ -38,7 +41,13 @@ from html import escape
 
 import pandas as pd
 
-from tennents_master import SkuException, TennentsMaster, suggest_sku
+from tennents_master import (
+    SPLIT_TOLERANCE,
+    SkuException,
+    TennentsMaster,
+    expected_off_invoice,
+    suggest_sku,
+)
 
 # Per-Brl total-discount tolerance (README §4: ±£0.50/brl, rounding)
 TENNENTS_DISCOUNT_TOLERANCE = 0.50
@@ -290,6 +299,43 @@ class LineArithmeticRow:
 
 
 @dataclass
+class SplitMismatch:
+    """The total discount was right but Tennents split it differently from our
+    price file: the tenant's off-invoice is not the figure FB agreed with them.
+    delta_per_brl = actual − expected off-invoice. Positive = the tenant got
+    MORE off the invoice than agreed, so FB's retro is short by
+    retro_short_gbp; negative = the tenant was invoiced too much and FB's retro
+    carries the excess (the tenant's money)."""
+    account: str
+    customer_name: str
+    sku_code: str
+    sku_desc: str
+    basis: str                    # 'our price file' | 'flat £200.00/brl retro'
+    expected_off: float
+    actual_off: float
+    delta_per_brl: float
+    kegs: float
+    barrels: float
+    retro_short_gbp: float        # delta × barrels
+
+
+@dataclass
+class SplitUnrecordedRow:
+    """A delivery carrying an off-invoice discount where our price file holds
+    no split for that (site, product) — usually a bar plan change Tennents
+    loaded that nobody entered on /tennents/bar-plan. Not judged right or
+    wrong: there is nothing to compare it with."""
+    account: str
+    customer_name: str
+    sku_code: str
+    sku_desc: str
+    actual_off_min: float
+    actual_off_max: float
+    kegs: float
+    barrels: float
+
+
+@dataclass
 class ManagedRetroRow:
     account: str
     customer_name: str
@@ -371,6 +417,8 @@ class TennentsSummary:
     sites_did_not_buy: list[tuple[str, str]]     # (account, site)
     master_arithmetic: list[MasterArithmeticRow]
     wsp_variance: list[WspVarianceRow]
+    split_mismatches: list[SplitMismatch] = field(default_factory=list)
+    split_unrecorded: list[SplitUnrecordedRow] = field(default_factory=list)
     total_discount_delta: float = 0.0            # net £ across mismatches (+ = short)
     pending_short_gbp: float = 0.0               # £ short this month on KNOWN exceptions
     barrels_total: float = 0.0
@@ -389,6 +437,8 @@ def reconcile(
     """Line-level reconciliation per the master workbook's README §4."""
 
     disc_buckets: dict[tuple, DiscountMismatch] = {}
+    split_buckets: dict[tuple, SplitMismatch] = {}
+    unrec_buckets: dict[tuple, SplitUnrecordedRow] = {}
     pending_buckets: dict[tuple, ExceptionPendingRow] = {}
     resolved_buckets: dict[tuple, ExceptionResolvedRow] = {}
     managed_buckets: dict[tuple, ManagedRetroRow] = {}
@@ -462,10 +512,10 @@ def reconcile(
                 b.barrels += line.barrels
                 b.retro_value += line.retro_per_brl * line.barrels
 
-        # 4. Total-discount check (§4). Note Gartocher's bespoke construct needs
-        #    no special-casing here: only the TOTAL is validated for every site —
-        #    the OID/retro split is never checked against the master (the split
-        #    is site-specific; the master only carries totals).
+        # 4. Total-discount check (§4). Gartocher's bespoke construct needs no
+        #    special-casing here: the TOTAL is validated the same way for every
+        #    site. The split is checked separately (4b, _check_split) against
+        #    our price file, and only once the total is right.
         if rb.basis == "exception":
             ex: SkuException = rb.exception  # type: ignore[assignment]
             loaded = ex.loaded_total_per_brl
@@ -551,6 +601,10 @@ def reconcile(
         else:  # sku_master
             if abs(line.total_per_brl - rb.expected) > discount_tolerance:  # type: ignore[operator]
                 _add_discount_mismatch(disc_buckets, line, canonical, rb.expected, basis="agreed rate")  # type: ignore[arg-type]
+            else:
+                # 4b. The split. Only judged once the TOTAL is right — a wrong
+                #     total is already section 1, and its split is wrong with it.
+                _check_split(split_buckets, unrec_buckets, master, line, canonical)
 
         # 5. WSP cross-check (monitoring): invoice/keg ÷ brl-per-keg + off-invoice
         #    discounts should reproduce the master WSP £/brl.
@@ -607,6 +661,8 @@ def reconcile(
     ]
 
     discount_mismatches = sorted(disc_buckets.values(), key=lambda r: -abs(r.delta_total))
+    split_mismatches = sorted(split_buckets.values(), key=lambda r: -abs(r.retro_short_gbp))
+    split_unrecorded = sorted(unrec_buckets.values(), key=lambda r: (r.customer_name, r.sku_code))
     exception_pending = sorted(pending_buckets.values(), key=lambda r: -(r.short_vs_correct or 0.0))
     exceptions_resolved = sorted(resolved_buckets.values(), key=lambda r: (r.customer_name, r.sku_code))
     retro_arith.sort(key=lambda r: -abs(r.delta))
@@ -633,12 +689,61 @@ def reconcile(
         sites_did_not_buy=sites_did_not_buy,
         master_arithmetic=master_arith,
         wsp_variance=wsp_rows,
+        split_mismatches=split_mismatches,
+        split_unrecorded=split_unrecorded,
         total_discount_delta=sum(r.delta_total for r in discount_mismatches),
         pending_short_gbp=sum(r.short_vs_correct or 0.0 for r in exception_pending),
         barrels_total=barrels_total,
         tlager_barrels=tlager_barrels,
         retro_due_total=retro_due_total,
     )
+
+
+def _check_split(
+    buckets: dict[tuple, SplitMismatch],
+    unrecorded: dict[tuple, SplitUnrecordedRow],
+    master: TennentsMaster,
+    line: DeliveryLine,
+    canonical: str,
+) -> None:
+    """Compare the tenant's off-invoice on one delivery (Off + AOD — both come
+    off the tenant's invoice) with the split our price file holds."""
+    actual = round(line.off_per_brl + line.aod_per_brl, 2)
+    expected, basis = expected_off_invoice(master, line.account, canonical, line.total_per_brl)
+    if expected is None:
+        if basis == "no split on file" and actual > 0.005:
+            k = (line.account, canonical)
+            u = unrecorded.get(k)
+            if u is None:
+                unrecorded[k] = SplitUnrecordedRow(
+                    account=line.account, customer_name=line.customer_name,
+                    sku_code=canonical, sku_desc=line.sku_desc,
+                    actual_off_min=actual, actual_off_max=actual,
+                    kegs=line.kegs, barrels=line.barrels,
+                )
+            else:
+                u.actual_off_min = min(u.actual_off_min, actual)
+                u.actual_off_max = max(u.actual_off_max, actual)
+                u.kegs += line.kegs
+                u.barrels += line.barrels
+        return
+    if abs(actual - expected) <= SPLIT_TOLERANCE:
+        return
+    delta = actual - expected
+    k = (line.account, canonical, round(expected, 2), actual)
+    b = buckets.get(k)
+    if b is None:
+        buckets[k] = SplitMismatch(
+            account=line.account, customer_name=line.customer_name,
+            sku_code=canonical, sku_desc=line.sku_desc, basis=basis,
+            expected_off=expected, actual_off=actual, delta_per_brl=delta,
+            kegs=line.kegs, barrels=line.barrels,
+            retro_short_gbp=delta * line.barrels,
+        )
+    else:
+        b.kegs += line.kegs
+        b.barrels += line.barrels
+        b.retro_short_gbp += delta * line.barrels
 
 
 def _add_discount_mismatch(
@@ -1091,6 +1196,7 @@ def render_summary_html(
   <div class="summary-row"><span>Lines processed</span><strong>{s.line_count}</strong></div>
   <div class="summary-row"><span>Discount mismatches (new)</span><strong>{len(s.discount_mismatches)}</strong></div>
   <div class="summary-row"><span>Net mismatch Δ (positive = short)</span><strong>{_money(s.total_discount_delta)}</strong></div>
+  <div class="summary-row"><span>Split differs from our price file</span><strong>{len(s.split_mismatches)}</strong> <span class="sub">(FB retro short {_money(sum(r.retro_short_gbp for r in s.split_mismatches))})</span></div>
   <div class="summary-row"><span>Known corrections still short this month</span><strong>{_money(s.pending_short_gbp)}</strong></div>
   <div class="summary-row"><span>Retro due per report</span><strong>{_money_neutral(s.retro_due_total)}</strong></div>
   <div class="summary-row"><span>Barrels this month</span><strong class="{pace_cls}">{s.barrels_total:,.2f}</strong> <span class="sub">(commitment pace {monthly_pace:,.0f}/mo for {ANNUAL_BARREL_COMMITMENT:,}/yr)</span></div>
@@ -1269,6 +1375,58 @@ def render_summary_html(
                 f"<td class='r'>{_money_neutral(r.retro_per_brl)}</td>"
                 f"<td class='r'>{r.barrels:.2f}</td>"
                 f"<td class='r'>{_money_neutral(r.retro_value)}</td></tr>"
+            )
+        parts.append("</tbody></table>")
+
+    # 6b. split vs our price file
+    parts.append(f"<h2>6b. Off-invoice split differs from our price file <span class='pill'>{len(s.split_mismatches)}</span></h2>")
+    parts.append(
+        "<p class='sub'>Lines whose TOTAL discount was right, but where Tennents gave the tenant a different "
+        "off-invoice from the one on our price file (set per site and product on the "
+        "<em>Bar plan changes</em> page; Gartocher-style flat-retro sites are judged on their flat retro). "
+        f"Tolerance ±£{SPLIT_TOLERANCE:.2f}/brl. Positive = the tenant got MORE off than agreed, so FB's retro is "
+        "short; negative = the tenant was invoiced too much and the excess sits in FB's retro.</p>"
+    )
+    if not s.split_mismatches:
+        parts.append("<p><em>None — every judged line was split the way our price file says.</em></p>")
+    else:
+        parts.append(
+            "<table><thead><tr>"
+            "<th>Account</th><th>Customer</th><th>SKU</th><th>Basis</th>"
+            "<th class='r'>Our off-invoice £/brl</th><th class='r'>Tennents off-invoice £/brl</th>"
+            "<th class='r'>Δ / brl</th><th class='r'>Brl</th><th class='r'>FB retro short</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in s.split_mismatches:
+            cls = "pos" if r.retro_short_gbp > 0 else "neg"
+            parts.append(
+                f"<tr class='{cls}'>"
+                f"<td>{escape(r.account)}</td><td>{escape(r.customer_name)}</td>"
+                f"<td>{escape(r.sku_code)} {escape(r.sku_desc)}</td><td>{escape(r.basis)}</td>"
+                f"<td class='r'>{_money_neutral(r.expected_off)}</td>"
+                f"<td class='r'>{_money_neutral(r.actual_off)}</td>"
+                f"<td class='r'>{_money(r.delta_per_brl)}</td>"
+                f"<td class='r'>{r.barrels:.2f}</td>"
+                f"<td class='r'><strong>{_money(r.retro_short_gbp)}</strong></td></tr>"
+            )
+        parts.append("</tbody></table>")
+    if s.split_unrecorded:
+        parts.append(
+            f"<h3>Off-invoice given where our price file has no split <span class='pill'>{len(s.split_unrecorded)}</span></h3>"
+            "<p class='sub'>Usually a bar plan change Tennents loaded that was never entered here. "
+            "Enter the agreed figure on the Bar plan changes page and the next run judges it.</p>"
+            "<table><thead><tr><th>Account</th><th>Customer</th><th>SKU</th>"
+            "<th class='r'>Tennents off-invoice £/brl</th><th class='r'>Kegs</th><th class='r'>Brl</th>"
+            "</tr></thead><tbody>"
+        )
+        for u in s.split_unrecorded:
+            rng = (_money_neutral(u.actual_off_min) if abs(u.actual_off_max - u.actual_off_min) < 0.005
+                   else f"{_money_neutral(u.actual_off_min)}–{_money_neutral(u.actual_off_max)}")
+            parts.append(
+                f"<tr><td>{escape(u.account)}</td><td>{escape(u.customer_name)}</td>"
+                f"<td>{escape(u.sku_code)} {escape(u.sku_desc)}</td>"
+                f"<td class='r'>{rng}</td><td class='r'>{u.kegs:g}</td>"
+                f"<td class='r'>{u.barrels:.2f}</td></tr>"
             )
         parts.append("</tbody></table>")
 

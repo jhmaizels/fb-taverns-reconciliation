@@ -124,7 +124,7 @@ Key facts:
   Tennents (`tennents_wrong_discount`, `_exception_pending`,
   `_exception_resolved`, `_retro_arithmetic`, `_line_arithmetic`,
   `_managed_retro_split`, `_no_agreed_rate`, `_not_on_master`,
-  `_new_customer`); retro (`retro_under_paid`, `_over_paid`,
+  `_new_customer`, `_wrong_split`, `_split_not_on_file`); retro (`retro_under_paid`, `_over_paid`,
   `_paid_not_on_master`). The pre-2026-07 Tennents types
   (`tennents_wrong_invoice`, `_wrong_fb_price`) are no longer produced but
   survive on historical rows.
@@ -196,6 +196,15 @@ Key facts:
   overrides (see §6), ±£0.50/brl; retro-due exactness; line arithmetic;
   managed/bespoke constructs. Join is account + raw SKU code (alt codes
   resolve via the SKU index).
+- **Split check (2026-10):** once a line's TOTAL is right, the tenant's
+  off-invoice (Off + AOD £/brl) is compared with our `TennentsSitePrices`
+  figure for that (site, SKU), ±£0.50/brl (`tennents_master.expected_off_invoice`):
+  bespoke flat-retro sites expect total − flat; managed sites are skipped (their
+  own check). A difference is `tennents_wrong_split` (section 6b; positive Δ =
+  tenant got more off, FB retro short, £ = Δ × barrels); off-invoice given where
+  the file has NO row is `tennents_split_not_on_file` (low). A wrong total is
+  never also flagged as a split. Before this only the total was checked, so a
+  tenant could be given FB's retro on the invoice and nothing would show.
 - Output: `write_tennents_findings` → Mismatches; Files row gets
   `period_month`/`barrels_total`/`tlager_barrels` for the /tennents
   barrelage-vs-2,700 panel and the annual-retro claim-window alarm.
@@ -252,6 +261,24 @@ Key facts:
   replace. The page also drafts an **email to Tennents** client-side (short
   discounts to correct + credit, pending corrections, rates to confirm); accepted
   SKUs drop out of it live.
+- **`GET /tennents/bar-plan`** → `POST /tennents/bar-plan/preview` →
+  `POST /tennents/bar-plan/apply` (admin, cross-origin checked): a **bar plan
+  change** — one pub, one product, the tenant's off-invoice £/brl (0 = not
+  sold here; the price file lists a product only when off > £0). Validated by
+  `tennents_master.plan_bar_plan_change` (refuses unknown site/product, managed
+  sites, RATE TBC, negative or above the agreed total; warns when a flat-retro
+  site's retro would move); the preview shows off-invoice / retro / net keg
+  before and after; `airtable_io.set_tennents_site_price` updates the
+  `TennentsSitePrices` row in place or creates it, old → new in `notes`,
+  `source_file='bar plan:<actor> <date>'`. The agreed TOTAL is never changed
+  here (that is SKU_Master's — the workbook or findings). **`replace_tennents_
+  master` PRESERVES bar plan rows** like findings rows: the page's figure WINS
+  over the workbook's (the workbook copy is usually older), a row the workbook
+  lacks is re-created, and a workbook that carries the SAME figure absorbs it
+  (the row becomes a plain workbook row). The upload page lists every row kept
+  over the workbook, with the workbook's figure. The result page links the
+  pub's single-site price file (the file David Simpson needs on a bar plan
+  change, per Nick Madigan 22 Sep 2026).
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 

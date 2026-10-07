@@ -271,9 +271,15 @@ class TennentsMaster:
     def off_invoice(self, account: str, sku_code: str) -> float:
         """Tenant off-invoice discount £/brl for (account, sku). 0.0 when none
         is stored — tenant pays full WSP on invoice, the whole discount is retro."""
-        sp = self._site_price_index.get(
-            (str(account).strip(), self.canonical_sku(sku_code).strip().upper()))
+        sp = self.site_price(account, sku_code)
         return float(sp.off_invoice_per_brl or 0.0) if sp else 0.0
+
+    def site_price(self, account: str, sku_code: str) -> "SitePrice | None":
+        """The stored Site_Prices row for (account, sku), or None when the file
+        carries no split for it. Distinct from off_invoice() == 0: a row at £0
+        is a RECORDED decision (tenant pays full WSP); no row is no decision."""
+        return self._site_price_index.get(
+            (str(account).strip(), self.canonical_sku(sku_code).strip().upper()))
 
     def canonical_sku(self, code: str) -> str:
         sku = self.find_sku(code)
@@ -553,3 +559,130 @@ def parse_master_workbook(path: str, source_name: str = "") -> TennentsMaster:
         site_prices=site_prices,
         site_prices_present=site_prices_present,
     )
+
+
+# ---------- bar plan changes (one site, one product) ----------
+#
+# A "bar plan change" is the area manager agreeing a product's off-invoice
+# split with one tenant (Nick Madigan, Scotland). It changes ONE Site_Prices
+# row and nothing else: the agreed TOTAL stays on SKU_Master, so the retro is
+# whatever the off-invoice leaves. Applied from /tennents/bar-plan, so a change
+# no longer needs the master workbook edited and re-uploaded.
+
+# Rows written from the bar plan page carry this prefix in source_file. They
+# exist only in Airtable, so replace_tennents_master keeps them across a
+# workbook re-upload (the findings: precedent for SKU rows).
+BAR_PLAN_SOURCE_PREFIX = "bar plan:"
+
+# Off-invoice £/brl tolerance for the monthly split check — the same ±£0.50
+# rounding allowance the total-discount check uses.
+SPLIT_TOLERANCE = 0.50
+
+
+@dataclass
+class BarPlanChange:
+    """What a bar plan change would do, before it is written."""
+    account: str
+    site_name: str
+    sku_code: str                 # canonical
+    product: str
+    total_per_brl: float
+    current_off: float | None     # None = no Site_Prices row yet
+    new_off: float
+    wsp_per_brl: float | None
+    keg_brl: float
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def new_retro(self) -> float:
+        return round(self.total_per_brl - self.new_off, 2)
+
+    @property
+    def current_retro(self) -> float | None:
+        return None if self.current_off is None else round(self.total_per_brl - self.current_off, 2)
+
+    @property
+    def removing(self) -> bool:
+        return self.new_off == 0.0
+
+    def net_keg(self, off: float | None) -> float | None:
+        """Tenant's invoiced price per keg at an off-invoice figure (WSP − off) ×
+        barrels per keg; None without a WSP or an off-invoice."""
+        if self.wsp_per_brl is None or off is None:
+            return None
+        return round((float(self.wsp_per_brl) - off) * self.keg_brl, 2)
+
+
+def plan_bar_plan_change(master: TennentsMaster, account: str, sku_code: str,
+                         off_invoice) -> BarPlanChange:
+    """Validate one bar plan change and describe it. Raises ValueError with a
+    sentence for the operator when it cannot be applied.
+
+    Refused: an unknown site or product; a managed site (it takes the whole
+    discount off-invoice by rule, so it has no split to set); a product with no
+    agreed total (RATE TBC — the retro would be unknowable); an off-invoice
+    below £0 or above the agreed total (a negative retro). £0 is allowed and
+    means "not sold here / tenant pays full WSP". A bespoke flat-retro site
+    (Gartocher) is allowed but warned when the figure breaks its flat retro."""
+    acct = str(account or "").strip()
+    site = master.site_for_account(acct)
+    if site is None:
+        raise ValueError(f"No Tennents site with account {acct!r} on the master")
+    if site.is_managed:
+        raise ValueError(f"{site.site_name} is managed: it takes the whole discount off-invoice, "
+                         "so there is no split to set")
+    sku = master.find_sku(sku_code)
+    if sku is None:
+        raise ValueError(f"Product {str(sku_code).strip()!r} is not on SKU_Master — add it to the "
+                         "master first (with its agreed total discount)")
+    if sku.correct_total_per_brl is None:
+        raise ValueError(f"{sku.sku_code} {sku.product} has no agreed total discount (RATE TBC) — "
+                         "set the rate first, or the retro can't be worked out")
+    try:
+        off = float(str(off_invoice).replace("£", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        raise ValueError("Off-invoice must be a figure in £ per barrel (0 for not sold here)") from None
+    if off != off or off in (float("inf"), float("-inf")):
+        raise ValueError("Off-invoice must be a figure in £ per barrel")
+    off = round(off, 2)
+    total = round(float(sku.correct_total_per_brl), 2)
+    if off < 0:
+        raise ValueError("Off-invoice can't be negative")
+    if off > total + 0.005:
+        raise ValueError(f"Off-invoice £{off:,.2f}/brl is more than the agreed total £{total:,.2f}/brl "
+                         f"for {sku.product or sku.sku_code} — FB's retro would be negative")
+
+    existing = master.site_price(acct, sku.sku_code)
+    warnings: list[str] = []
+    flat = site.flat_retro_per_brl
+    if flat is not None and off > 0 and abs((total - off) - flat) > 0.005:
+        warnings.append(f"{site.site_name} is on a flat £{flat:,.2f}/brl retro; this leaves "
+                        f"£{total - off:,.2f}/brl retro (off-invoice £{total - flat:,.2f} would keep the flat retro)")
+    if sku.wsp_per_brl is None:
+        warnings.append("No WSP on the master for this product, so the net keg price can't be shown")
+    return BarPlanChange(
+        account=acct, site_name=site.site_name, sku_code=sku.sku_code,
+        product=sku.product or sku.brand, total_per_brl=total,
+        current_off=(None if existing is None else round(float(existing.off_invoice_per_brl or 0.0), 2)),
+        new_off=off, wsp_per_brl=sku.wsp_per_brl, keg_brl=keg_brl_factor(sku),
+        warnings=warnings,
+    )
+
+
+def expected_off_invoice(master: TennentsMaster, account: str, sku_code: str,
+                         total_charged: float) -> tuple[float | None, str]:
+    """The off-invoice £/brl our file says Tennents should be giving the tenant
+    on one delivery, with the basis. None = not judged:
+      - managed site (whole discount off-invoice; its own check covers it);
+      - bespoke flat-retro site: expected = the line's total − the flat retro;
+      - otherwise the Site_Prices row; no row → None ("no split on file")."""
+    site = master.site_for_account(account)
+    if site is None or site.is_managed:
+        return None, "managed" if site is not None else "unknown site"
+    flat = site.flat_retro_per_brl
+    if flat is not None:
+        return round(total_charged - flat, 2), f"flat £{flat:,.2f}/brl retro"
+    sp = master.site_price(account, sku_code)
+    if sp is None:
+        return None, "no split on file"
+    return round(float(sp.off_invoice_per_brl or 0.0), 2), "our price file"

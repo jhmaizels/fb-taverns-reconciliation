@@ -1410,6 +1410,9 @@ def _opt(fields: dict, name: str, value) -> None:
 # They exist only in Airtable (the operator's workbook copy won't have them), so
 # replace_tennents_master preserves them across a workbook re-upload.
 FINDINGS_SOURCE_PREFIX = "findings:"
+# Site_Prices rows written from /tennents/bar-plan carry this source_file
+# prefix (tennents_master.BAR_PLAN_SOURCE_PREFIX — kept equal by a test).
+BAR_PLAN_SOURCE_PREFIX = "bar plan:"
 
 
 def _split_codes(v) -> list[str]:
@@ -1693,7 +1696,7 @@ def load_tennents_master():
     )
 
 
-def replace_tennents_master(master, source: str) -> tuple[int, int]:
+def replace_tennents_master(master, source: str, report: dict | None = None) -> tuple[int, int, int]:
     """
     Wipe the Tennents master tables and recreate them from a parsed
     TennentsMaster. Covers four tables — TennentsSkuMaster / TennentsSiteMaster /
@@ -1702,8 +1705,11 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
     carried a Site_Prices sheet (else the stored layer is preserved). SKU rows
     added/changed from the findings page (source 'findings:…') are PRESERVED
     across the wipe (re-created if absent from the workbook; alt codes unioned
-    and a findings rate kept when the workbook row has none). Returns
-    (deleted, created, preserved).
+    and a findings rate kept when the workbook row has none), and so are
+    Site_Prices rows from the bar plan page (source_file 'bar plan:…'; the
+    page's figure wins unless the workbook carries the same one). Returns
+    (deleted, created, preserved); pass `report` (a dict) to receive
+    report["bar_plan"], one entry per bar plan row re-applied.
     """
     deleted = 0
     created = 0
@@ -1904,6 +1910,21 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
     # actually carried a Site_Prices sheet — re-uploading an OLDER workbook
     # without that sheet must PRESERVE the seeded layer, not silently wipe it.
     if "TennentsSitePrices" in T and getattr(master, "site_prices_present", False):
+        # Bar plan changes made on /tennents/bar-plan (source_file 'bar plan:…')
+        # exist only in Airtable — snapshot them before the wipe and re-apply
+        # them over the workbook below, as the findings: SKU rows are.
+        bar_plan_rows = [
+            rec["fields"] for rec in _list_all(T["TennentsSitePrices"])
+            if str(rec["fields"].get("source_file", "") or "").startswith(BAR_PLAN_SOURCE_PREFIX)
+        ]
+        if bar_plan_rows:
+            logger.warning(
+                "replace_tennents_master: %d bar plan row(s) about to be wiped and re-applied: %s",
+                len(bar_plan_rows),
+                json.dumps([{k: f.get(k) for k in (
+                    "price_key", "account", "site_name", "sku_code", "off_invoice_per_brl",
+                    "source_file", "notes")} for f in bar_plan_rows], default=str),
+            )
         deleted += _wipe_table(T["TennentsSitePrices"], "price_key")
         payload = []
         for sp in master.site_prices:
@@ -1919,9 +1940,124 @@ def replace_tennents_master(master, source: str) -> tuple[int, int]:
             _opt(fields, "product", sp.product)
             _opt(fields, "notes", sp.notes)
             payload.append({"fields": fields})
-        created += len(_batch(payload, "create", T["TennentsSitePrices"])) if payload else 0
+        made = _batch(payload, "create", T["TennentsSitePrices"]) if payload else []
+        created += len(made)
+        if bar_plan_rows:
+            n, kept = _reapply_bar_plan_rows(master, bar_plan_rows, made, source)
+            preserved += n
+            created += sum(1 for k in kept if k["action"] == "created")
+            if report is not None:
+                report["bar_plan"] = kept
 
     return deleted, created, preserved
+
+
+def _reapply_bar_plan_rows(master, rows: list[dict], made: list[dict], source: str) -> tuple[int, list[dict]]:
+    """Re-apply bar plan rows over a freshly loaded workbook Site_Prices layer.
+
+    The page's figure WINS over the workbook's: the operator's workbook copy is
+    usually older than a change made on the page. Where the workbook already
+    carries the SAME figure it has caught up, so nothing is written and the row
+    reverts to an ordinary workbook row (it stops being preserved). Rows are
+    matched on (account, canonical SKU) so leading-zero drift can't miss one.
+    Returns (rows written, a list describing each one for the upload page)."""
+    def _key(acct, code) -> tuple[str, str]:
+        return (str(acct or "").strip(), master.canonical_sku(str(code or "")).strip().upper())
+
+    by_key = {_key(r["fields"].get("account"), r["fields"].get("sku_code")): r for r in made}
+    creates, updates, out = [], [], []
+    for f in rows:
+        k = _key(f.get("account"), f.get("sku_code"))
+        off = float(f.get("off_invoice_per_brl") or 0.0)
+        hit = by_key.get(k)
+        keep = {
+            "off_invoice_per_brl": off,
+            "source_file": f.get("source_file", ""),
+            "version": master.version,
+        }
+        _opt(keep, "notes", f.get("notes"))
+        desc = {"site_name": f.get("site_name", ""), "sku_code": f.get("sku_code", ""),
+                "product": f.get("product", ""), "off_invoice_per_brl": off}
+        if hit is not None:
+            wb_off = float(hit["fields"].get("off_invoice_per_brl") or 0.0)
+            if abs(wb_off - off) < 0.005:
+                continue                      # the workbook has caught up
+            updates.append({"id": hit["id"], "fields": keep})
+            out.append({**desc, "action": "kept_over_workbook", "workbook_off_invoice_per_brl": wb_off})
+        else:
+            fields = {"price_key": f"{k[0]}|{f.get('sku_code', '')}", "account": k[0],
+                      "site_name": f.get("site_name", ""), "sku_code": f.get("sku_code", ""), **keep}
+            _opt(fields, "product", f.get("product"))
+            creates.append({"fields": fields})
+            out.append({**desc, "action": "created"})
+    if updates:
+        _batch(updates, "update", T["TennentsSitePrices"])
+    if creates:
+        _batch(creates, "create", T["TennentsSitePrices"])
+    return len(updates) + len(creates), out
+
+
+def set_tennents_site_price(master, change, actor: str, note: str = "") -> dict:
+    """Write ONE bar plan change (a tennents_master.BarPlanChange, already
+    validated by plan_bar_plan_change) to TennentsSitePrices: update the
+    (account, SKU) row in place, or create it. Stamped source_file
+    'bar plan:<actor> <date>' so a workbook re-upload keeps it, and the old and
+    new figures go in the notes. Idempotent: the same figure again writes
+    nothing. Raises ValueError when the table isn't set up."""
+    if "TennentsSitePrices" not in T:
+        raise ValueError("The per-site off-invoice table (TennentsSitePrices) isn't set up in Airtable yet")
+    tid = T["TennentsSitePrices"]
+    want = (change.account, master.canonical_sku(change.sku_code).strip().upper())
+    rows = [
+        r for r in _list_all(tid)
+        if (str(r["fields"].get("account", "") or "").strip(),
+            master.canonical_sku(str(r["fields"].get("sku_code", "") or "")).strip().upper()) == want
+    ]
+    today = date.today().isoformat()
+    stamp = f"{BAR_PLAN_SOURCE_PREFIX}{(actor or '').strip()} {today}".strip()
+    before = "none" if change.current_off is None else f"£{change.current_off:,.2f}"
+    line = f"Bar plan change {today} by {(actor or '').strip() or 'unknown'}: off-invoice {before} → £{change.new_off:,.2f}/brl."
+    if note.strip():
+        line += f" {note.strip()}"
+    if rows:
+        cur = float(rows[0]["fields"].get("off_invoice_per_brl") or 0.0)
+        if abs(cur - change.new_off) < 0.005:
+            return {"action": "already", "off_invoice_per_brl": change.new_off}
+        old_notes = str(rows[0]["fields"].get("notes", "") or "").strip()
+        _batch([{"id": rows[0]["id"], "fields": {
+            "off_invoice_per_brl": change.new_off,
+            "source_file": stamp,
+            "notes": (line + (" | " + old_notes if old_notes else ""))[:2000],
+        }}], "update", tid)
+        if len(rows) > 1:
+            logger.warning("set_tennents_site_price: %d rows for %s — updated %s only",
+                           len(rows), want, rows[0]["id"])
+        return {"action": "updated", "off_invoice_per_brl": change.new_off}
+    fields = {
+        "price_key": f"{change.account}|{change.sku_code}",
+        "account": change.account,
+        "site_name": change.site_name,
+        "sku_code": change.sku_code,
+        "off_invoice_per_brl": change.new_off,
+        "version": master.version,
+        "source_file": stamp,
+        "notes": line,
+    }
+    _opt(fields, "product", change.product)
+    _batch([{"fields": fields}], "create", tid)
+    return {"action": "created", "off_invoice_per_brl": change.new_off}
+
+
+def list_bar_plan_changes(limit: int = 50) -> list[dict]:
+    """Site_Prices rows written from the bar plan page, newest stamp first."""
+    if "TennentsSitePrices" not in T:
+        return []
+    rows = [
+        r["fields"] for r in _list_all(T["TennentsSitePrices"])
+        if str(r["fields"].get("source_file", "") or "").startswith(BAR_PLAN_SOURCE_PREFIX)
+    ]
+    rows.sort(key=lambda f: str(f.get("source_file", ""))[-10:], reverse=True)
+    return rows[:limit]
 
 
 def get_tennents_master_info() -> dict:
@@ -2202,6 +2338,43 @@ def write_tennents_findings(summary, file_record_id: str) -> int:
                 f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — "
                 f"total discount £/Brl: expected {r.expected:.2f} ({r.basis}), "
                 f"actual {r.actual:.2f}. Positive Δ = short."
+            ),
+        }})
+
+    for r in getattr(summary, "split_mismatches", []):
+        sev = "high" if abs(r.retro_short_gbp) >= 100 else ("medium" if abs(r.retro_short_gbp) >= 10 else "low")
+        payload.append({"fields": {
+            "mismatch_key": _key("split", r.account, r.sku_code,
+                                 f"{r.expected_off:.2f}", f"{r.actual_off:.2f}"),
+            "type": "tennents_wrong_split",
+            "severity": sev,
+            "file": [file_record_id],
+            "expected_fb_price": float(r.expected_off),  # off-invoice £/Brl (repurposed)
+            "actual_fb_price": float(r.actual_off),
+            "delta_per_unit": float(r.delta_per_brl),
+            "delta_total": float(r.retro_short_gbp),
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — total right, "
+                f"but off-invoice £/Brl {r.actual_off:.2f} vs {r.expected_off:.2f} ({r.basis}). "
+                f"Positive Δ = tenant got more off, FB retro short."
+            ),
+        }})
+
+    for r in getattr(summary, "split_unrecorded", []):
+        payload.append({"fields": {
+            "mismatch_key": _key("splitnofile", r.account, r.sku_code),
+            "type": "tennents_split_not_on_file",
+            "severity": "low",
+            "file": [file_record_id],
+            "actual_fb_price": float(r.actual_off_max),   # off-invoice £/Brl (repurposed)
+            "qty": float(r.barrels),
+            "status": "open",
+            "notes": (
+                f"Tennents {r.account} {r.customer_name} / {r.sku_code} {r.sku_desc} — off-invoice "
+                f"£{r.actual_off_min:.2f}–{r.actual_off_max:.2f}/Brl given, but our price file has no split "
+                f"for this site and product. Enter it on Tennents → Bar plan changes."
             ),
         }})
 
