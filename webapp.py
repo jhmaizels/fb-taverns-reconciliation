@@ -107,6 +107,8 @@ from airtable_io import (  # noqa: E402
     load_tennents_master,
     replace_tennents_master,
     accept_tennents_sku,
+    set_tennents_site_price,
+    list_bar_plan_changes,
     get_tennents_master_info,
     list_tennents_monthly_volumes,
     write_tennents_findings,
@@ -119,7 +121,7 @@ from tennents import (  # noqa: E402
     reconcile as reconcile_tennents,
     render_summary_html as render_tennents_summary_html,
 )
-from tennents_master import parse_master_workbook  # noqa: E402
+from tennents_master import BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_bar_plan_change  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -3180,6 +3182,14 @@ retro due exact; managed sites all off-invoice).</p>
   </p>
 </div>
 
+<h2>Bar plan change <span class="pill">one pub, one product</span></h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0">When an area manager agrees a product's off-invoice with a tenant, set it here instead of
+  editing the workbook: it changes that pub's <code>Site_Prices</code> figure, the price file follows at once, and the
+  monthly reconciliation checks the pub's deliveries against it. Requires the admin role.</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/bar-plan')}" style="margin-top:0">Make a bar plan change</a></p>
+</div>
+
 <form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
   <h3 style="margin-top:0; color: #2c5aa0">Upload master workbook</h3>
   <p class="sub">Replaces the stored SKU rates, sites and exceptions. Requires the admin role.</p>
@@ -3393,7 +3403,8 @@ def upload_tennents_master(
             master = parse_master_workbook(tmp_path, source_name=original_name)
         except ValueError as e:
             return _error_page(escape(str(e)))
-        deleted, created, preserved = replace_tennents_master(master, source=original_name)
+        bar_plan_report: dict = {}
+        deleted, created, preserved = replace_tennents_master(master, source=original_name, report=bar_plan_report)
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
@@ -3404,12 +3415,28 @@ def upload_tennents_master(
             except OSError:
                 pass
 
+    kept = bar_plan_report.get("bar_plan") or []
+    findings_kept = max(preserved - len(kept), 0)
     preserved_note = (
-        f"<div class='result'><strong>{preserved} in-app change(s) preserved</strong> — SKUs, alt codes or "
+        f"<div class='result'><strong>{findings_kept} in-app change(s) preserved</strong> — SKUs, alt codes or "
         f"rates accepted from the findings page that this workbook didn't carry were kept rather than wiped. "
         f"Add them to the workbook when convenient (see <a href=\"{ext_url('/tennents/master')}\">Browse master</a>).</div>"
-        if preserved else ""
+        if findings_kept else ""
     )
+    if kept:
+        items = "".join(
+            f"<li>{escape(str(k.get('site_name', '')))}, {escape(str(k.get('product') or k.get('sku_code', '')))}: "
+            f"£{k['off_invoice_per_brl']:,.2f}/brl off-invoice"
+            + (f" (this workbook says £{k['workbook_off_invoice_per_brl']:,.2f})" if k.get("action") == "kept_over_workbook"
+               else " (not in this workbook)")
+            + "</li>" for k in kept
+        )
+        preserved_note += (
+            f"<div class='result'><strong>{len(kept)} bar plan change(s) kept over this workbook</strong> — made on "
+            f"<a href=\"{ext_url('/tennents/bar-plan')}\">Bar plan change</a> after the workbook was last edited. "
+            f"Put the same figures on its <code>Site_Prices</code> sheet, or change them on that page if the workbook is right."
+            f"<ul>{items}</ul></div>"
+        )
     no_rate = [s.sku_code for s in master.skus if s.correct_total_per_brl is None]
     open_exceptions = sum(1 for ex in master.exceptions if not ex.resolved)
     arith = master.arithmetic_errors()
@@ -3489,6 +3516,184 @@ async def tennents_accept_sku(
             status_code=500,
         )
     return JSONResponse({"ok": True, **result})
+
+
+# ---------- Tennents bar plan changes (one site, one product) ----------
+
+def _gbp(v) -> str:
+    return "—" if v is None else f"£{v:,.2f}"
+
+
+def _bar_plan_form_html(master, account: str = "", sku_code: str = "", off: str = "", note: str = "") -> str:
+    sites = sorted((s for s in master.sites if not s.is_managed and s.account and s.account.upper() != "TBC"),
+                   key=lambda s: s.site_name.lower())
+    skus = sorted((k for k in master.skus if k.correct_total_per_brl is not None),
+                  key=lambda k: ((k.product or k.brand or "").lower(), k.sku_code))
+    site_opts = "".join(
+        f'<option value="{escape(s.account)}"{" selected" if s.account == account else ""}>'
+        f"{escape(s.site_name)} ({escape(s.account)})</option>" for s in sites
+    )
+    sku_opts = "".join(
+        f'<option value="{escape(k.sku_code)}"{" selected" if k.sku_code == sku_code else ""}>'
+        f"{escape(k.product or k.brand)} — {escape(k.sku_code)} (total £{k.correct_total_per_brl:,.2f}/brl)</option>"
+        for k in skus
+    )
+    return f"""<form action="{ext_url('/tennents/bar-plan/preview')}" method="post" style="max-width: 640px">
+  <label for="bp-site">Pub</label>
+  <select name="account" id="bp-site" required><option value="">Choose a pub…</option>{site_opts}</select>
+  <label for="bp-sku">Product</label>
+  <select name="sku_code" id="bp-sku" required><option value="">Choose a product…</option>{sku_opts}</select>
+  <label for="bp-off">Off-invoice to the tenant, £ per barrel (0 = not sold here)</label>
+  <input type="text" name="off_invoice" id="bp-off" value="{escape(off)}" required inputmode="decimal">
+  <label for="bp-note">Note (who agreed it, e.g. "Nick's email 7 Oct")</label>
+  <input type="text" name="note" id="bp-note" value="{escape(note)}" maxlength="300">
+  <button type="submit">Preview the change</button>
+</form>"""
+
+
+@app.get("/tennents/bar-plan", response_class=HTMLResponse)
+def tennents_bar_plan(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    """One pub, one product: set the tenant's off-invoice £/brl in Site_Prices.
+    The agreed total stays on SKU_Master; the retro is what the off-invoice
+    leaves. Replaces editing the workbook's Site_Prices sheet and re-uploading."""
+    try:
+        master = load_tennents_master()
+        recent = list_bar_plan_changes()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    rows = "".join(
+        f"<tr><td>{escape(str(f.get('site_name', '')))}</td><td>{escape(str(f.get('product') or f.get('sku_code', '')))}</td>"
+        f"<td>{_gbp(f.get('off_invoice_per_brl'))}</td>"
+        f"<td>{escape(str(f.get('source_file', ''))[len(BAR_PLAN_SOURCE_PREFIX):])}</td>"
+        f"<td class='sub'>{escape(str(f.get('notes', ''))[:240])}</td></tr>"
+        for f in recent
+    )
+    recent_html = (
+        "<h2>Changes made here</h2><p class='sub'>Kept over a workbook re-upload until the workbook carries the same figure.</p>"
+        "<table><thead><tr><th>Pub</th><th>Product</th><th>Off-invoice £/brl</th><th>By, on</th><th>Note</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>" if recent else ""
+    )
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
+<h1>Bar plan change <span class="estate-tag">one pub, one product</span></h1>
+<p class="sub">Sets how much of a product's agreed total discount the tenant gets off the invoice at one pub.
+FB's retro is the rest. The agreed total is the master's (<code>SKU_Master</code>) and is not changed here;
+a product with no agreed total (RATE TBC) or not on the master has to be added to the workbook first.
+Managed pubs take the whole discount off-invoice, so they are not listed. Set 0 to take a product off a pub's
+price file.</p>
+{_tennents_master_banner_html()}
+{_bar_plan_form_html(master)}
+{recent_html}
+{PAGE_FOOT}"""
+
+
+async def _bar_plan_form(request: Request):
+    form = await request.form()
+    return {k: (form.get(k) or "").strip() for k in ("account", "sku_code", "off_invoice", "note")}
+
+
+def _bar_plan_change_table(change) -> str:
+    def row(label, before, after):
+        return f"<tr><td>{label}</td><td>{before}</td><td><strong>{after}</strong></td></tr>"
+    return (
+        "<table><thead><tr><th></th><th>Now</th><th>After</th></tr></thead><tbody>"
+        + row("Off-invoice to the tenant, £/brl",
+              "no figure on file (full WSP)" if change.current_off is None else _gbp(change.current_off),
+              _gbp(change.new_off))
+        + row("FB retro, £/brl",
+              _gbp(change.total_per_brl) if change.current_off is None else _gbp(change.current_retro),
+              _gbp(change.new_retro))
+        + row("Tenant's net price per keg",
+              _gbp(change.net_keg(change.current_off if change.current_off is not None else 0.0)),
+              _gbp(change.net_keg(change.new_off)))
+        + "</tbody></table>"
+        + f"<p class='sub'>Agreed total discount £{change.total_per_brl:,.2f}/brl; "
+          f"WSP {_gbp(change.wsp_per_brl)}/brl; {change.keg_brl:g} brl per keg.</p>"
+    )
+
+
+@app.post("/tennents/bar-plan/preview", response_class=HTMLResponse)
+async def tennents_bar_plan_preview(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    f = await _bar_plan_form(request)
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    try:
+        change = plan_bar_plan_change(master, f["account"], f["sku_code"], f["off_invoice"])
+    except ValueError as e:
+        return HTMLResponse(f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Back</a></p>
+<h1>Bar plan change</h1>
+<div class="result err">{escape(str(e))}</div>
+{_bar_plan_form_html(master, f["account"], f["sku_code"], f["off_invoice"], f["note"])}
+{PAGE_FOOT}""", status_code=400)
+    warn = "".join(f"<div class='result err'>{escape(w)}</div>" for w in change.warnings)
+    same = change.current_off is not None and abs(change.current_off - change.new_off) < 0.005
+    action = (
+        "<div class='result'>Our price file already has this figure — nothing to change.</div>" if same else
+        f"""<form action="{ext_url('/tennents/bar-plan/apply')}" method="post">
+  <input type="hidden" name="account" value="{escape(change.account)}">
+  <input type="hidden" name="sku_code" value="{escape(change.sku_code)}">
+  <input type="hidden" name="off_invoice" value="{change.new_off:.2f}">
+  <input type="hidden" name="note" value="{escape(f['note'])}">
+  <button type="submit">Save to the price master</button>
+</form>"""
+    )
+    removing = ("<p>Off-invoice £0 takes this product off the pub's price file (the file lists a product as sold "
+                "only when it has an off-invoice above £0).</p>" if change.removing else "")
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Back</a></p>
+<h1>{escape(change.site_name)}: {escape(change.product)}</h1>
+<p class="sub">Tennents account {escape(change.account)}, product {escape(change.sku_code)}.</p>
+{warn}
+{_bar_plan_change_table(change)}
+{removing}
+{action}
+{PAGE_FOOT}"""
+
+
+@app.post("/tennents/bar-plan/apply", response_class=HTMLResponse)
+async def tennents_bar_plan_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    f = await _bar_plan_form(request)
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+        change = plan_bar_plan_change(master, f["account"], f["sku_code"], f["off_invoice"])
+        result = await run_in_threadpool(set_tennents_site_price, master, change, principal.email, f["note"])
+    except ValueError as e:
+        return _error_page(escape(str(e)))
+    except Exception:
+        logger.exception("tennents bar plan apply failed")
+        return _error_page("Could not update the price master — the details have been logged. Nothing may have "
+                           "been saved; check the pub's figure on the bar plan page before trying again.")
+    said = {"created": "added to", "updated": "changed in", "already": "already in"}[result["action"]]
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Another bar plan change</a></p>
+<h1>Saved: {escape(change.site_name)}, {escape(change.product)}</h1>
+<div class="result">Off-invoice £{change.new_off:,.2f}/brl {said} the price master; FB retro £{change.new_retro:,.2f}/brl.
+From now on the monthly Tennents reconciliation checks this pub's deliveries of this product against that figure.</div>
+{_bar_plan_change_table(change) if result["action"] != "already" else ""}
+<p>
+  <a class="button" href="{ext_url('/tennents/export-prices?site=' + quote(change.account))}">Download {escape(change.site_name)} price file</a>
+  <a class="button" href="{ext_url('/tennents/bar-plan')}" style="background:#666">Another change</a>
+</p>
+<p class="sub">If you also keep the master workbook, put the same figure on its <code>Site_Prices</code> sheet: a re-upload
+keeps this change only while the workbook disagrees, and lists it on the upload page.</p>
+{PAGE_FOOT}"""
 
 
 @app.post("/upload-tennents", response_class=HTMLResponse)
