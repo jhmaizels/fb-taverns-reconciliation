@@ -1513,6 +1513,14 @@ def _opt(fields: dict, name: str, value) -> None:
 # They exist only in Airtable (the operator's workbook copy won't have them), so
 # replace_tennents_master preserves them across a workbook re-upload.
 FINDINGS_SOURCE_PREFIX = "findings:"
+# SKU rows added or re-rated on the Tennents price grid are stamped like the
+# findings rows and preserved across a workbook re-upload the same way, with
+# one difference: a grid-set TOTAL or WSP WINS over the workbook's figure (the
+# operator's workbook copy is usually older than a change made on the page),
+# exactly as a bar plan row does; a workbook that carries the same figure
+# absorbs it.
+GRID_SOURCE_PREFIX = "price grid:"
+IN_APP_SOURCE_PREFIXES = (FINDINGS_SOURCE_PREFIX, GRID_SOURCE_PREFIX)
 # Site_Prices rows written from /tennents/bar-plan carry this source_file
 # prefix (tennents_master.BAR_PLAN_SOURCE_PREFIX — kept equal by a test).
 BAR_PLAN_SOURCE_PREFIX = "bar plan:"
@@ -1861,7 +1869,7 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
     # they survive the next re-upload too.
     inapp_rows = [
         rec["fields"] for rec in _list_all(T["TennentsSkuMaster"])
-        if str(rec["fields"].get("source", "") or "").startswith(FINDINGS_SOURCE_PREFIX)
+        if str(rec["fields"].get("source", "") or "").startswith(IN_APP_SOURCE_PREFIXES)
     ]
     if inapp_rows:
         # These rows exist ONLY in Airtable. Log a snapshot before the wipe so a
@@ -1871,7 +1879,7 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
             len(inapp_rows),
             json.dumps([{k: f.get(k) for k in (
                 "sku_code", "alt_code", "product", "container", "correct_total_per_brl",
-                "contract_base_per_brl", "hold_per_brl", "source", "notes")} for f in inapp_rows],
+                "contract_base_per_brl", "wsp_per_brl", "hold_per_brl", "source", "notes")} for f in inapp_rows],
                 default=str),
         )
 
@@ -1994,6 +2002,29 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
             if f.get("contract_base_per_brl") is not None and wb.get("contract_base_per_brl") is None:
                 p.setdefault("contract_base_per_brl", f["contract_base_per_brl"])   # never over a workbook base
             p["source"] = f_stamp
+        elif str(f_stamp).startswith(GRID_SOURCE_PREFIX):
+            # A total or WSP set on the price grid wins over an older workbook
+            # figure (the bar plan rule); the same figure means the workbook
+            # has caught up and the row reverts to a plain workbook row.
+            kept: dict = {}
+            for key in ("correct_total_per_brl", "wsp_per_brl"):
+                mine, theirs = _finite(f.get(key)), _finite(wb.get(key))
+                if mine is not None and (theirs is None or abs(mine - theirs) > 0.005):
+                    kept[key] = mine
+                    if key == "correct_total_per_brl":
+                        kept["contract_base_per_brl"] = round(mine - float(wb.get("hold_per_brl") or 0.0), 2)
+            if kept:
+                p = patches.setdefault(rec["id"], {})
+                p.update(kept)
+                p["source"] = f_stamp
+                if report is not None:
+                    report.setdefault("sku_rates", []).append({
+                        "sku_code": prim, "product": wb.get("product", "") or f.get("product", ""),
+                        "correct_total_per_brl": kept.get("correct_total_per_brl"),
+                        "workbook_total": _finite(wb.get("correct_total_per_brl")),
+                        "wsp_per_brl": kept.get("wsp_per_brl"),
+                        "workbook_wsp": _finite(wb.get("wsp_per_brl")),
+                    })
     reapply_patch = [{"id": rid, "fields": flds} for rid, flds in patches.items() if flds]
     preserved = len(reapply_create) + len(reapply_patch)
     if reapply_create:
@@ -2315,6 +2346,142 @@ def add_tennents_site(master, site, actor: str, note: str = "") -> dict:
         invalidate_tennents_cache()
     refresh_tennents_cache_async()
     return {"action": "created", "account": site.account, "site_name": site.site_name}
+
+
+def set_tennents_sku_rate(master, change, actor: str, note: str = "") -> dict:
+    """Write ONE product-level edit from the price grid (a tennents_master
+    .SkuRateChange, already validated by plan_sku_rate_change) to
+    SKU_Master: the agreed total (base = total − hold, the master arithmetic
+    rule) and, when given, the WSP. Stamped source 'price grid:<actor> <date>'
+    so a workbook re-upload keeps the figure (see GRID_SOURCE_PREFIX). The
+    cached master is patched to match. Idempotent."""
+    if change.unchanged:
+        return {"action": "already", "sku_code": change.sku_code}
+    sku = master.find_sku(change.sku_code)
+    if sku is None:
+        raise ValueError(f"Product {change.sku_code!r} is not on the master")
+    tid = T["TennentsSkuMaster"]
+    rec_id = sku.rec_id
+    if not rec_id:
+        hits = _list_all(tid, fields=["sku_code"], filter_by_formula=f"{{sku_code}}='{change.sku_code}'")
+        rec_id = next((r["id"] for r in hits if str(r["fields"].get("sku_code", "")).strip().upper()
+                       == change.sku_code.upper()), "")
+        if not rec_id:
+            raise ValueError(f"Product {change.sku_code!r} is not on the master (re-run the page)")
+    today = date.today().isoformat()
+    who = (actor or "").strip()
+    stamp = f"{GRID_SOURCE_PREFIX}{who} {today}".strip()
+    parts = []
+    if change.total_changed:
+        before = "RATE TBC" if change.old_total is None else f"£{change.old_total:,.2f}"
+        parts.append(f"total {before} → £{change.new_total:,.2f}/brl")
+    if change.wsp_changed:
+        before = "none" if change.old_wsp is None else f"£{change.old_wsp:,.2f}"
+        parts.append(f"WSP {before} → £{change.new_wsp:,.2f}/brl")
+    line = f"Price grid {today} by {who or 'unknown'}: " + ", ".join(parts) + "."
+    if note.strip():
+        line += f" {note.strip()}"
+    old_notes = (sku.notes or "").strip()
+    notes = (line + (" | " + old_notes if old_notes else ""))[:2000]
+    fields: dict = {"source": stamp, "notes": notes}
+    if change.total_changed:
+        fields["correct_total_per_brl"] = change.new_total
+        fields["contract_base_per_brl"] = round(change.new_total - float(sku.hold_per_brl or 0.0), 2)
+    if change.wsp_changed:
+        fields["wsp_per_brl"] = change.new_wsp
+    _batch([{"id": rec_id, "fields": fields}], "update", tid)
+    try:
+        from dataclasses import replace as _dc_replace
+        base = TENNENTS_CACHE.peek() or master
+        skus = []
+        for k in base.skus:
+            if k.sku_code.strip().upper() == change.sku_code.upper():
+                k = _dc_replace(
+                    k, source=stamp, notes=notes, rec_id=rec_id,
+                    correct_total_per_brl=fields.get("correct_total_per_brl", k.correct_total_per_brl),
+                    contract_base_per_brl=fields.get("contract_base_per_brl", k.contract_base_per_brl),
+                    wsp_per_brl=fields.get("wsp_per_brl", k.wsp_per_brl),
+                )
+            skus.append(k)
+        patched = _dc_replace(base, skus=skus)
+        patched.reindex()
+        TENNENTS_CACHE.publish(patched)
+    except Exception:
+        logger.warning("tennents cache patch failed — the page catches up on refresh", exc_info=True)
+        invalidate_tennents_cache()
+    refresh_tennents_cache_async()
+    return {"action": "updated", "sku_code": change.sku_code,
+            "correct_total_per_brl": change.new_total, "wsp_per_brl": change.new_wsp}
+
+
+def add_tennents_sku(master, sku, actor: str, note: str = "") -> dict:
+    """Write ONE product (a tennents_master.SkuRate, already validated by
+    plan_add_sku) to SKU_Master from the price grid, stamped 'price grid:…'
+    so a workbook re-upload re-creates it (the findings-row rule). Re-reads
+    the code from Airtable first (a filtered read) and refuses one already
+    there. The cached master is patched to include it."""
+    tid = T["TennentsSkuMaster"]
+    code = sku.sku_code.strip().upper()
+    for r in _list_all(tid, fields=["sku_code", "product"], filter_by_formula=f"{{sku_code}}='{code}'"):
+        if str(r["fields"].get("sku_code", "") or "").strip().upper() == code:
+            raise ValueError(f"Code {code} is already on the master as {r['fields'].get('product', '') or 'another product'}")
+    today = date.today().isoformat()
+    who = (actor or "").strip()
+    stamp = f"{GRID_SOURCE_PREFIX}{who} {today}".strip()
+    line = f"Added on the price grid {today} by {who or 'unknown'}."
+    if note.strip():
+        line += f" {note.strip()}"
+    fields = {
+        "sku_code": code,
+        "product": sku.product,
+        "on_contract": False,
+        "hold_per_brl": 0.0,
+        "version": getattr(master, "version", "") or "",
+        "source": stamp,
+        "source_file": stamp,
+        "notes": line[:2000],
+    }
+    _opt(fields, "brand", sku.brand)
+    _opt(fields, "container", sku.container)
+    _opt(fields, "wsp_per_brl", sku.wsp_per_brl)
+    _opt(fields, "correct_total_per_brl", sku.correct_total_per_brl)
+    _opt(fields, "contract_base_per_brl", sku.contract_base_per_brl)
+    made = _batch([{"fields": fields}], "create", tid)
+    try:
+        from dataclasses import replace as _dc_replace
+        row = _dc_replace(sku, sku_code=code, source=stamp, notes=line[:2000],
+                          rec_id=(made[0].get("id", "") if made else ""), source_file=stamp)
+        base = TENNENTS_CACHE.peek() or master
+        patched = _dc_replace(base, skus=list(base.skus) + [row])
+        patched.reindex()
+        TENNENTS_CACHE.publish(patched)
+    except Exception:
+        logger.warning("tennents cache patch failed — the page catches up on refresh", exc_info=True)
+        invalidate_tennents_cache()
+    refresh_tennents_cache_async()
+    return {"action": "created", "sku_code": code, "product": sku.product}
+
+
+def list_grid_changes(limit: int = 50, master=None) -> list[dict]:
+    """Recent changes made on the Tennents price grid or bar plan page, newest
+    first, off the cached master: off-invoice rows ('bar plan:' stamps) and
+    SKU rows ('price grid:' stamps)."""
+    master = master if master is not None else load_tennents_master()
+    out = []
+    for sp in master.site_prices:
+        stamp = str(sp.source_file or "")
+        if stamp.startswith(BAR_PLAN_SOURCE_PREFIX):
+            out.append({"kind": "off_invoice", "site_name": sp.site_name, "sku_code": sp.sku_code,
+                        "product": sp.product, "figure": sp.off_invoice_per_brl,
+                        "who": stamp[len(BAR_PLAN_SOURCE_PREFIX):].strip(), "notes": sp.notes})
+    for k in master.skus:
+        stamp = str(k.source or "")
+        if stamp.startswith(GRID_SOURCE_PREFIX):
+            out.append({"kind": "sku", "site_name": "", "sku_code": k.sku_code, "product": k.product or k.brand,
+                        "figure": k.correct_total_per_brl, "who": stamp[len(GRID_SOURCE_PREFIX):].strip(),
+                        "notes": k.notes})
+    out.sort(key=lambda r: r["who"][-10:], reverse=True)
+    return out[:limit]
 
 
 def list_bar_plan_changes(limit: int = 50, master=None) -> list[dict]:

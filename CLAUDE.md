@@ -289,6 +289,32 @@ Key facts:
   re-creates such a pub when the uploaded workbook lacks its account (and
   lists it on the upload page); a workbook row for the account wins. Mallroad
   House (account 17599415) was never on the workbook (9 Oct 2026).
+- **The Tennents price grid — `GET /tennents/master` (2026-10-09, `tennents_grid.py`):**
+  the LWC master's shape for the Scottish estate: SKUs down, tenanted pubs
+  across (managed pubs shown greyed "all off" only with `?managed=1`), each
+  cell the tenant's off-invoice £/brl from `TennentsSitePrices` (blank = £0 /
+  no row = not on the price file); the toggle shows FB's retro (total − off)
+  with the net keg price (WSP − off, × `keg_brl_factor`). Left columns: WSP
+  and the estate-wide Total (`correct_total_per_brl`, "RATE TBC" when blank).
+  `?edit=1` (admin) is the LWC grid's cell machinery: a cell POSTs
+  `/tennents/cell/apply` (account, sku_code, off_invoice; blank = 0; the SAME
+  `plan_bar_plan_change` + `set_tennents_site_price` as the bar plan form,
+  `ajax=1` → JSON); a row's WSP/Total POST `/tennents/product-cell/apply`
+  (`plan_sku_rate_change` → `set_tennents_sku_rate`: a total below any pub's
+  off-invoice is REFUSED naming the pubs, a blank total keeps the current one
+  so a WSP can go on alone, base = total − hold); "+ Add product" is
+  `/tennents/product/new` (`plan_add_sku` → `add_tennents_sku`; blank total =
+  RATE TBC, and a TBC row's cells are disabled until it is set); "+ Add pub"
+  is `/tennents/pub/new` (the bar plan add-site form). SKU rows written from
+  the grid are stamped `source = 'price grid:<actor> <date>'`
+  (`GRID_SOURCE_PREFIX`, listed with the findings prefix in
+  `IN_APP_SOURCE_PREFIXES`) and `replace_tennents_master` treats them like
+  bar plan rows: a grid-set total or WSP WINS over an older workbook figure
+  (reported in `report["sku_rates"]`, listed on the upload page), the same
+  figure absorbs, a product the workbook lacks is re-created. The old
+  read-only tables are `?view=tables`; `/tennents/bar-plan` (one change with
+  a before/after preview) still works and the home page offers both. Every
+  write patches the cached master (see §10) so the next page shows it.
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -473,7 +499,11 @@ medium `>=5` / low; over and paid-not-on-master medium.
 | `POST /upload-master` | yes | **LWC master replace** | **YES** |
 | `POST /add-support` | yes | **NL tenant-support rule** (LLM) | **YES** |
 | `GET /tennents` | yes | Tennents landing (+ barrelage vs 2,700 + annual-retro claim alarm) | — |
-| `GET /tennents/master` | yes | Read-only browse of the master workbook mirror | — |
+| `GET /tennents/master` | yes | The Tennents price grid (`?edit=1` admin edits cells; `?view=tables` the read-only mirror) | — |
+| `POST /tennents/cell/apply` | yes (admin) | One grid cell: a pub's off-invoice £/brl for a product (`ajax=1` JSON) | **YES** (TennentsSitePrices) |
+| `POST /tennents/product-cell/apply` | yes (admin) | One product's WSP / total discount, estate-wide | **YES** (SKU_Master, grid-stamped) |
+| `GET/POST /tennents/product/new` | yes (admin) | Add a product to SKU_Master | **YES** |
+| `GET /tennents/pub/new` | yes (admin) | The add-a-pub form (posts to `/tennents/bar-plan/add-site`) | — |
 | `POST /upload-tennents-master` | yes | **Tennents master workbook WIPE+replace** (admin) | **YES** |
 | `POST /upload-tennents` | yes | Tennents monthly reconcile | findings only |
 | `POST /tennents/accept-sku` | yes (admin) | Findings-page **Add to master** (JSON): `link` a new report code to an existing SKU (alt code), `new` at the charged rate, `set_rate` on a RATE-TBC SKU | **YES** (SKU_Master, findings-stamped) |
