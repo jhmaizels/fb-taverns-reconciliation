@@ -118,6 +118,12 @@ class SkuRate:
     correct_total_per_brl: float | None   # None = no agreed rate yet (RATE TBC)
     source: str = ""
     notes: str = ""
+    # Airtable provenance, set by airtable_io.load_tennents_master and unused
+    # by the workbook parser: the stored row's id (a write can PATCH it without
+    # a table sweep), the workbook it came from, and when the row was created.
+    rec_id: str = ""
+    source_file: str = ""
+    created_at: str = ""
 
     @property
     def implied_total(self) -> float | None:
@@ -133,6 +139,8 @@ class SiteInfo:
     operating_model: str    # raw text, e.g. "Tenanted (TBC)" / "MANAGED (confirmed)"
     discount_construct: str
     notes: str = ""
+    rec_id: str = ""        # Airtable row id (see SkuRate)
+    source_file: str = ""
 
     @property
     def is_managed(self) -> bool:
@@ -194,6 +202,8 @@ class SitePrice:
     product: str = ""
     off_invoice_per_brl: float = 0.0
     notes: str = ""
+    rec_id: str = ""                      # Airtable row id (see SkuRate)
+    source_file: str = ""                 # workbook name, or a 'bar plan:' stamp
 
 
 @dataclass

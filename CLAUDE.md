@@ -546,6 +546,33 @@ throttle** and Airtable's own paginated, rate-limited API as the floor. Render
 has shown intermittent **health-check timeouts (5s)** consistent with a long
 upload blocking the worker.
 
+**The Tennents master is CACHED (2026-10-09), like the LWC master.** Until
+then every Tennents page re-read the four master tables (the ~780-row
+`TennentsSitePrices` sweep alone ~3.7s) and the bar plan page read them three
+times over: ~10s a click, ~10s a save (Render logs 9 Oct). Now
+`airtable_io._TtlCache` (fresh within `MASTER_CACHE_TTL`, stale served at once
+with a background refresh, invalidate keeps the last value, `publish` installs
+a patched copy and bumps the generation so a slow in-flight fetch cannot
+resurrect the pre-write value) holds the master (`TENNENTS_CACHE`) and the
+monthly volumes (`TENNENTS_VOLUMES_CACHE`); `_fetch_tennents_master` reads the
+four tables in parallel and keeps each row's Airtable id, `source_file` and
+`createdTime` on the dataclasses (`rec_id` etc. — the workbook parser leaves
+them blank). Rules: `get_tennents_master_info` and `list_bar_plan_changes` are
+DERIVED from the cached master (no Airtable call); `set_tennents_site_price`
+PATCHes by `rec_id` (a filtered `{account}='…'` read when there is none),
+then patches a COPY of the cached master (`_publish_site_price`, the LWC
+`publish_patched_snapshot` idea) so the next page shows the change, and kicks
+a background re-read; `add_tennents_site` is a filtered read + create +
+publish; `accept_tennents_sku` invalidates; `replace_tennents_master` ends
+with `load_tennents_master(force_refresh=True)`; `upsert_file_record`
+invalidates the volumes cache. Any NEW Tennents write must either publish the
+patched master or invalidate — a write the cache never hears of shows for up
+to a minute as not having happened. Boot warms both caches (`webapp`
+startup). `auth_supabase` caches a token's user and role for `AUTH_CACHE_TTL`
+(60s, keyed on a sha256 of the token, successes only), which takes the two
+Supabase round trips off every click. `test_tennents_cache.py` covers all of
+it with the refresh thread stubbed.
+
 **Other gotchas:**
 - Errors in `_list_all` / `_batch` call **`sys.exit()`** (terminate process),
   not raise — but `replace_tennents_master`'s DELETE loop uses

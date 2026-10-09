@@ -33,9 +33,12 @@ timeouts and fail safe (no session => not authorised, never => allowed).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from urllib.parse import quote
@@ -164,13 +167,75 @@ class DrinksPrincipal:
 # ---------------------------------------------------------------------------
 # Supabase auth/token network helpers (all wrapped, fail safe)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Short per-token cache (2026-10-09). Every request validated the token and
+# read the role with two Supabase round trips (~0.3s together, behind the hub
+# proxy's own hop). A token's identity and role do not change inside a minute,
+# so successes are kept for AUTH_CACHE_TTL seconds keyed on a hash of the
+# token — never the token itself — and bounded in size. Failures are NOT
+# cached: a revoked or expired token must fail on the next request, and a
+# transient network error must not pin a user out.
+# ---------------------------------------------------------------------------
+AUTH_CACHE_TTL = float(os.environ.get("AUTH_CACHE_TTL", "60"))
+_AUTH_CACHE_MAX = 500
+_auth_cache: dict = {}
+_auth_cache_lock = threading.Lock()
+
+
+def _token_key(kind: str, access_token: str, extra: str = "") -> str:
+    return kind + ":" + hashlib.sha256((access_token + "|" + extra).encode("utf-8")).hexdigest()
+
+
+def _auth_cache_get(key: str):
+    if AUTH_CACHE_TTL <= 0:
+        return None
+    with _auth_cache_lock:
+        hit = _auth_cache.get(key)
+        if hit is None:
+            return None
+        value, ts = hit
+        if (time.monotonic() - ts) >= AUTH_CACHE_TTL:
+            _auth_cache.pop(key, None)
+            return None
+        return value
+
+
+def _auth_cache_put(key: str, value) -> None:
+    if AUTH_CACHE_TTL <= 0 or value is None:
+        return
+    with _auth_cache_lock:
+        if len(_auth_cache) >= _AUTH_CACHE_MAX:
+            now = time.monotonic()
+            for k in [k for k, (_, ts) in _auth_cache.items() if (now - ts) >= AUTH_CACHE_TTL]:
+                _auth_cache.pop(k, None)
+            if len(_auth_cache) >= _AUTH_CACHE_MAX:
+                _auth_cache.clear()
+        _auth_cache[key] = (value, time.monotonic())
+
+
+def clear_auth_cache() -> None:
+    with _auth_cache_lock:
+        _auth_cache.clear()
+
+
 def validate_token(access_token: str) -> Optional[dict]:
     """Validate a Supabase access token via GET {URL}/auth/v1/user.
 
     Returns a dict with at least {'id', 'email'} on success, else None
-    (on 401, network error, or misconfiguration). Never raises."""
+    (on 401, network error, or misconfiguration). Never raises. A success is
+    cached for AUTH_CACHE_TTL seconds (see above)."""
     if not access_token or not SUPABASE_URL or not SUPABASE_ANON_KEY:
         return None
+    ck = _token_key("user", access_token)
+    cached = _auth_cache_get(ck)
+    if cached is not None:
+        return cached
+    result = _validate_token_uncached(access_token)
+    _auth_cache_put(ck, result)
+    return result
+
+
+def _validate_token_uncached(access_token: str) -> Optional[dict]:
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/auth/v1/user",
@@ -245,6 +310,16 @@ def get_drinks_role(user_id: str, access_token: str) -> Optional[str]:
     drinks row / on any error. Never raises."""
     if not user_id or not access_token or not SUPABASE_URL or not SUPABASE_ANON_KEY:
         return None
+    ck = _token_key("role", access_token, user_id)
+    cached = _auth_cache_get(ck)
+    if cached is not None:
+        return cached
+    result = _get_drinks_role_uncached(user_id, access_token)
+    _auth_cache_put(ck, result)
+    return result
+
+
+def _get_drinks_role_uncached(user_id: str, access_token: str) -> Optional[str]:
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/user_app_roles",

@@ -202,7 +202,19 @@ def _warm_master_cache() -> None:
         except Exception:
             logger.warning("master-cache warm-up failed", exc_info=True)
 
+    def _warm_tennents() -> None:
+        # The Tennents master has its own cache (airtable_io.TENNENTS_CACHE);
+        # warm it too so the first Tennents click after a deploy is not a
+        # four-table sweep.
+        try:
+            load_tennents_master()
+            list_tennents_monthly_volumes()
+            logger.info("tennents-cache warm-up complete")
+        except Exception:
+            logger.warning("tennents-cache warm-up failed", exc_info=True)
+
     threading.Thread(target=_warm, daemon=True, name="master-cache-warmup").start()
+    threading.Thread(target=_warm_tennents, daemon=True, name="tennents-cache-warmup").start()
 
 
 @app.middleware("http")
