@@ -108,6 +108,7 @@ from airtable_io import (  # noqa: E402
     replace_tennents_master,
     accept_tennents_sku,
     set_tennents_site_price,
+    add_tennents_site,
     list_bar_plan_changes,
     get_tennents_master_info,
     list_tennents_monthly_volumes,
@@ -121,7 +122,9 @@ from tennents import (  # noqa: E402
     reconcile as reconcile_tennents,
     render_summary_html as render_tennents_summary_html,
 )
-from tennents_master import BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_bar_plan_change  # noqa: E402
+from tennents_master import (  # noqa: E402
+    BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_add_site, plan_bar_plan_change,
+)
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -3416,7 +3419,8 @@ def upload_tennents_master(
                 pass
 
     kept = bar_plan_report.get("bar_plan") or []
-    findings_kept = max(preserved - len(kept), 0)
+    sites_kept = bar_plan_report.get("sites") or []
+    findings_kept = max(preserved - len(kept) - len(sites_kept), 0)
     preserved_note = (
         f"<div class='result'><strong>{findings_kept} in-app change(s) preserved</strong> — SKUs, alt codes or "
         f"rates accepted from the findings page that this workbook didn't carry were kept rather than wiped. "
@@ -3435,6 +3439,16 @@ def upload_tennents_master(
             f"<div class='result'><strong>{len(kept)} bar plan change(s) kept over this workbook</strong> — made on "
             f"<a href=\"{ext_url('/tennents/bar-plan')}\">Bar plan change</a> after the workbook was last edited. "
             f"Put the same figures on its <code>Site_Prices</code> sheet, or change them on that page if the workbook is right."
+            f"<ul>{items}</ul></div>"
+        )
+    if sites_kept:
+        items = "".join(
+            f"<li>{escape(str(k.get('site_name', '')))} (account {escape(str(k.get('account', '')))})</li>"
+            for k in sites_kept
+        )
+        preserved_note += (
+            f"<div class='result'><strong>{len(sites_kept)} pub(s) added on the bar plan page kept</strong> — this "
+            f"workbook's <code>Site_Master</code> sheet doesn't have them. Add a row for each when convenient."
             f"<ul>{items}</ul></div>"
         )
     no_rate = [s.sku_code for s in master.skus if s.correct_total_per_brl is None]
@@ -3551,6 +3565,70 @@ def _bar_plan_form_html(master, account: str = "", sku_code: str = "", off: str 
 </form>"""
 
 
+def _add_site_form_html(account: str = "", site_name: str = "", managed: bool = False, note: str = "") -> str:
+    return f"""<h2>Pub not in the list?</h2>
+<p class="sub">A pub missing from the master's <code>Site_Master</code> can't take a bar plan change, has no price file, and
+reads as a new customer on the monthly report. Add it here with its Tennents account number (the number in brackets after
+the pub's name on the monthly Tennents report), then set its products above, one at a time.</p>
+<form action="{ext_url('/tennents/bar-plan/add-site')}" method="post" style="max-width: 640px">
+  <label for="as-name">Pub name</label>
+  <input type="text" name="site_name" id="as-name" value="{escape(site_name)}" required maxlength="80">
+  <label for="as-acct">Tennents account number</label>
+  <input type="text" name="account" id="as-acct" value="{escape(account)}" required inputmode="numeric">
+  <label><input type="checkbox" name="managed" value="1"{" checked" if managed else ""}> Managed pub (takes the whole
+  discount off-invoice; it won't appear in the bar plan list)</label>
+  <label for="as-note">Note (e.g. "Not on the workbook; account from Tennents report")</label>
+  <input type="text" name="note" id="as-note" value="{escape(note)}" maxlength="300">
+  <button type="submit">Add the pub</button>
+</form>"""
+
+
+@app.post("/tennents/bar-plan/add-site", response_class=HTMLResponse)
+async def tennents_bar_plan_add_site(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    account = (form.get("account") or "").strip()
+    site_name = (form.get("site_name") or "").strip()
+    managed = bool(form.get("managed"))
+    note = (form.get("note") or "").strip()
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    try:
+        site = plan_add_site(master, account, site_name, managed=managed)
+        await run_in_threadpool(add_tennents_site, master, site, principal.email, note)
+    except ValueError as e:
+        return HTMLResponse(f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Back</a></p>
+<h1>Add a pub</h1>
+<div class="result err">{escape(str(e))}</div>
+{_add_site_form_html(account, site_name, managed, note)}
+{PAGE_FOOT}""", status_code=400)
+    except Exception:
+        logger.exception("tennents add site failed")
+        return _error_page("Could not add the pub — the details have been logged. Check whether it now appears on "
+                           "the bar plan page before trying again.")
+    nxt = ("It is managed, so it takes the whole discount off-invoice and has no split to set."
+           if site.is_managed else
+           "It is now in the pub list: set each product it sells (off-invoice £ per barrel). Until a product has a "
+           "figure, it isn't on the pub's price file.")
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Bar plan change</a></p>
+<h1>Added: {escape(site.site_name)}</h1>
+<div class="result">{escape(site.site_name)} is on the master under Tennents account {escape(site.account)}
+({escape(site.operating_model)}, {escape(site.discount_construct)}). {nxt}</div>
+<p><a class="button" href="{ext_url('/tennents/bar-plan')}">Set its products</a></p>
+<p class="sub">If you also keep the master workbook, add the same row to its <code>Site_Master</code> sheet: a re-upload
+keeps this pub only while the workbook lacks it, and lists it on the upload page.</p>
+{PAGE_FOOT}"""
+
+
 @app.get("/tennents/bar-plan", response_class=HTMLResponse)
 def tennents_bar_plan(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
     """One pub, one product: set the tenant's off-invoice £/brl in Site_Prices.
@@ -3586,6 +3664,7 @@ Managed pubs take the whole discount off-invoice, so they are not listed. Set 0 
 price file.</p>
 {_tennents_master_banner_html()}
 {_bar_plan_form_html(master)}
+{_add_site_form_html()}
 {recent_html}
 {PAGE_FOOT}"""
 

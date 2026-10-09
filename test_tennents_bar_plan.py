@@ -14,7 +14,7 @@ import airtable_io as aio  # noqa: E402
 import tennents_master as tm  # noqa: E402
 from tennents import DeliveryLine, MonthlyReport, reconcile, render_summary_html  # noqa: E402
 from tennents_master import (  # noqa: E402
-    SiteInfo, SitePrice, SkuRate, TennentsMaster, expected_off_invoice, plan_bar_plan_change,
+    SiteInfo, SitePrice, SkuRate, TennentsMaster, expected_off_invoice, plan_add_site, plan_bar_plan_change,
 )
 from test_tennents_findings import FakeIO, _install  # noqa: E402  (also sets utf-8 stdout)
 
@@ -194,6 +194,68 @@ def test_replace_keeps_bar_plan():
     _check("preserved counts them", preserved == 2, str(preserved))
 
 
+def test_plan_add_site():
+    print("\n-- plan_add_site")
+    m = make_master()
+    st = plan_add_site(m, " 17599415 ", "  Mallroad   House ")
+    _check("tenanted row", st.account == "17599415" and st.site_name == "Mallroad House"
+           and not st.is_managed and st.discount_construct == "Standard split", str(st))
+    _check("managed row", plan_add_site(m, "17599416", "Somewhere", managed=True).is_managed)
+    _check("Excel-style float account normalised", plan_add_site(m, "17599415.0", "X").account == "17599415")
+
+    def refuses(label, *args):
+        try:
+            plan_add_site(m, *args)
+            _check(label, False, "accepted")
+        except ValueError:
+            _check(label, True)
+    refuses("account already on the master", "11110001", "New Name")
+    refuses("name already on the master", "17599415", "bell rock")
+    refuses("account not a number", "TBC", "Mallroad House")
+    refuses("account too short", "123", "Mallroad House")
+    refuses("blank name", "17599415", "   ")
+
+
+def test_add_site_write_and_keep():
+    print("\n-- add_tennents_site and a workbook re-upload")
+    sid = aio.T["TennentsSiteMaster"]
+    fake = FakeIO([])
+    fake.tables[sid] = [{"id": "s1", "fields": {"account": "11110001", "site_name": "BELL ROCK"}}]
+    _install(fake)
+    m = make_master()
+    st = plan_add_site(m, "17599415", "Mallroad House")
+    r = aio.add_tennents_site(m, st, "james@x", "not on the workbook")
+    row = fake.tables[sid][-1]["fields"]
+    _check("row created", r["action"] == "created" and len(fake.tables[sid]) == 2)
+    _check("stamped bar plan", row["source_file"].startswith(aio.BAR_PLAN_SOURCE_PREFIX + "james@x"))
+    _check("model and construct written", row["operating_model"] == "Tenanted" and row["discount_construct"] == "Standard split")
+    try:
+        aio.add_tennents_site(m, st, "james@x")
+        _check("second add refused", False, "accepted")
+    except ValueError:
+        _check("second add refused", True)
+
+    report: dict = {}
+    _, _, preserved = aio.replace_tennents_master(make_master(), "wb.xlsx", report=report)
+    accts = sorted(f["fields"]["account"] for f in fake.tables[sid])
+    _check("workbook without the pub keeps it", "17599415" in accts and accts.count("17599415") == 1, str(accts))
+    _check("reported", [k["account"] for k in report.get("sites", [])] == ["17599415"], str(report.get("sites")))
+    _check("preserved counts it", preserved == 1, str(preserved))
+    kept_row = next(f["fields"] for f in fake.tables[sid] if f["fields"]["account"] == "17599415")
+    _check("still stamped, so the next re-upload keeps it too",
+           kept_row["source_file"].startswith(aio.BAR_PLAN_SOURCE_PREFIX))
+
+    wb = make_master()
+    wb.sites.append(SiteInfo("17599415", "MALLROAD HOUSE", "Tenanted", "Standard split"))
+    wb.reindex()
+    report = {}
+    aio.replace_tennents_master(wb, "wb2.xlsx", report=report)
+    rows = [f["fields"] for f in fake.tables[sid] if f["fields"]["account"] == "17599415"]
+    _check("workbook that caught up wins, no duplicate", len(rows) == 1 and rows[0]["site_name"] == "MALLROAD HOUSE"
+           and not str(rows[0].get("source_file", "")).startswith(aio.BAR_PLAN_SOURCE_PREFIX), str(rows))
+    _check("nothing reported", report.get("sites") == [], str(report.get("sites")))
+
+
 def main() -> int:
     test_prefix_kept_equal()
     test_plan()
@@ -201,6 +263,8 @@ def main() -> int:
     test_split_check()
     test_set_site_price()
     test_replace_keeps_bar_plan()
+    test_plan_add_site()
+    test_add_site_write_and_keep()
     print("\nALL PASS" if PASS else "\nFAILURES")
     return 0 if PASS else 1
 

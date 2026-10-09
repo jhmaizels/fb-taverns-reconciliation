@@ -669,6 +669,42 @@ def plan_bar_plan_change(master: TennentsMaster, account: str, sku_code: str,
     )
 
 
+def plan_add_site(master: TennentsMaster, account: str, site_name: str,
+                  managed: bool = False) -> SiteInfo:
+    """Validate a pub to add to Site_Master from the bar plan page and return
+    the row to write. Raises ValueError with a sentence for the operator.
+
+    A pub missing from Site_Master can't take a bar plan change, gets no price
+    file, and every line of its monthly Tennents report reads as a new customer
+    (Mallroad House, 9 Oct 2026: never on the workbook). Refused: an account
+    that isn't a plain number, one already on the master, and a name another
+    account already carries (that is a changed account number — a workbook
+    edit, not a second pub). The construct is the standard split, or all
+    off-invoice for a managed pub; a bespoke construct (Gartocher's flat
+    retro) is a workbook edit."""
+    acct = _account_str(str(account or "").replace(" ", ""))
+    if not acct.isdigit() or not 6 <= len(acct) <= 10:
+        raise ValueError(f"Tennents account {str(account or '').strip()!r} should be the account number "
+                         "Tennents uses for the pub, e.g. 17599415")
+    name = " ".join(str(site_name or "").split())
+    if not name:
+        raise ValueError("Give the pub's name as it should appear on its price file")
+    if len(name) > 80:
+        raise ValueError("The pub's name is too long (80 characters at most)")
+    existing = master.site_for_account(acct)
+    if existing is not None:
+        raise ValueError(f"Account {acct} is already on the master as {existing.site_name}")
+    clash = next((s for s in master.sites if s.site_name.strip().upper() == name.upper()), None)
+    if clash is not None:
+        raise ValueError(f"{clash.site_name} is already on the master under account {clash.account or 'TBC'}. "
+                         "If its account number has changed, correct it in the workbook rather than adding it twice")
+    return SiteInfo(
+        account=acct, site_name=name,
+        operating_model="MANAGED" if managed else "Tenanted",
+        discount_construct="ALL OFF-INVOICE" if managed else "Standard split",
+    )
+
+
 def expected_off_invoice(master: TennentsMaster, account: str, sku_code: str,
                          total_charged: float) -> tuple[float | None, str]:
     """The off-invoice £/brl our file says Tennents should be giving the tenant
