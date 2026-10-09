@@ -279,6 +279,16 @@ Key facts:
   over the workbook, with the workbook's figure. The result page links the
   pub's single-site price file (the file David Simpson needs on a bar plan
   change, per Nick Madigan 22 Sep 2026).
+- **`POST /tennents/bar-plan/add-site`** (admin, cross-origin checked): "Pub
+  not in the list?" on the bar plan page adds ONE pub to `TennentsSiteMaster`
+  (name, Tennents account number, tenanted or managed; construct "Standard
+  split" / "ALL OFF-INVOICE"), validated by `tennents_master.plan_add_site`
+  (refuses a non-numeric account, one already on the master, and a name
+  another account carries) and written by `airtable_io.add_tennents_site`,
+  stamped `source_file='bar plan:<actor> <date>'`. `replace_tennents_master`
+  re-creates such a pub when the uploaded workbook lacks its account (and
+  lists it on the upload page); a workbook row for the account wins. Mallroad
+  House (account 17599415) was never on the workbook (9 Oct 2026).
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 

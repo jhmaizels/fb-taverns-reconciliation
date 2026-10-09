@@ -1707,9 +1707,12 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
     across the wipe (re-created if absent from the workbook; alt codes unioned
     and a findings rate kept when the workbook row has none), and so are
     Site_Prices rows from the bar plan page (source_file 'bar plan:…'; the
-    page's figure wins unless the workbook carries the same one). Returns
+    page's figure wins unless the workbook carries the same one), and so are
+    pubs added on that page (TennentsSiteMaster rows stamped 'bar plan:…',
+    re-created unless the workbook carries the account). Returns
     (deleted, created, preserved); pass `report` (a dict) to receive
-    report["bar_plan"], one entry per bar plan row re-applied.
+    report["bar_plan"], one entry per bar plan row re-applied, and
+    report["sites"], one per added pub kept.
     """
     deleted = 0
     created = 0
@@ -1869,6 +1872,21 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
             absorbed or "-", dropped_alts or "-",
         )
 
+    # Pubs added on the bar plan page (source_file 'bar plan:…') exist only in
+    # Airtable: snapshot them and re-create any the workbook doesn't carry. A
+    # workbook row for the same account wins — it has caught up.
+    added_sites = [
+        rec["fields"] for rec in _list_all(T["TennentsSiteMaster"])
+        if str(rec["fields"].get("source_file", "") or "").startswith(BAR_PLAN_SOURCE_PREFIX)
+    ]
+    if added_sites:
+        logger.warning(
+            "replace_tennents_master: %d pub(s) added on the bar plan page about to be wiped and re-applied: %s",
+            len(added_sites),
+            json.dumps([{k: f.get(k) for k in (
+                "account", "site_name", "operating_model", "discount_construct", "source_file", "notes")}
+                for f in added_sites], default=str),
+        )
     deleted += _wipe_table(T["TennentsSiteMaster"], "account")
     payload = []
     for st in master.sites:
@@ -1883,6 +1901,23 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
         _opt(fields, "notes", st.notes)
         payload.append({"fields": fields})
     created += len(_batch(payload, "create", T["TennentsSiteMaster"])) if payload else 0
+    if added_sites:
+        in_workbook = {str(st.account or "").strip() for st in master.sites}
+        keep_sites, site_report = [], []
+        for f in added_sites:
+            acct = str(f.get("account", "") or "").strip()
+            if not acct or acct in in_workbook:
+                continue                      # the workbook has caught up
+            fields = {k: v for k, v in f.items() if k != "version"}
+            fields["version"] = master.version
+            keep_sites.append({"fields": fields})
+            site_report.append({"account": acct, "site_name": f.get("site_name", "")})
+            in_workbook.add(acct)
+        if keep_sites:
+            created += len(_batch(keep_sites, "create", T["TennentsSiteMaster"]))
+            preserved += len(keep_sites)
+        if report is not None:
+            report["sites"] = site_report
 
     deleted += _wipe_table(T["TennentsSiteSkuExceptions"], "exception_key")
     payload = []
@@ -2046,6 +2081,35 @@ def set_tennents_site_price(master, change, actor: str, note: str = "") -> dict:
     _opt(fields, "product", change.product)
     _batch([{"fields": fields}], "create", tid)
     return {"action": "created", "off_invoice_per_brl": change.new_off}
+
+
+def add_tennents_site(master, site, actor: str, note: str = "") -> dict:
+    """Write ONE pub (a tennents_master.SiteInfo, already validated by
+    plan_add_site) to TennentsSiteMaster. Stamped source_file
+    'bar plan:<actor> <date>' so a workbook re-upload that lacks the pub keeps
+    it. Re-reads the table first and refuses an account already there (the
+    master in hand may be a few seconds old)."""
+    tid = T["TennentsSiteMaster"]
+    for r in _list_all(tid, fields=["account", "site_name"]):
+        if str(r["fields"].get("account", "") or "").strip() == site.account:
+            raise ValueError(f"Account {site.account} is already on the master as "
+                             f"{r['fields'].get('site_name', '') or 'another pub'}")
+    today = date.today().isoformat()
+    who = (actor or "").strip()
+    line = f"Added on the bar plan page {today} by {who or 'unknown'}."
+    if note.strip():
+        line += f" {note.strip()}"
+    fields = {
+        "account": site.account,
+        "site_name": site.site_name,
+        "version": getattr(master, "version", "") or "",
+        "source_file": f"{BAR_PLAN_SOURCE_PREFIX}{who} {today}".strip(),
+        "notes": line[:2000],
+    }
+    _opt(fields, "operating_model", site.operating_model)
+    _opt(fields, "discount_construct", site.discount_construct)
+    _batch([{"fields": fields}], "create", tid)
+    return {"action": "created", "account": site.account, "site_name": site.site_name}
 
 
 def list_bar_plan_changes(limit: int = 50) -> list[dict]:
