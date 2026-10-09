@@ -327,6 +327,108 @@ def refresh_master_cache_async() -> None:
     threading.Thread(target=_work, daemon=True, name="master-cache-refresh").start()
 
 
+# ---------- generic stale-while-revalidate cache ----------
+# The LWC master cache above was hand-written first; this is the same shape as
+# a reusable class for the Tennents master (and the Tennents monthly volumes),
+# which until 2026-10-09 were re-read from Airtable on EVERY page: four table
+# sweeps per click, the 780-row TennentsSitePrices one alone ~3.7s, so the bar
+# plan page took ~10s and a save ~10s. Semantics match load_master_snapshot:
+# fresh within TTL; stale served instantly with a background refresh after the
+# TTL; a write invalidates but keeps the last good value to serve stale (never
+# an inline rebuild behind the hub proxy); writers publish a patched value so
+# the next read reflects the change at once; a generation counter stops a slow
+# in-flight fetch from resurrecting a pre-write value.
+
+class _TtlCache:
+    def __init__(self, name: str, ttl: float):
+        self.name = name
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._value = None
+        self._ts = 0.0
+        self._last = None
+        self._gen = 0
+        self._refreshing = False
+        self._fetch = None
+
+    def get(self, fetch, force_refresh: bool = False):
+        """Return the cached value, fetching inline only when nothing is held."""
+        self._fetch = fetch
+        with self._lock:
+            value, ts, last, gen = self._value, self._ts, self._last, self._gen
+        if not force_refresh and value is not None:
+            if (time.monotonic() - ts) < self.ttl:
+                return value
+            self.refresh_async()
+            return value
+        if not force_refresh and last is not None:
+            self.refresh_async()
+            return last
+        fresh = fetch()
+        with self._lock:
+            if self._gen == gen:
+                self._value, self._ts = fresh, time.monotonic()
+            self._last = fresh
+        return fresh
+
+    def peek(self):
+        """The held value (fresh or stale) without fetching, else None."""
+        with self._lock:
+            return self._value if self._value is not None else self._last
+
+    def invalidate(self) -> None:
+        with self._lock:
+            if self._value is not None:
+                self._last = self._value
+            self._value, self._ts = None, 0.0
+            self._gen += 1
+
+    def publish(self, value) -> None:
+        """Install a locally patched value as the fresh entry (a write just
+        landed and the caller mirrored it), bumping the generation so an
+        in-flight background fetch started before the write is discarded."""
+        with self._lock:
+            self._value, self._ts, self._last = value, time.monotonic(), value
+            self._gen += 1
+
+    def refresh_async(self) -> None:
+        """Kick ONE background re-fetch (no-op while one is running)."""
+        fetch = self._fetch
+        if fetch is None:
+            return
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+            gen_before = self._gen
+
+        def _work() -> None:
+            try:
+                fresh = fetch()
+                with self._lock:
+                    if self._gen == gen_before:
+                        self._value, self._ts, self._last = fresh, time.monotonic(), fresh
+            except Exception:
+                logger.warning("background %s refresh failed", self.name, exc_info=True)
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        threading.Thread(target=_work, daemon=True, name=f"{self.name}-refresh").start()
+
+
+TENNENTS_CACHE = _TtlCache("tennents-master", MASTER_CACHE_TTL)
+TENNENTS_VOLUMES_CACHE = _TtlCache("tennents-volumes", MASTER_CACHE_TTL)
+
+
+def invalidate_tennents_cache() -> None:
+    TENNENTS_CACHE.invalidate()
+
+
+def refresh_tennents_cache_async() -> None:
+    TENNENTS_CACHE.refresh_async()
+
+
 # ---------- pricing policy config (Config table, single record) ----------
 # The cask fixed £/keg margin and the draught target GP drive the "suggested
 # price" on the findings page + the LWC email. They change once a year at the
@@ -1343,6 +1445,7 @@ def upsert_file_record(
     file_name = file_name_override or os.path.basename(file_path)
     raw_hash = _file_hash(file_path)
     existing = _list_all(table_id, fields=["raw_hash"])
+    TENNENTS_VOLUMES_CACHE.invalidate()
     for rec in existing:
         if rec["fields"].get("raw_hash") == raw_hash:
             if extra_fields:
@@ -1488,6 +1591,13 @@ def _tennents_sku_lookup() -> dict[str, dict]:
     return out
 
 
+def _tennents_sku_changed() -> None:
+    """A SKU row was written outside the cached master's knowledge: drop the
+    cache (the last value still serves stale) and re-read in the background."""
+    invalidate_tennents_cache()
+    refresh_tennents_cache_async()
+
+
 def accept_tennents_sku(
     mode: str, sku_code: str, actor: str, source_file: str, *,
     link_to: str | None = None, sku_desc: str = "",
@@ -1550,6 +1660,7 @@ def accept_tennents_sku(
             "alt_code": new_alt, "source": stamp,
             "notes": f"Alt code {code} linked from findings ({source_file}).",
         }}], "update", tid)
+        _tennents_sku_changed()
         return {"action": "linked", "sku_code": target, "alt_code": new_alt}
 
     total = _finite(charged_total)
@@ -1579,6 +1690,7 @@ def accept_tennents_sku(
             "source": stamp,
             "notes": f"Rate set to the charged £{total:.2f}/brl from findings ({source_file}). Confirm with Tennents.",
         }}], "update", tid)
+        _tennents_sku_changed()
         return {"action": "rate_set", "sku_code": code, "correct_total_per_brl": total}
 
     if mode == "new":
@@ -1604,18 +1716,34 @@ def accept_tennents_sku(
         }
         _opt(fields, "container", (container or "").strip())
         _batch([{"fields": fields}], "create", tid)
+        _tennents_sku_changed()
         return {"action": "created", "sku_code": code, "correct_total_per_brl": total}
 
     raise ValueError(f"unknown mode {mode!r}")
 
 
-def load_tennents_master():
-    """Load the Tennents master workbook mirror as a TennentsMaster."""
+def load_tennents_master(force_refresh: bool = False):
+    """The Tennents master (workbook mirror) as a TennentsMaster, served from
+    the stale-while-revalidate cache — see _TtlCache. Pass force_refresh=True
+    after a wholesale replace so the next page shows the new workbook."""
+    return TENNENTS_CACHE.get(_fetch_tennents_master, force_refresh=force_refresh)
+
+
+def _fetch_tennents_master():
+    """One sweep of the four Tennents tables, read in parallel (they are
+    independent, and the per-site table's eight pages dominate)."""
+    from concurrent.futures import ThreadPoolExecutor
     from tennents_master import SkuException, SiteInfo, SitePrice, SkuRate, TennentsMaster
+
+    names = ["TennentsSkuMaster", "TennentsSiteMaster", "TennentsSiteSkuExceptions"]
+    if "TennentsSitePrices" in T:
+        names.append("TennentsSitePrices")
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        recs = dict(zip(names, pool.map(lambda n: _list_all(T[n]), names)))
 
     versions: Counter[str] = Counter()
     skus: list[SkuRate] = []
-    for rec in _list_all(T["TennentsSkuMaster"]):
+    for rec in recs["TennentsSkuMaster"]:
         f = rec["fields"]
         if not f.get("sku_code"):
             continue
@@ -1637,6 +1765,9 @@ def load_tennents_master():
             correct_total_per_brl=f.get("correct_total_per_brl"),
             source=f.get("source", "") or "",
             notes=f.get("notes", "") or "",
+            rec_id=rec.get("id", ""),
+            source_file=f.get("source_file", "") or "",
+            created_at=rec.get("createdTime", "") or "",
         ))
 
     sites = [
@@ -1646,8 +1777,10 @@ def load_tennents_master():
             operating_model=f.get("operating_model", "") or "",
             discount_construct=f.get("discount_construct", "") or "",
             notes=f.get("notes", "") or "",
+            rec_id=rec.get("id", ""),
+            source_file=f.get("source_file", "") or "",
         )
-        for rec in _list_all(T["TennentsSiteMaster"])
+        for rec in recs["TennentsSiteMaster"]
         if (f := rec["fields"]).get("account")
     ]
 
@@ -1666,7 +1799,7 @@ def load_tennents_master():
             # workbook re-upload; unticked falls back to the status text.
             resolved_flag=True if f.get("resolved") else None,
         )
-        for rec in _list_all(T["TennentsSiteSkuExceptions"])
+        for rec in recs["TennentsSiteSkuExceptions"]
         if (f := rec["fields"]).get("sku_code")
     ]
 
@@ -1682,8 +1815,10 @@ def load_tennents_master():
                 product=f.get("product", "") or "",
                 off_invoice_per_brl=float(f.get("off_invoice_per_brl") or 0.0),
                 notes=f.get("notes", "") or "",
+                rec_id=rec.get("id", ""),
+                source_file=f.get("source_file", "") or "",
             )
-            for rec in _list_all(T["TennentsSitePrices"])
+            for rec in recs["TennentsSitePrices"]
             if (f := rec["fields"]).get("sku_code")
         ]
 
@@ -1984,6 +2119,13 @@ def replace_tennents_master(master, source: str, report: dict | None = None) -> 
             if report is not None:
                 report["bar_plan"] = kept
 
+    # The cached master is now wholly stale: drop it and read the new tables
+    # inline, so the upload page's banner and the next click show this workbook.
+    invalidate_tennents_cache()
+    try:
+        load_tennents_master(force_refresh=True)
+    except Exception:
+        logger.warning("tennents master reload after replace failed", exc_info=True)
     return deleted, created, preserved
 
 
@@ -2038,16 +2180,30 @@ def set_tennents_site_price(master, change, actor: str, note: str = "") -> dict:
     (account, SKU) row in place, or create it. Stamped source_file
     'bar plan:<actor> <date>' so a workbook re-upload keeps it, and the old and
     new figures go in the notes. Idempotent: the same figure again writes
-    nothing. Raises ValueError when the table isn't set up."""
+    nothing. Raises ValueError when the table isn't set up.
+
+    No table sweep: the row is PATCHed by the id the cached master carries,
+    else found with a server-side filter on the account (a handful of rows).
+    The cached master is patched to match and re-published, so the grid and
+    the price file show the change at once; Airtable is re-read in the
+    background."""
     if "TennentsSitePrices" not in T:
         raise ValueError("The per-site off-invoice table (TennentsSitePrices) isn't set up in Airtable yet")
     tid = T["TennentsSitePrices"]
-    want = (change.account, master.canonical_sku(change.sku_code).strip().upper())
-    rows = [
-        r for r in _list_all(tid)
-        if (str(r["fields"].get("account", "") or "").strip(),
-            master.canonical_sku(str(r["fields"].get("sku_code", "") or "")).strip().upper()) == want
-    ]
+    canon = master.canonical_sku(change.sku_code).strip().upper()
+    existing = master.site_price(change.account, change.sku_code)
+    rows: list[dict] = []
+    if existing is not None and existing.rec_id:
+        rows = [{"id": existing.rec_id, "fields": {
+            "off_invoice_per_brl": existing.off_invoice_per_brl, "notes": existing.notes}}]
+    else:
+        acct = "".join(ch for ch in str(change.account) if ch.isalnum())
+        rows = [
+            r for r in _list_all(tid, filter_by_formula=f"{{account}}='{acct}'")
+            if (str(r["fields"].get("account", "") or "").strip(),
+                master.canonical_sku(str(r["fields"].get("sku_code", "") or "")).strip().upper())
+            == (change.account, canon)
+        ]
     today = date.today().isoformat()
     stamp = f"{BAR_PLAN_SOURCE_PREFIX}{(actor or '').strip()} {today}".strip()
     before = "none" if change.current_off is None else f"£{change.current_off:,.2f}"
@@ -2059,14 +2215,16 @@ def set_tennents_site_price(master, change, actor: str, note: str = "") -> dict:
         if abs(cur - change.new_off) < 0.005:
             return {"action": "already", "off_invoice_per_brl": change.new_off}
         old_notes = str(rows[0]["fields"].get("notes", "") or "").strip()
+        notes = (line + (" | " + old_notes if old_notes else ""))[:2000]
         _batch([{"id": rows[0]["id"], "fields": {
             "off_invoice_per_brl": change.new_off,
             "source_file": stamp,
-            "notes": (line + (" | " + old_notes if old_notes else ""))[:2000],
+            "notes": notes,
         }}], "update", tid)
         if len(rows) > 1:
             logger.warning("set_tennents_site_price: %d rows for %s — updated %s only",
-                           len(rows), want, rows[0]["id"])
+                           len(rows), (change.account, canon), rows[0]["id"])
+        _publish_site_price(master, change, rows[0]["id"], stamp, notes)
         return {"action": "updated", "off_invoice_per_brl": change.new_off}
     fields = {
         "price_key": f"{change.account}|{change.sku_code}",
@@ -2079,18 +2237,50 @@ def set_tennents_site_price(master, change, actor: str, note: str = "") -> dict:
         "notes": line,
     }
     _opt(fields, "product", change.product)
-    _batch([{"fields": fields}], "create", tid)
+    made = _batch([{"fields": fields}], "create", tid)
+    rec_id = made[0].get("id", "") if made else ""
+    _publish_site_price(master, change, rec_id, stamp, line)
     return {"action": "created", "off_invoice_per_brl": change.new_off}
+
+
+def _publish_site_price(master, change, rec_id: str, stamp: str, notes: str) -> None:
+    """Mirror a written Site_Prices row onto a COPY of the cached master and
+    publish it (the LWC publish_patched_snapshot pattern), then re-read
+    Airtable in the background. Never raises — the write has landed; a failed
+    mirror only means the page catches up on the next refresh."""
+    try:
+        from dataclasses import replace as _dc_replace
+        from tennents_master import SitePrice
+        # Patch the CACHED master where one is held (it may already carry an
+        # earlier unpublished-to-Airtable patch), else the one the caller used.
+        base = TENNENTS_CACHE.peek() or master
+        canon = master.canonical_sku(change.sku_code).strip().upper()
+        kept = [sp for sp in base.site_prices
+                if not (sp.account == change.account and master.canonical_sku(sp.sku_code).strip().upper() == canon)]
+        kept.append(SitePrice(
+            account=change.account, site_name=change.site_name, sku_code=change.sku_code,
+            product=change.product, off_invoice_per_brl=change.new_off, notes=notes,
+            rec_id=rec_id, source_file=stamp,
+        ))
+        patched = _dc_replace(base, site_prices=kept)
+        patched.reindex()
+        TENNENTS_CACHE.publish(patched)
+    except Exception:
+        logger.warning("tennents cache patch failed — the page catches up on refresh", exc_info=True)
+        invalidate_tennents_cache()
+    refresh_tennents_cache_async()
 
 
 def add_tennents_site(master, site, actor: str, note: str = "") -> dict:
     """Write ONE pub (a tennents_master.SiteInfo, already validated by
     plan_add_site) to TennentsSiteMaster. Stamped source_file
     'bar plan:<actor> <date>' so a workbook re-upload that lacks the pub keeps
-    it. Re-reads the table first and refuses an account already there (the
-    master in hand may be a few seconds old)."""
+    it. Re-reads the account from Airtable first (a filtered read, not a
+    sweep) and refuses one already there — the master in hand may be a few
+    seconds old. The cached master is patched to include the pub."""
     tid = T["TennentsSiteMaster"]
-    for r in _list_all(tid, fields=["account", "site_name"]):
+    acct = "".join(ch for ch in str(site.account) if ch.isalnum())
+    for r in _list_all(tid, fields=["account", "site_name"], filter_by_formula=f"{{account}}='{acct}'"):
         if str(r["fields"].get("account", "") or "").strip() == site.account:
             raise ValueError(f"Account {site.account} is already on the master as "
                              f"{r['fields'].get('site_name', '') or 'another pub'}")
@@ -2099,86 +2289,80 @@ def add_tennents_site(master, site, actor: str, note: str = "") -> dict:
     line = f"Added on the bar plan page {today} by {who or 'unknown'}."
     if note.strip():
         line += f" {note.strip()}"
+    stamp = f"{BAR_PLAN_SOURCE_PREFIX}{who} {today}".strip()
     fields = {
         "account": site.account,
         "site_name": site.site_name,
         "version": getattr(master, "version", "") or "",
-        "source_file": f"{BAR_PLAN_SOURCE_PREFIX}{who} {today}".strip(),
+        "source_file": stamp,
         "notes": line[:2000],
     }
     _opt(fields, "operating_model", site.operating_model)
     _opt(fields, "discount_construct", site.discount_construct)
-    _batch([{"fields": fields}], "create", tid)
+    made = _batch([{"fields": fields}], "create", tid)
+    try:
+        from dataclasses import replace as _dc_replace
+        from tennents_master import SiteInfo
+        row = SiteInfo(account=site.account, site_name=site.site_name, operating_model=site.operating_model,
+                       discount_construct=site.discount_construct, notes=line[:2000],
+                       rec_id=(made[0].get("id", "") if made else ""), source_file=stamp)
+        base = TENNENTS_CACHE.peek() or master
+        patched = _dc_replace(base, sites=list(base.sites) + [row])
+        patched.reindex()
+        TENNENTS_CACHE.publish(patched)
+    except Exception:
+        logger.warning("tennents cache patch failed — the page catches up on refresh", exc_info=True)
+        invalidate_tennents_cache()
+    refresh_tennents_cache_async()
     return {"action": "created", "account": site.account, "site_name": site.site_name}
 
 
-def list_bar_plan_changes(limit: int = 50) -> list[dict]:
-    """Site_Prices rows written from the bar plan page, newest stamp first."""
-    if "TennentsSitePrices" not in T:
+def list_bar_plan_changes(limit: int = 50, master=None) -> list[dict]:
+    """Site_Prices rows written from the bar plan page, newest stamp first —
+    read off the cached master, no Airtable call."""
+    master = master if master is not None else load_tennents_master()
+    if not getattr(master, "site_prices_present", False) and not master.site_prices:
         return []
     rows = [
-        r["fields"] for r in _list_all(T["TennentsSitePrices"])
-        if str(r["fields"].get("source_file", "") or "").startswith(BAR_PLAN_SOURCE_PREFIX)
+        {"site_name": sp.site_name, "sku_code": sp.sku_code, "product": sp.product,
+         "off_invoice_per_brl": sp.off_invoice_per_brl, "source_file": sp.source_file, "notes": sp.notes}
+        for sp in master.site_prices
+        if str(sp.source_file or "").startswith(BAR_PLAN_SOURCE_PREFIX)
     ]
     rows.sort(key=lambda f: str(f.get("source_file", ""))[-10:], reverse=True)
     return rows[:limit]
 
 
-def get_tennents_master_info() -> dict:
-    """Summary for the Tennents landing banner and the index card."""
-    version = ""
-    source_file = ""
-    latest: str | None = None
-    sku_count = 0
-    no_rate_count = 0
-    for rec in _list_all(T["TennentsSkuMaster"],
-                         fields=["sku_code", "correct_total_per_brl", "version", "source_file"]):
-        f = rec["fields"]
-        if not f.get("sku_code"):
-            continue
-        sku_count += 1
-        if f.get("correct_total_per_brl") is None:
-            no_rate_count += 1
-        version = version or f.get("version", "")
-        source_file = source_file or f.get("source_file", "")
-        ct = rec.get("createdTime")
-        if ct and (latest is None or ct > latest):
-            latest = ct
-
-    site_count = sum(
-        1 for rec in _list_all(T["TennentsSiteMaster"], fields=["account"])
-        if rec["fields"].get("account")
-    )
-    open_exceptions = 0
-    exception_count = 0
-    for rec in _list_all(T["TennentsSiteSkuExceptions"], fields=["sku_code", "status", "resolved"]):
-        f = rec["fields"]
-        if not f.get("sku_code"):
-            continue
-        exception_count += 1
-        resolved = bool(f.get("resolved")) or "resolved" in (f.get("status", "") or "").lower()
-        if not resolved:
-            open_exceptions += 1
-
+def get_tennents_master_info(master=None) -> dict:
+    """Summary for the Tennents landing banner and the index card, derived
+    from the cached master (it used to be three more table sweeps per page)."""
+    master = master if master is not None else load_tennents_master()
+    skus = [s for s in master.skus if s.sku_code]
+    source_file = next((s.source_file for s in skus if s.source_file), "")
+    latest = max((s.created_at for s in skus if s.created_at), default=None)
+    exceptions = [e for e in master.exceptions if e.sku_code_raw]
     return {
-        "version": version,
+        "version": master.version,
         "source_file": source_file,
-        "sku_count": sku_count,
-        "no_rate_count": no_rate_count,
-        "site_count": site_count,
-        "exception_count": exception_count,
-        "open_exception_count": open_exceptions,
+        "sku_count": len(skus),
+        "no_rate_count": sum(1 for s in skus if s.correct_total_per_brl is None),
+        "site_count": sum(1 for st in master.sites if st.account),
+        "exception_count": len(exceptions),
+        "open_exception_count": sum(1 for e in exceptions if not e.resolved),
         "latest_uploaded_at": latest,
     }
 
 
 def list_tennents_monthly_volumes() -> list[dict]:
-    """Latest Tennents monthly upload per period, for barrelage tracking.
+    """Latest Tennents monthly upload per period, for barrelage tracking —
+    cached like the master (upsert_file_record invalidates it)."""
+    return TENNENTS_VOLUMES_CACHE.get(_fetch_tennents_monthly_volumes)
 
-    Files carry period_month/barrels_total/tlager_barrels (set on Tennents
+
+def _fetch_tennents_monthly_volumes() -> list[dict]:
+    """Files carry period_month/barrels_total/tlager_barrels (set on Tennents
     monthly uploads). A corrected re-issue of a month supersedes the earlier
-    upload by received_at, so each period counts once.
-    """
+    upload by received_at, so each period counts once."""
     best: dict[str, dict] = {}
     for rec in _list_all(T["Files"], fields=[
         "file_name", "supplier", "received_at",
