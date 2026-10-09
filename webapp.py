@@ -109,7 +109,10 @@ from airtable_io import (  # noqa: E402
     accept_tennents_sku,
     set_tennents_site_price,
     add_tennents_site,
+    set_tennents_sku_rate,
+    add_tennents_sku,
     list_bar_plan_changes,
+    list_grid_changes,
     get_tennents_master_info,
     list_tennents_monthly_volumes,
     write_tennents_findings,
@@ -123,8 +126,10 @@ from tennents import (  # noqa: E402
     render_summary_html as render_tennents_summary_html,
 )
 from tennents_master import (  # noqa: E402
-    BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_add_site, plan_bar_plan_change,
+    BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_add_site, plan_add_sku, plan_bar_plan_change,
+    plan_sku_rate_change,
 )
+import tennents_grid  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -3177,12 +3182,13 @@ retro due exact; managed sites all off-invoice).</p>
 
 <h2>Master price file</h2>
 <div class="result" style="max-width: none">
-  <p style="margin-top:0"><strong>FB_Taverns_Tennents_Master.xlsx</strong> is the primary price file:
-  estate-wide SKU rates (<code>SKU_Master</code>), site operating models and discount constructs
-  (<code>Site_Master</code>), and per-(site, SKU) exceptions (<code>Site_SKU_Exceptions</code>).
-  The workbook is the editing surface — update it, bump the version on its README sheet, and
-  re-upload; the stored master is replaced wholesale (its README §5).</p>
-  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}" style="margin-top:0">Browse current master</a></p>
+  <p style="margin-top:0">The <strong>price grid</strong> is the editing surface, like the LWC pricing master:
+  products down, pubs across, each cell the tenant's off-invoice £/brl, with the estate-wide total discount
+  and WSP per product, and buttons to add a product or a pub. Changes reach the price files and the monthly
+  reconciliation at once. The workbook (<strong>FB_Taverns_Tennents_Master.xlsx</strong>) still carries the
+  exceptions and bespoke constructs; a re-upload keeps what was changed on the grid and lists it.</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}" style="margin-top:0">Open the price grid</a>
+  <a class="button" href="{ext_url('/tennents/master')}?view=tables" style="margin-top:0; background:#555">Workbook tables</a></p>
 </div>
 
 <h2>Team price file <span class="pill">per site</span></h2>
@@ -3199,10 +3205,12 @@ retro due exact; managed sites all off-invoice).</p>
 
 <h2>Bar plan change <span class="pill">one pub, one product</span></h2>
 <div class="result" style="max-width: none">
-  <p style="margin-top:0">When an area manager agrees a product's off-invoice with a tenant, set it here instead of
-  editing the workbook: it changes that pub's <code>Site_Prices</code> figure, the price file follows at once, and the
-  monthly reconciliation checks the pub's deliveries against it. Requires the admin role.</p>
-  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/bar-plan')}" style="margin-top:0">Make a bar plan change</a></p>
+  <p style="margin-top:0">When an area manager agrees a product's off-invoice with a tenant, type it into the pub's
+  column on the <a href="{ext_url('/tennents/master')}?edit=1">price grid</a> — or use the one-at-a-time form with its
+  before/after preview. The price file follows at once and the monthly reconciliation checks the pub's deliveries
+  against it. Requires the admin role.</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}?edit=1" style="margin-top:0">Edit the price grid</a>
+  <a class="button" href="{ext_url('/tennents/bar-plan')}" style="margin-top:0; background:#555">One change with a preview</a></p>
 </div>
 
 <form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
@@ -3220,8 +3228,11 @@ retro due exact; managed sites all off-invoice).</p>
 
 
 @app.get("/tennents/master", response_class=HTMLResponse)
-def tennents_master_view(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
-    """Read-only browse of the stored master (the workbook mirror)."""
+def tennents_master_view(request: Request, principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    """The Tennents price grid (tennents_grid.py) — products down, pubs
+    across, each cell the tenant's off-invoice £/brl; ?edit=1 (admin) edits
+    cells in place like the LWC master. ?view=tables is the old read-only
+    dump of the workbook mirror (SKU rates, sites, exceptions)."""
     try:
         master = load_tennents_master()
     except Exception:
@@ -3229,6 +3240,19 @@ def tennents_master_view(principal: DrinksPrincipal = Depends(require_drinks_rol
         return _error_page("Could not load the Tennents master from Airtable.")
     if not master.skus:
         return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    params = {k: v for k, v in request.query_params.items()}
+    if params.get("view") == "tables":
+        return _tennents_master_tables(principal, master)
+    recent = list_grid_changes(master=master) if not params.get("edit") else []
+    body = tennents_grid.render_tennents_grid(
+        master, params, is_admin=principal.is_admin,
+        banner_html=_tennents_master_banner_html(), recent=recent,
+    )
+    return f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}"
+
+
+def _tennents_master_tables(principal, master) -> HTMLResponse:
+    """Read-only browse of the stored master (the workbook mirror)."""
 
     def m(v, dash="—"):
         return f"£{v:,.2f}" if v is not None else dash
@@ -3266,11 +3290,12 @@ def tennents_master_view(principal: DrinksPrincipal = Depends(require_drinks_rol
     )
 
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
-<h1>Tennents master <span class="estate-tag">read-only</span></h1>
-<p class="sub">Mirror of <strong>FB_Taverns_Tennents_Master.xlsx</strong> — to change anything, edit the
-workbook, bump its version and re-upload it on the Tennents page. (Exceptions can also be retired by
-ticking <code>resolved</code> in Airtable once Tennents confirm a fix.)</p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/master')}">← Back to the price grid</a></p>
+<h1>Tennents master tables <span class="estate-tag">read-only</span></h1>
+<p class="sub">The stored mirror of <strong>FB_Taverns_Tennents_Master.xlsx</strong> as tables. Off-invoice
+figures, totals, WSPs and new products or pubs are edited on the <a href="{ext_url('/tennents/master')}">price grid</a>;
+exceptions and bespoke constructs still come from the workbook (exceptions can also be retired by ticking
+<code>resolved</code> in Airtable once Tennents confirm a fix).</p>
 {_tennents_master_banner_html()}
 
 <h2>SKU rates <span class="pill">{len(master.skus)}</span></h2>
@@ -3453,6 +3478,24 @@ def upload_tennents_master(
             f"Put the same figures on its <code>Site_Prices</code> sheet, or change them on that page if the workbook is right."
             f"<ul>{items}</ul></div>"
         )
+    rates_kept = bar_plan_report.get("sku_rates") or []
+    if rates_kept:
+        def _rk(k) -> str:
+            bits = []
+            if k.get("correct_total_per_brl") is not None:
+                bits.append(f"total £{k['correct_total_per_brl']:,.2f}/brl"
+                            + (f" (this workbook says £{k['workbook_total']:,.2f})" if k.get("workbook_total") is not None
+                               else " (no rate in this workbook)"))
+            if k.get("wsp_per_brl") is not None:
+                bits.append(f"WSP £{k['wsp_per_brl']:,.2f}/brl"
+                            + (f" (this workbook says £{k['workbook_wsp']:,.2f})" if k.get("workbook_wsp") is not None
+                               else " (no WSP in this workbook)"))
+            return f"<li>{escape(str(k.get('product') or k.get('sku_code', '')))} ({escape(str(k.get('sku_code', '')))}): {'; '.join(bits)}</li>"
+        preserved_note += (
+            f"<div class='result'><strong>{len(rates_kept)} product rate(s) set on the price grid kept over this workbook</strong>"
+            f" — put the same figures on its <code>SKU_Master</code> sheet, or change them on the grid if the workbook is right."
+            f"<ul>{''.join(_rk(k) for k in rates_kept)}</ul></div>"
+        )
     if sites_kept:
         items = "".join(
             f"<li>{escape(str(k.get('site_name', '')))} (account {escape(str(k.get('account', '')))})</li>"
@@ -3631,13 +3674,179 @@ async def tennents_bar_plan_add_site(
            "It is now in the pub list: set each product it sells (off-invoice £ per barrel). Until a product has a "
            "figure, it isn't on the pub's price file.")
     return f"""{render_head(principal.email, principal.role)}
-<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/bar-plan')}">← Bar plan change</a></p>
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/master')}">← Price grid</a></p>
 <h1>Added: {escape(site.site_name)}</h1>
 <div class="result">{escape(site.site_name)} is on the master under Tennents account {escape(site.account)}
 ({escape(site.operating_model)}, {escape(site.discount_construct)}). {nxt}</div>
-<p><a class="button" href="{ext_url('/tennents/bar-plan')}">Set its products</a></p>
+<p><a class="button" href="{ext_url('/tennents/master')}?edit=1&site={quote(site.account)}">Set its products on the grid</a>
+<a class="button" href="{ext_url('/tennents/bar-plan')}" style="background:#555">Bar plan form</a></p>
 <p class="sub">If you also keep the master workbook, add the same row to its <code>Site_Master</code> sheet: a re-upload
 keeps this pub only while the workbook lacks it, and lists it on the upload page.</p>
+{PAGE_FOOT}"""
+
+
+def _grid_back(form: dict, saved: bool) -> str:
+    qs = [("edit", "1")]
+    if saved:
+        qs.insert(0, ("saved", "1"))
+    for k, name in (("fsite", "site"), ("fq", "q"), ("fmanaged", "managed")):
+        if form.get(k):
+            qs.append((name, form[k]))
+    return ext_url("/tennents/master") + "?" + urlencode(qs)
+
+
+@app.post("/tennents/cell/apply")
+async def tennents_cell_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """ONE price-grid cell: the tenant's off-invoice £/brl for a product at a
+    pub. The same validation and write as the bar plan form
+    (plan_bar_plan_change → set_tennents_site_price); an empty cell means £0
+    (off the price file). ajax=1 returns JSON for the grid's save driver;
+    otherwise 303 back to the grid (the no-JS Enter path)."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    f = {k: (form.get(k) or "").strip() for k in ("account", "sku_code", "off_invoice", "note", "fsite", "fq", "fmanaged")}
+    wants_json = (form.get("ajax") or "").strip() == "1"
+    off = f["off_invoice"] or "0"
+
+    def _fail(msg: str, status: int = 400):
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": [msg]}, status_code=status)
+        return _error_page(escape(msg))
+
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _fail("Could not load the Tennents master from Airtable.", 500)
+    try:
+        change = plan_bar_plan_change(master, f["account"], f["sku_code"], off)
+        result = await run_in_threadpool(set_tennents_site_price, master, change, principal.email, f["note"])
+    except ValueError as e:
+        return _fail(str(e))
+    except Exception:
+        logger.exception("tennents cell apply failed")
+        return _fail("Could not update the price master — the details have been logged. Reload the grid to "
+                     "see whether the figure landed before trying again.", 500)
+    saved = result["action"] != "already"
+    if wants_json:
+        return JSONResponse({"ok": True, "saved": saved, "off_invoice": change.new_off,
+                            "retro": change.new_retro, "warnings": change.warnings})
+    return RedirectResponse(_grid_back(f, saved), status_code=303)
+
+
+@app.post("/tennents/product-cell/apply")
+async def tennents_product_cell_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    """ONE product row's WSP / Total cells on the price grid: the agreed total
+    discount (estate-wide) and the WSP, through plan_sku_rate_change →
+    set_tennents_sku_rate. A blank total leaves a RATE-TBC row as it is."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    f = {k: (form.get(k) or "").strip() for k in ("sku_code", "total", "wsp", "note", "fsite", "fq", "fmanaged")}
+    wants_json = (form.get("ajax") or "").strip() == "1"
+
+    def _fail(msg: str, status: int = 400):
+        if wants_json:
+            return JSONResponse({"ok": False, "errors": [msg]}, status_code=status)
+        return _error_page(escape(msg))
+
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _fail("Could not load the Tennents master from Airtable.", 500)
+    try:
+        change = plan_sku_rate_change(master, f["sku_code"], f["total"], f["wsp"])
+        result = await run_in_threadpool(set_tennents_sku_rate, master, change, principal.email, f["note"])
+    except ValueError as e:
+        return _fail(str(e))
+    except Exception:
+        logger.exception("tennents product cell apply failed")
+        return _fail("Could not update the price master — the details have been logged. Reload the grid to "
+                     "see whether the figure landed before trying again.", 500)
+    saved = result["action"] != "already"
+    if wants_json:
+        return JSONResponse({"ok": True, "saved": saved, "warnings": change.warnings})
+    return RedirectResponse(_grid_back(f, saved), status_code=303)
+
+
+def _product_form_html(code: str = "", product: str = "", container: str = "", total: str = "",
+                       wsp: str = "", note: str = "") -> str:
+    return f"""<form action="{ext_url('/tennents/product/new')}" method="post" style="max-width: 640px">
+  <label for="np-code">Tennents product code (as the monthly report prints it)</label>
+  <input type="text" name="sku_code" id="np-code" value="{escape(code)}" required maxlength="32">
+  <label for="np-name">Product name (as it should appear on the price files)</label>
+  <input type="text" name="product" id="np-name" value="{escape(product)}" required maxlength="80">
+  <label for="np-cont">Container (e.g. 11G, 50L, 30L / 50L)</label>
+  <input type="text" name="container" id="np-cont" value="{escape(container)}" maxlength="40">
+  <label for="np-wsp">WSP, £ per barrel (leave blank if not known)</label>
+  <input type="text" name="wsp" id="np-wsp" value="{escape(wsp)}" inputmode="decimal">
+  <label for="np-total">Agreed total discount, £ per barrel (leave blank for RATE TBC — no pub can be given
+  an off-invoice until it is set)</label>
+  <input type="text" name="total" id="np-total" value="{escape(total)}" inputmode="decimal">
+  <label for="np-note">Note (who agreed it, e.g. "Tennents email 7 Oct")</label>
+  <input type="text" name="note" id="np-note" value="{escape(note)}" maxlength="300">
+  <button type="submit">Add the product</button>
+</form>"""
+
+
+@app.get("/tennents/product/new", response_class=HTMLResponse)
+def tennents_product_new(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/master')}?edit=1">← Price grid</a></p>
+<h1>Add a product</h1>
+<p class="sub">A product new to the Tennents master: one row on <code>SKU_Master</code> with its code, name and
+the estate-wide total discount. Then give each pub that sells it an off-invoice figure on the grid. (A product
+the monthly report shows under a NEW CODE for an existing SKU is linked as an alt code from the findings page,
+not added here.)</p>
+{_product_form_html()}
+{PAGE_FOOT}"""
+
+
+@app.post("/tennents/product/new", response_class=HTMLResponse)
+async def tennents_product_new_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    f = {k: (form.get(k) or "").strip() for k in ("sku_code", "product", "container", "total", "wsp", "note")}
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    try:
+        sku = plan_add_sku(master, f["sku_code"], f["product"], f["container"], f["total"], f["wsp"])
+        await run_in_threadpool(add_tennents_sku, master, sku, principal.email, f["note"])
+    except ValueError as e:
+        return HTMLResponse(f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/master')}?edit=1">← Price grid</a></p>
+<h1>Add a product</h1>
+<div class="result err">{escape(str(e))}</div>
+{_product_form_html(f["sku_code"], f["product"], f["container"], f["total"], f["wsp"], f["note"])}
+{PAGE_FOOT}""", status_code=400)
+    except Exception:
+        logger.exception("tennents add product failed")
+        return _error_page("Could not add the product — the details have been logged. Check whether it now appears "
+                           "on the grid before trying again.")
+    return RedirectResponse(ext_url("/tennents/master") + "?" + urlencode([("saved", "1"), ("edit", "1"), ("q", sku.sku_code)]),
+                            status_code=303)
+
+
+@app.get("/tennents/pub/new", response_class=HTMLResponse)
+def tennents_pub_new(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/master')}?edit=1">← Price grid</a></p>
+{_add_site_form_html()}
 {PAGE_FOOT}"""
 
 

@@ -715,6 +715,134 @@ def plan_add_site(master: TennentsMaster, account: str, site_name: str,
     )
 
 
+def _parse_gbp(v, what: str, allow_blank: bool = False) -> float | None:
+    """A £ figure typed on the price grid → float (2dp); None for a blank when
+    allowed. Raises ValueError with a sentence for the operator."""
+    raw = str(v if v is not None else "").replace("£", "").replace(",", "").strip()
+    if not raw:
+        if allow_blank:
+            return None
+        raise ValueError(f"{what} must be a figure in £ per barrel")
+    try:
+        x = float(raw)
+    except ValueError:
+        raise ValueError(f"{what} must be a figure in £ per barrel") from None
+    if x != x or x in (float("inf"), float("-inf")):
+        raise ValueError(f"{what} must be a figure in £ per barrel")
+    if x < 0:
+        raise ValueError(f"{what} can't be negative")
+    return round(x, 2)
+
+
+@dataclass
+class SkuRateChange:
+    """A product-level edit from the price grid, before it is written: the
+    agreed total discount (and optionally the WSP) for ONE SKU, estate-wide."""
+    sku_code: str
+    product: str
+    old_total: float | None
+    new_total: float | None        # None = still RATE TBC (a blank total on a TBC row)
+    old_wsp: float | None
+    new_wsp: float | None          # None = leave the WSP as it is
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def total_changed(self) -> bool:
+        if self.new_total is None:
+            return False
+        return self.old_total is None or abs(self.old_total - self.new_total) > 0.005
+
+    @property
+    def wsp_changed(self) -> bool:
+        if self.new_wsp is None:
+            return False
+        return self.old_wsp is None or abs(self.old_wsp - self.new_wsp) > 0.005
+
+    @property
+    def unchanged(self) -> bool:
+        return not self.total_changed and not self.wsp_changed
+
+
+def plan_sku_rate_change(master: TennentsMaster, sku_code: str, total, wsp=None) -> SkuRateChange:
+    """Validate a product-level edit from the price grid: the agreed total
+    discount £/brl (SKU_Master CURRENT CORRECT) and, when given, the WSP.
+
+    The total is ESTATE-WIDE — every pub's retro is total − its off-invoice —
+    so a total below any pub's current off-invoice would make that pub's retro
+    negative and is refused, naming the pubs. Lowering the total within the
+    off-invoices is allowed and warned (every pub's retro shrinks). A blank
+    total keeps the current one (so a WSP can be set on its own); a blank WSP
+    means leave it; a WSP below the total is refused (the net keg price would
+    be below zero)."""
+    sku = master.find_sku(sku_code)
+    if sku is None:
+        raise ValueError(f"Product {str(sku_code).strip()!r} is not on SKU_Master")
+    old_total = None if sku.correct_total_per_brl is None else round(float(sku.correct_total_per_brl), 2)
+    old_wsp = None if sku.wsp_per_brl is None else round(float(sku.wsp_per_brl), 2)
+    new_total = _parse_gbp(total, "Total discount", allow_blank=True)
+    if new_total is None:
+        new_total = old_total
+    new_wsp = _parse_gbp(wsp, "WSP", allow_blank=True)
+    if new_total is not None:
+        over = sorted(
+            (sp.site_name or sp.account, round(float(sp.off_invoice_per_brl or 0.0), 2))
+            for sp in master.site_prices
+            if master.canonical_sku(sp.sku_code).strip().upper() == sku.sku_code.strip().upper()
+            and float(sp.off_invoice_per_brl or 0.0) > new_total + 0.005
+        )
+        if over:
+            named = ", ".join(f"{n} (£{o:,.2f})" for n, o in over[:6]) + (" …" if len(over) > 6 else "")
+            raise ValueError(f"Total £{new_total:,.2f}/brl is below the off-invoice already given at {named} — "
+                             "FB's retro there would be negative. Lower those pubs first, or keep the total")
+    wsp_now = new_wsp if new_wsp is not None else old_wsp
+    if wsp_now is not None and new_total is not None and wsp_now + 0.005 < new_total:
+        raise ValueError(f"Total discount £{new_total:,.2f}/brl is more than the WSP £{wsp_now:,.2f}/brl")
+    warnings: list[str] = []
+    if old_total is not None and new_total is not None and new_total + 0.005 < old_total:
+        warnings.append(f"Lowering the total from £{old_total:,.2f} to £{new_total:,.2f}/brl shrinks FB's retro "
+                        "at every pub selling this product (their off-invoice figures stay as they are)")
+    return SkuRateChange(sku_code=sku.sku_code, product=sku.product or sku.brand,
+                         old_total=old_total, new_total=new_total, old_wsp=old_wsp, new_wsp=new_wsp,
+                         warnings=warnings)
+
+
+def plan_add_sku(master: TennentsMaster, sku_code: str, product: str, container: str = "",
+                 total=None, wsp=None, brand: str = "") -> SkuRate:
+    """Validate a product to add to SKU_Master from the price grid and return
+    the row to write. The code is Tennents' product code as the monthly report
+    prints it; the total is the agreed estate-wide discount (blank = RATE TBC,
+    so no pub can be given an off-invoice until it is set)."""
+    code = str(sku_code or "").strip().upper()
+    if not code or len(code) > 32 or not all(ch.isalnum() or ch in "._-" for ch in code):
+        raise ValueError("Give the product's Tennents code as the monthly report prints it (e.g. 401211)")
+    if "/" in str(sku_code or ""):
+        raise ValueError("One code per product — a second container's code can be linked as an alt code "
+                         "from the findings page")
+    name = " ".join(str(product or "").split())
+    if not name:
+        raise ValueError("Give the product's name as it should appear on the price files")
+    if len(name) > 80:
+        raise ValueError("The product's name is too long (80 characters at most)")
+    existing = master.find_sku(code)
+    if existing is not None:
+        raise ValueError(f"Code {code} is already on the master as {existing.product or existing.brand} "
+                         f"({existing.sku_code}{' / ' + existing.alt_code if existing.alt_code else ''})")
+    clash = next((k for k in master.skus if (k.product or "").strip().upper() == name.upper()
+                  and (k.container or "").strip().upper() == str(container or "").strip().upper()), None)
+    if clash is not None:
+        raise ValueError(f"{clash.product} {clash.container} is already on the master under code {clash.sku_code}")
+    new_total = _parse_gbp(total, "Total discount", allow_blank=True)
+    new_wsp = _parse_gbp(wsp, "WSP", allow_blank=True)
+    if new_total is not None and new_wsp is not None and new_wsp + 0.005 < new_total:
+        raise ValueError(f"Total discount £{new_total:,.2f}/brl is more than the WSP £{new_wsp:,.2f}/brl")
+    return SkuRate(
+        sku_code=code, alt_code="", brand=" ".join(str(brand or "").split()), product=name,
+        container=" ".join(str(container or "").split()), brl_per_unit=None, abv=None,
+        wsp_per_brl=new_wsp, contract_base_per_brl=new_total, on_contract=False, supplier_type="",
+        hold_per_brl=0.0, correct_total_per_brl=new_total,
+    )
+
+
 def expected_off_invoice(master: TennentsMaster, account: str, sku_code: str,
                          total_charged: float) -> tuple[float | None, str]:
     """The off-invoice £/brl our file says Tennents should be giving the tenant

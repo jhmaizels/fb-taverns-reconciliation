@@ -78,9 +78,10 @@ class FakeIO:
         self.sweeps.append((table_id, filter_by_formula or ""))
         rows = self.tables.setdefault(table_id, [])
         if filter_by_formula:
-            # {account}='x'
+            # {field}='value'
+            fld = filter_by_formula.split("{")[1].split("}")[0]
             val = filter_by_formula.split("'")[1]
-            rows = [r for r in rows if str(r["fields"].get("account", "")) == val]
+            rows = [r for r in rows if str(r["fields"].get(fld, "")) == val]
         return [{"id": r["id"], "fields": dict(r["fields"]), "createdTime": r.get("createdTime", "")} for r in rows]
 
     def batch(self, records, op, table_id):
@@ -101,8 +102,10 @@ class FakeIO:
                 out.append(r)
         return out
 
-    def wipe(self, table_id):
+    def wipe(self, table_id, *_a, **_k):
+        n = len(self.tables.get(table_id, []))
         self.tables[table_id] = []
+        return n
 
 
 def _install(fake: FakeIO):
