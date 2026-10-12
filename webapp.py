@@ -3203,6 +3203,14 @@ retro due exact; managed sites all off-invoice).</p>
   </p>
 </div>
 
+<h2>Tennents pricer <span class="pill">for David Simpson</span></h2>
+<div class="result" style="max-width: none">
+  <p style="margin-top:0">Tennents' own <strong>FB TAVERNS - PRICER</strong>, the layout their Pricing team loads,
+  filled in from the master with each pub's off-invoice. Send this to David after a bar plan change; it lists
+  anything his file cannot carry before you download.</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/pricer')}" style="margin-top:0">Tennents pricer for a pub</a></p>
+</div>
+
 <h2>Bar plan change <span class="pill">one pub, one product</span></h2>
 <div class="result" style="max-width: none">
   <p style="margin-top:0">When an area manager agrees a product's off-invoice with a tenant, type it into the pub's
@@ -3361,6 +3369,123 @@ def tennents_prices_index(principal: DrinksPrincipal = Depends(require_drinks_ro
 <table><thead><tr><th>Site</th><th>Tennents account</th><th>Price file</th></tr></thead>
 <tbody>{rows}</tbody></table>
 {PAGE_FOOT}"""
+
+
+@app.get("/tennents/pricer", response_class=HTMLResponse)
+def tennents_pricer_page(
+    site: str | None = None,
+    principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
+):
+    """Tennents' own pricer for a pub (the layout David Simpson's Pricing team
+    loads), filled from the master: what it will carry, what it cannot, then
+    the download. tennents_pricer.py holds the rules."""
+    from tennents_price_export import find_site, list_site_choices
+    from tennents_pricer import check_pricer
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    target = find_site(master, site) if site else None
+    if site and target is None:
+        return _error_page(f"No Tennents site matches {escape(site)!r}.")
+    if target is None:
+        options = "".join(f'<option value="{escape(a)}">{escape(n)}</option>' for a, n in list_site_choices(master))
+        return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
+<h1>Tennents pricer <span class="estate-tag">for David Simpson</span></h1>
+<p class="sub">Tennents' own &ldquo;FB TAVERNS - PRICER&rdquo; layout, the one their Pricing team loads, filled in
+from the price master: the pub's off-invoice per product. WSP and total discount stay as Tennents sent them.</p>
+<form method="get" action="{ext_url('/tennents/pricer')}">
+  <label>Pub <select name="site">{options}</select></label>
+  <button type="submit">Check and download</button>
+</form>
+<p><a href="{ext_url('/tennents/pricer/download?format=zip')}">Every pub as a .zip</a></p>
+{PAGE_FOOT}"""
+    try:
+        check = check_pricer(master, target)
+    except Exception:
+        logger.exception("tennents pricer check failed")
+        return _error_page("Could not read the Tennents pricer template — the details have been logged.")
+
+    def _gbp(v):
+        return "" if v is None else f"£{v:,.2f}"
+
+    warn = []
+    if check.not_on_pricer:
+        items = "".join(f"<li>{escape(s.product or s.brand)} ({escape(s.sku_code)}): off-invoice {_gbp(off)}/brl</li>"
+                        for s, off in check.not_on_pricer)
+        warn.append("<p><strong>Sold here but not on Tennents' pricer.</strong> Their file has no row for these, "
+                    "so ask David to add them (and give him the figure) in the same email, or they stay at no "
+                    f"discount:</p><ul>{items}</ul>")
+    if check.total_differs:
+        items = "".join(f"<li>{escape(ln.brand)}: Tennents {_gbp(ln.tennents_total)}/brl, our master "
+                        f"{_gbp(ln.master_total)}/brl</li>" for ln in check.total_differs)
+        warn.append("<p><strong>Total discount differs.</strong> The pricer keeps Tennents' figure, so the retro it "
+                    f"shows is not the one we expect. Settle which is right before sending:</p><ul>{items}</ul>")
+    if check.off_above_total:
+        items = "".join(f"<li>{escape(ln.brand)}: off-invoice {_gbp(ln.off)} against Tennents' total "
+                        f"{_gbp(ln.tennents_total)}</li>" for ln in check.off_above_total)
+        warn.append(f"<p><strong>Off-invoice above the total discount</strong> (negative retro):</p><ul>{items}</ul>")
+    warn_html = (f'<div class="result" style="max-width:none; border-left:4px solid #b26a00; background:#fff4e5">'
+                 f'{"".join(warn)}</div>') if warn else ""
+    rows = "".join(
+        f"<tr><td>{escape(ln.code)}</td><td>{escape(ln.brand)}</td><td>{_gbp(ln.tennents_total)}</td>"
+        f"<td>{_gbp(ln.off) or '—'}</td>"
+        f"<td>{'' if ln.off is None or ln.tennents_total is None else _gbp(ln.tennents_total - ln.off)}</td>"
+        f"<td>{'' if ln.sku else 'not in our master; left as sent'}</td></tr>"
+        for ln in check.lines)
+    acct = quote(target.account)
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/pricer')}">← Another pub</a></p>
+<h1>Tennents pricer: {escape(target.site_name)} <span class="estate-tag">{escape(target.account)}</span></h1>
+<p class="sub">{len(check.filled)} products carry an off-invoice; blank means not sold here. The file opens with
+the password Tennents use, and the date on it is today's.</p>
+{warn_html}
+<p><a class="button" href="{ext_url('/tennents/pricer/download?site=' + acct)}">Download the pricer for {escape(target.site_name)}</a></p>
+<table><thead><tr><th>Sku Code</th><th>Brand</th><th>Tennents total £/brl</th><th>Off-invoice £/brl</th>
+<th>FB retro £/brl</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+{PAGE_FOOT}"""
+
+
+@app.get("/tennents/pricer/download")
+def tennents_pricer_download(
+    site: str | None = None,
+    format: str | None = None,
+    principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
+):
+    """The filled pricer: one pub (?site=) or every pub as a .zip (?format=zip)."""
+    from tennents_price_export import _sites_in_scope, find_site
+    from tennents_pricer import build_pricer_bytes, build_pricer_zip_bytes, pricer_filename
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    today = date.today().isoformat()
+    try:
+        if format == "zip":
+            return Response(
+                content=build_pricer_zip_bytes(master, _sites_in_scope(master)),
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="FB_TAVERNS_PRICERS_{today}.zip"'},
+            )
+        target = find_site(master, site or "")
+        if target is None:
+            return _error_page(f"No Tennents site matches {escape(site or '')!r}.")
+        data, _ = build_pricer_bytes(master, target)
+        return Response(
+            content=data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": _attachment_disposition(pricer_filename(target))},
+        )
+    except Exception:
+        logger.exception("tennents pricer build failed")
+        return _error_page("Could not build the Tennents pricer — the details have been logged.")
 
 
 @app.get("/tennents/export-prices")
@@ -3989,6 +4114,7 @@ From now on the monthly Tennents reconciliation checks this pub's deliveries of 
 {_bar_plan_change_table(change) if result["action"] != "already" else ""}
 <p>
   <a class="button" href="{ext_url('/tennents/export-prices?site=' + quote(change.account))}">Download {escape(change.site_name)} price file</a>
+  <a class="button" href="{ext_url('/tennents/pricer?site=' + quote(change.account))}">Tennents pricer for {escape(change.site_name)}</a>
   <a class="button" href="{ext_url('/tennents/bar-plan')}" style="background:#666">Another change</a>
 </p>
 <p class="sub">If you also keep the master workbook, put the same figure on its <code>Site_Prices</code> sheet: a re-upload

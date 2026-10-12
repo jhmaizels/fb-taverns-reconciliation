@@ -87,6 +87,16 @@ Module map:
   volume fields), then load the workbook from the CLI.
 - `tennents_price_export.py` — read-only builder for the team-facing per-site
   Tennents price file (master workbook / single site / zip), master-driven.
+- `tennents_pricer.py` — fills Tennents' OWN "FB TAVERNS - PRICER" layout (the
+  file their Pricing team loads; David Simpson, 9 Oct 2026) for a pub from the
+  master: pub name J2, date L2, tenant off-invoice in column J of "BDM Copy".
+  Tennents' WSP and total discount are left as sent; a total that differs from
+  SKU_Master, an off-invoice above it, and a product the pub sells with no row
+  on the pricer are listed on `/tennents/pricer` before the download
+  (`/tennents/pricer/download`, one pub or `?format=zip`). The template lives
+  unlocked in `pricer_template/`; the download is locked again with the
+  password Tennents use (`TENNENTS_PRICER_PASSWORD` overrides, empty = unlocked).
+  When Tennents send a new pricer (new WSP, new rows), replace the template file.
 - `seed_tennents_site_prices.py` — one-off: seed the per-site off-invoice
   `Site_Prices` layer into the master workbook from the team's price files.
 
