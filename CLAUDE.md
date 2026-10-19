@@ -325,6 +325,14 @@ Key facts:
   read-only tables are `?view=tables`; `/tennents/bar-plan` (one change with
   a before/after preview) still works and the home page offers both. Every
   write patches the cached master (see §10) so the next page shows it.
+- **`GET /tennents/july-restore`** → `POST /tennents/july-restore/apply` (admin,
+  cross-origin checked, 2026-10-19): the 45 July 2026 off-invoice deals the
+  `Site_Prices` seed stored as £0 (its keg-contradiction rule; listed in
+  `tennents_july_restore.JULY_ZEROED_DEALS`), so they dropped off the pubs'
+  price files (Nick Madigan: Corner House, Real McCoy, Hazel Arms). The page
+  judges each against today's master; one press writes the rows still at £0
+  through `set_tennents_site_price` (bar-plan stamped). A figure set since July
+  is left alone. Once pressed the page shows "Nothing left to restore".
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 

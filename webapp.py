@@ -125,6 +125,7 @@ from tennents import (  # noqa: E402
     reconcile as reconcile_tennents,
     render_summary_html as render_tennents_summary_html,
 )
+from tennents_july_restore import RESTORE_NOTE, plan_july_restore  # noqa: E402
 from tennents_master import (  # noqa: E402
     BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_add_site, plan_add_sku, plan_bar_plan_change,
     plan_sku_rate_change,
@@ -3219,6 +3220,8 @@ retro due exact; managed sites all off-invoice).</p>
   against it. Requires the admin role.</p>
   <p style="margin-bottom:0"><a class="button" href="{ext_url('/tennents/master')}?edit=1" style="margin-top:0">Edit the price grid</a>
   <a class="button" href="{ext_url('/tennents/bar-plan')}" style="margin-top:0; background:#555">One change with a preview</a></p>
+  <p class="sub" style="margin-bottom:0">Off-invoice deals from the July 2026 price file that the master stored as £0:
+  <a href="{ext_url('/tennents/july-restore')}">put them back</a>.</p>
 </div>
 
 <form action="{ext_url('/upload-tennents-master')}" method="post" enctype="multipart/form-data" style="max-width: 540px; margin-top: 1em">
@@ -4119,6 +4122,113 @@ From now on the monthly Tennents reconciliation checks this pub's deliveries of 
 </p>
 <p class="sub">If you also keep the master workbook, put the same figure on its <code>Site_Prices</code> sheet: a re-upload
 keeps this change only while the workbook disagrees, and lists it on the upload page.</p>
+{PAGE_FOOT}"""
+
+
+_RESTORE_STATUS = {
+    "restore": "To restore",
+    "already": "Already on the master",
+    "changed": "Changed since July — left alone",
+    "refused": "Cannot restore",
+}
+
+
+def _july_restore_table(lines) -> str:
+    rows = []
+    for ln in lines:
+        ch = ln.change
+        cur = "no row" if ln.current_off is None else _gbp(ln.current_off)
+        retro = _gbp(ch.new_retro) if ch is not None else ""
+        net = _gbp(ch.net_keg(ch.new_off)) if ch is not None else ""
+        why = escape(ln.reason) if ln.reason else ""
+        if ch is not None and ch.warnings:
+            why = escape("; ".join(ch.warnings))
+        rows.append(
+            f"<tr><td>{escape(ln.site_name)}</td><td>{escape(ln.product)}"
+            f"<br><span class='sub'>{escape(ln.sku_code or ln.july_code)}</span></td>"
+            f"<td>{_gbp(ln.july_off)}</td><td>{cur}</td><td>{retro}</td><td>{net}</td>"
+            f"<td><strong>{_RESTORE_STATUS[ln.status]}</strong>"
+            f"{'<br><span class=sub>' + why + '</span>' if why else ''}</td></tr>"
+        )
+    return ("<table><thead><tr><th>Pub</th><th>Product</th><th>July off-invoice £/brl</th><th>Master now</th>"
+            "<th>FB retro after</th><th>Net keg after</th><th>Status</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+
+
+@app.get("/tennents/july-restore", response_class=HTMLResponse)
+def tennents_july_restore(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    """Preview the July 2026 off-invoice deals the Site_Prices seed stored as £0
+    (tennents_july_restore.py) against today's master. Nothing is written here."""
+    try:
+        master = load_tennents_master()
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    if not master.skus:
+        return _error_page("No Tennents master loaded yet — upload FB_Taverns_Tennents_Master.xlsx first.")
+    lines = plan_july_restore(master)
+    n = sum(1 for ln in lines if ln.status == "restore")
+    button = (
+        f"""<form action="{ext_url('/tennents/july-restore/apply')}" method="post">
+  <button type="submit">Restore {n} deal{'s' if n != 1 else ''} to the price master</button>
+</form>
+<p class="sub">Each line is written exactly as a bar plan change would write it (stamped with your name and kept over a
+workbook re-upload). Lines already on the master, or changed since July, are not touched.</p>""" if n else
+        "<div class='result'>Nothing left to restore.</div>"
+    )
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents')}">← Back to Tennents</a></p>
+<h1>July 2026 off-invoice deals <span class="estate-tag">stored as £0</span></h1>
+<p class="sub">When the per-site off-invoice figures were first loaded from the July 2026 price file, a figure went in only
+if that sheet's own net keg price reflected it; these {len(lines)} lines did not, so they were stored as £0. A pub's
+price file lists a product only when its off-invoice is above £0, so they dropped off (Corner House, Real McCoy, Hazel
+Arms and others). Tennents' September report shows the deals still being given. Check the figures below, then press
+the button once.</p>
+{_tennents_master_banner_html()}
+{button}
+{_july_restore_table(lines)}
+{PAGE_FOOT}"""
+
+
+@app.post("/tennents/july-restore/apply", response_class=HTMLResponse)
+async def tennents_july_restore_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    try:
+        master = await run_in_threadpool(load_tennents_master)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the Tennents master from Airtable.")
+    lines = [ln for ln in plan_july_restore(master) if ln.status == "restore"]
+    done, failed = [], []
+    for ln in lines:
+        try:
+            r = await run_in_threadpool(set_tennents_site_price, master, ln.change, principal.email, RESTORE_NOTE)
+            done.append((ln, r["action"]))
+        except Exception as e:
+            logger.exception("july restore failed for %s %s", ln.account, ln.sku_code)
+            failed.append((ln, str(e) if isinstance(e, ValueError) else "write failed — logged"))
+    pubs = sorted({(ln.account, ln.change.site_name) for ln, _ in done})
+    links = "".join(
+        f"<li>{escape(name)}: <a href=\"{ext_url('/tennents/export-prices?site=' + quote(acct))}\">price file</a> · "
+        f"<a href=\"{ext_url('/tennents/pricer?site=' + quote(acct))}\">Tennents pricer</a></li>"
+        for acct, name in pubs
+    )
+    fail_html = "".join(
+        f"<div class='result err'>{escape(ln.site_name)}, {escape(ln.product)}: {escape(msg)}</div>"
+        for ln, msg in failed
+    )
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/tennents/july-restore')}">← Back to the July deals</a></p>
+<h1>Restored {len(done)} of {len(lines)} July deals</h1>
+{fail_html}
+<div class="result">Written to the price master. From now on the price files list these products and the monthly
+reconciliation checks each pub's split against these figures.</div>
+<h2>Price files for the pubs changed</h2>
+<ul>{links}</ul>
 {PAGE_FOOT}"""
 
 
