@@ -184,7 +184,7 @@ def test_render():
     _check("edit button for admin, no inputs in read mode", "Edit prices" in html and 'name="off_invoice"' not in html)
     _check("Gartocher's bespoke construct in its header", "flat £200/brl" in html)
     html_v = tennents_grid.render_tennents_grid(m, {}, is_admin=False)
-    _check("viewer gets no edit button", "Edit prices" not in html_v and 'id="grid-save"' not in html_v)
+    _check("viewer gets no edit button", "Edit prices" not in html_v and 'id="grid-done"' not in html_v)
 
     html_m = tennents_grid.render_tennents_grid(m, {"managed": "1"}, is_admin=True)
     _check("managed pub shown on request, all off", "MANAGED HOUSE" in html_m and "all off" in html_m)
@@ -196,7 +196,7 @@ def test_render():
     _check("edit mode: WSP and Total inputs in one form", 'name="wsp"' in html_e and 'name="total" form="pcell-0"' in html_e)
     heads_e = html_e[html_e.index("<thead>"):html_e.index("</thead>")]
     _check("edit mode: product filter kept, one pub", 'pcell-1' not in html_e and "GARTOCHER" not in heads_e and "BELL ROCK" in heads_e)
-    _check("edit mode: buttons", "+ Add product" in html_e and "+ Add pub" in html_e and "grid-save" in html_e)
+    _check("edit mode: buttons", "+ Add product" in html_e and "+ Add pub" in html_e and "grid-done" in html_e and "grid-save" not in html_e)
     _check("filters ride the cell forms", 'name="fsite" value="11110001"' in html_e and 'name="fq" value="lager"' in html_e)
     html_t = tennents_grid.render_tennents_grid(m, {"edit": "1", "q": "stout"}, is_admin=True)
     _check("RATE TBC row: cells disabled until the total is set", "disabled" in html_t and "set the product" in html_t)

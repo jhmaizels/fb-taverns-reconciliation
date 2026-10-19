@@ -16,7 +16,7 @@ and airtable_io's writers:
   + Add pub              → GET  /tennents/pub/new
 
 Edit mode reuses the LWC grid's machinery (form.cellf + input.cell-input,
-dirty highlighting, "Save changes" posting each dirty form with ajax=1 and
+dirty highlighting, "Save & finish" posting each dirty form with ajax=1 and
 reading JSON) and the same CSS classes, so the two grids look and behave the
 same. The pricing structure differs and the grid says so: there is ONE
 estate-wide total discount per product (the Total column, editable in edit
@@ -98,13 +98,12 @@ def render_tennents_grid(master: TennentsMaster, params: dict, is_admin: bool,
     if not is_admin:
         edit_btns = ""
     elif edit:
-        save_reload = base + _qs(saved="1", edit="1", site=site_f, q=q, managed=mg)
+        saved_href = base + _qs(saved="1", site=site_f, q=q, managed=mg)
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/tennents/product/new")}">+ Add product</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/tennents/pub/new")}">+ Add pub</a>'
-            f'<button type="button" id="grid-save" class="button" style="margin-top:0; background:#1b5e20" '
-            f'data-reload="{escape(save_reload, quote=True)}" disabled>Save changes</button>'
             f'<a class="button" id="grid-done" style="margin-top:0; background:#666" '
+            f'data-saved="{escape(saved_href, quote=True)}" '
             f'href="{base}{_qs(site=site_f, q=q, managed=mg)}">Done editing</a>'
         )
     else:
@@ -144,7 +143,7 @@ def render_tennents_grid(master: TennentsMaster, params: dict, is_admin: bool,
     edit_help = (
         '<p class="help" style="margin-top:0">Editing works like the spreadsheet: '
         '<strong>type off-invoice figures into as many cells as you like</strong>, then press '
-        '<strong>Save changes</strong> to commit them all · <strong>clear a cell</strong> (or type 0) to take the '
+        '<strong>Save &amp; finish</strong> to commit them all and leave edit mode · <strong>clear a cell</strong> (or type 0) to take the '
         'product off that pub\'s price file · the <strong>WSP</strong> and <strong>Total</strong> columns are editable '
         'too — one figure per product, every pub (the retro at each pub follows; a total below a pub\'s off-invoice is '
         'refused). <strong>+ Add product</strong> for a product new to the master, <strong>+ Add pub</strong> for a '
@@ -283,7 +282,7 @@ def render_tennents_grid(master: TennentsMaster, params: dict, is_admin: bool,
 
 
 # In-grid editing, the LWC grid's driver cut down to this grid's two cell
-# kinds. Each cell is a <form class=cellf>; "Save changes" POSTs every dirty
+# kinds. Each cell is a <form class=cellf>; "Save & finish" POSTs every dirty
 # form SEQUENTIALLY with ajax=1 and reads {ok, errors} JSON; Enter in one cell
 # saves just that cell; an emptied or zeroed off-invoice cell asks before it
 # takes the product off the pub's price file. Typing recomputes the retro /
@@ -293,11 +292,10 @@ var t=document.getElementById('pivot-tbl');
 var tog=document.getElementById('pivot-toggle');
 if(tog&&t){tog.addEventListener('click',function(){var on=t.classList.toggle('show-margin');tog.textContent=on?'Show off-invoice':'Show retro & net keg';});}
 if(!t)return;
-var saveBtn=document.getElementById('grid-save');
 var doneLink=document.getElementById('grid-done');
 function sameNum(a,b){a=(a||'').trim();b=(b||'').trim();if(a===''&&b==='')return true;if(a===''||b==='')return false;var x=parseFloat(a),y=parseFloat(b);if(isNaN(x)||isNaN(y))return a===b;return Math.abs(x-y)<0.005;}
 function dirty(i){return !i.disabled&&!sameNum(i.value,i.getAttribute('data-prev')||'');}
-function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(saveBtn){saveBtn.textContent=n?('Save changes ('+n+')'):'Save changes';saveBtn.disabled=(n===0);}return n;}
+function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(doneLink&&!busy){doneLink.textContent=n?('Save & finish ('+n+')'):'Done editing';doneLink.style.background=n?'#1b5e20':'#666';}return n;}
 function fmt(x){return '£'+x.toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function isZero(s){var x=parseFloat((s||'').trim());return !isNaN(x)&&Math.abs(x)<0.005;}
 function rowNums(tr){var ti=tr.querySelector('input[name=total]'),wi=tr.querySelector('input[name=wsp]');var tot=ti?parseFloat(ti.value):parseFloat(tr.getAttribute('data-total'));var wsp=wi?parseFloat(wi.value):parseFloat(tr.getAttribute('data-wsp'));return{tot:tot,wsp:wsp,keg:parseFloat(tr.getAttribute('data-keg'))||1};}
@@ -313,9 +311,8 @@ function formDirty(f){return cellInputs(f).some(dirty);}
 function removals(forms){var n=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){var p=(i.getAttribute('data-prev')||'').trim();if(i.name==='off_invoice'&&p!==''&&!isZero(p)&&(i.value.trim()===''||isZero(i.value)))n++;});});return n;}
 function restoreTotals(forms){forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name==='total'&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!==''){i.value=i.getAttribute('data-prev');var tr=i.closest('tr');if(tr)updRow(tr);}});});}
 function saveOne(f){restoreTotals([f]);var ins=cellInputs(f);if(!ins.length||!formDirty(f)){refresh();return Promise.resolve(true);}var rem=removals([f]);if(rem&&!confirm('Take this product off the pub\'s price file? (Off-invoice becomes £0.)')){ins.forEach(function(i){i.value=i.getAttribute('data-prev')||'';});refresh();var tr=f.closest('tr');if(tr)updRow(tr);return Promise.resolve(false);}var dl=ins.filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){ins.forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});dl.forEach(flash);refresh();return true;}dl.forEach(function(i){i.classList.add('err');});alert('Could not save: '+errmsg(res));return false;});}
-function saveAll(){if(busy)return Promise.resolve({ok:false,wrote:0});var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){if(formDirty(f))forms.push(f);});restoreTotals(forms);forms=forms.filter(formDirty);if(!forms.length){refresh();return Promise.resolve({ok:true,wrote:0});}var rem=removals(forms);if(rem&&!confirm('Take '+rem+' product'+(rem>1?'s':'')+' off the price file'+(rem>1?'s':'')+'? (Off-invoice becomes £0.)')){refresh();return Promise.resolve({ok:false,wrote:0});}busy=true;if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…';}var idx=0,ok=true,wrote=0;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var dl=cellInputs(f).filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){if(res.j.saved)wrote++;cellInputs(f).forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});return step();}ok=false;dl.forEach(function(i){i.classList.add('err');});if(dl[0])dl[0].focus();alert('Could not save: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return{ok:all,wrote:wrote};});}
-if(saveBtn){saveBtn.addEventListener('click',function(){saveAll().then(function(r){if(r.ok&&r.wrote){location=saveBtn.getAttribute('data-reload')||location.href;}});});}
-if(doneLink){doneLink.addEventListener('click',function(e){if(refresh()>0){e.preventDefault();var href=doneLink.getAttribute('href');saveAll().then(function(r){if(r.ok)location=href;});}});}
+function saveAll(){if(busy)return Promise.resolve({ok:false,wrote:0});var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){if(formDirty(f))forms.push(f);});restoreTotals(forms);forms=forms.filter(formDirty);if(!forms.length){refresh();return Promise.resolve({ok:true,wrote:0});}var rem=removals(forms);if(rem&&!confirm('Take '+rem+' product'+(rem>1?'s':'')+' off the price file'+(rem>1?'s':'')+'? (Off-invoice becomes £0.)')){refresh();return Promise.resolve({ok:false,wrote:0});}busy=true;if(doneLink){doneLink.textContent='Saving…';}var idx=0,ok=true,wrote=0;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var dl=cellInputs(f).filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){if(res.j.saved)wrote++;cellInputs(f).forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});return step();}ok=false;dl.forEach(function(i){i.classList.add('err');});if(dl[0])dl[0].focus();alert('Could not save: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return{ok:all,wrote:wrote};});}
+if(doneLink){doneLink.addEventListener('click',function(e){if(busy){e.preventDefault();return;}if(refresh()>0){e.preventDefault();saveAll().then(function(r){if(r.ok)location=r.wrote?(doneLink.getAttribute('data-saved')||doneLink.getAttribute('href')):doneLink.getAttribute('href');});}});}
 t.addEventListener('submit',function(e){var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;e.preventDefault();saveOne(f);});
 window.addEventListener('beforeunload',function(e){if(refresh()>0){e.preventDefault();e.returnValue='';return '';}});
 refresh();
