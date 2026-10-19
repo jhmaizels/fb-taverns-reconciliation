@@ -1244,15 +1244,17 @@ def test_route_cell_editor_ajax_json_mode():
 
 
 def test_render_master_grid_has_save_changes_button():
-    """Edit mode renders the batch 'Save changes' + 'Done editing' controls and
-    keeps per-cell data-prev for dirty-tracking; view mode has neither."""
+    """Edit mode renders ONE batch control ('Done editing', which reads
+    'Save & finish (N)' once cells are dirty) carrying the saved-banner target,
+    and keeps per-cell data-prev for dirty-tracking; view mode has none."""
     with FakeAirtable([_grid_rule()]):
         with FakeAuthClient("admin") as client:
             r = client.get("/master", params={"edit": "1"})
-            assert 'id="grid-save"' in r.text and 'id="grid-done"' in r.text
-            assert "data-prev=" in r.text and "Save changes" in r.text
+            assert 'id="grid-done"' in r.text and 'id="grid-save"' not in r.text
+            assert "data-prev=" in r.text and "Save &amp; finish" in r.text
+            assert "saved=1" in r.text
             rv = client.get("/master")
-            assert 'id="grid-save"' not in rv.text
+            assert 'id="grid-done"' not in rv.text
 
 
 def test_route_apply_add_product_shows_in_grid_immediately():

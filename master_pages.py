@@ -455,14 +455,13 @@ def render_master_pivot(
     if not is_admin:
         edit_btns = ""
     elif edit:
-        save_reload = base + _qs(saved="1", edit="1", site=site_f, q=q)
+        saved_href = base + _qs(saved="1", site=site_f, q=q)
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/site/new")}">+ Add site</a>'
             f'<a class="button" style="margin-top:0; background:#7a5c00" href="{ext_url("/master/increase")}">Annual increase</a>'
-            f'<button type="button" id="grid-save" class="button" style="margin-top:0; background:#1b5e20" '
-            f'data-reload="{escape(save_reload, quote=True)}" disabled>Save changes</button>'
             f'<a class="button" id="grid-done" style="margin-top:0; background:#666" '
+            f'data-saved="{escape(saved_href, quote=True)}" '
             f'href="{base}{_qs(site=site_f, q=q)}">Done editing</a>'
         )
     else:
@@ -492,7 +491,7 @@ def render_master_pivot(
     edit_help = (
         '<p class="help" style="margin-top:0">Editing works like the spreadsheet: '
         '<strong>type new prices into as many cells as you like</strong>, then press '
-        '<strong>Save changes</strong> to commit them all · '
+        '<strong>Save &amp; finish</strong> to commit them all and leave edit mode · '
         '<strong>clear a cell</strong> to remove its price · '
         '<strong>+ Add product</strong> for a brand-new line. '
         'The <strong>Price</strong> and <strong>Retro P/Keg</strong> columns are '
@@ -724,14 +723,15 @@ def render_master_pivot(
 
     # In-grid editing. Each cell is its own <form class=cellf> POSTing to
     # /master/cell/apply. Saving happens via fetch (ajax=1 JSON mode) so the
-    # operator can edit many cells and commit them together with "Save changes"
+    # operator can edit many cells and commit them together with the one "Save & finish" button
     # WITHOUT a per-cell page reload — and can't silently lose edits:
     #   - dirty cells (value != stored, numeric compare) are highlighted;
-    #   - "Save changes (N)" POSTs every dirty cell SEQUENTIALLY (parallel would
+    #   - "Save & finish (N)" POSTs every dirty cell SEQUENTIALLY (parallel would
     #     race the master cache to None between publishes — the back-to-back
     #     overload the airtable_io cache comments call out);
     #   - Enter in one cell still saves just that cell (now in place, no reload);
-    #   - "Done editing" flushes pending edits first; a beforeunload guard warns
+    #   - with nothing unsaved the same button reads "Done editing" and just leaves
+    #     edit mode; a beforeunload guard warns
     #     if the operator navigates away with unsaved cells.
     # The product-level Price / Retro P/Keg cells ride the SAME machinery
     # (form.cellf + input.cell-input), posting to /master/product-cell/apply.
@@ -742,7 +742,7 @@ def render_master_pivot(
     # retro cell removes the retro (confirm), an emptied FB Price cell is
     # restored — the list price can't be cleared from the grid. Typing in
     # either recomputes the row's Net cell live. EVERY cell POST (Enter or
-    # Save changes) is serialized through one shared promise chain — a
+    # Save & finish) is serialized through one shared promise chain — a
     # product-level save rewrites the same rule rows a tenant/retro save for
     # that product touches, so overlapping requests could clobber each other.
     # If JS fails to load, each cell form still submits natively (POST -> 303),
@@ -753,11 +753,10 @@ var t=document.getElementById('pivot-tbl');
 var tog=document.getElementById('pivot-toggle');
 if(tog&&t){tog.addEventListener('click',function(){var on=t.classList.toggle('show-margin');tog.textContent=on?'Show prices':'Show margins';});}
 if(!t)return;
-var saveBtn=document.getElementById('grid-save');
 var doneLink=document.getElementById('grid-done');
 function sameNum(a,b){a=(a||'').trim();b=(b||'').trim();if(a===''&&b==='')return true;if(a===''||b==='')return false;var x=parseFloat(a),y=parseFloat(b);if(isNaN(x)||isNaN(y))return a===b;return Math.abs(x-y)<0.005;}
 function dirty(i){return !sameNum(i.value,i.getAttribute('data-prev')||'');}
-function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(saveBtn){saveBtn.textContent=n?('Save changes ('+n+')'):'Save changes';saveBtn.disabled=(n===0);}return n;}
+function refresh(){var n=0;Array.prototype.forEach.call(t.querySelectorAll('input.cell-input'),function(i){if(dirty(i)){i.classList.add('dirty');n++;}else{i.classList.remove('dirty');}});if(doneLink&&!busy){doneLink.textContent=n?('Save & finish ('+n+')'):'Done editing';doneLink.style.background=n?'#1b5e20':'#666';}return n;}
 function fmt(x){return '£'+x.toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function isZero(s){var x=parseFloat((s||'').trim());return !isNaN(x)&&Math.abs(x)<0.005;}
 function updMargins(tr){var fbi=tr.querySelector('input[name=fb_price]');if(!fbi)return;var fb=parseFloat(fbi.value);if(isNaN(fb))return;var ri=tr.querySelector('input[name=retro_gbp]');var net=fb-(ri?(parseFloat(ri.value)||0):0);Array.prototype.forEach.call(tr.querySelectorAll('input[name=tenant_price]'),function(ti){var td=ti.closest('td');var m=td?td.querySelector('.cell-margin'):null;var tp=parseFloat(ti.value);if(!m||isNaN(tp))return;var mg=tp-net;var pct=tp>0?(mg/tp*100):null;var cls=pct===null?'':(pct<MR?'cell-neg':(pct>MG?'cell-pos':'cell-warn'));m.className='cell-margin '+cls;m.innerHTML=fmt(mg)+'<span class="pct">'+(pct===null?'n/a':pct.toFixed(1)+'%')+'</span>';});}
@@ -772,9 +771,8 @@ function enq(fn){var p=chain.then(fn,fn);chain=p.then(function(){},function(){})
 function cellInputs(f){return Array.prototype.filter.call(f.elements,function(el){return el.classList&&el.classList.contains('cell-input');});}
 function formDirty(f){return cellInputs(f).some(dirty);}
 function saveOne(f){var ins=cellInputs(f);if(!ins.length)return Promise.resolve(false);var proceed=true,changed=false;ins.forEach(function(i){var prev=i.getAttribute('data-prev')||'';var v=i.value.trim();if(v===''&&prev!==''){if(i.name==='fb_price'){i.value=prev;updNet(i);}else{var msg=(i.name==='retro_gbp')?'Remove this retro? The net price rises to the full list price at every site.':'Remove this price? The product stops billing at this site from today.';if(confirm(msg)){changed=true;}else{i.value=prev;if(i.name==='retro_gbp')updNet(i);proceed=false;}}}else if(!sameNum(v,prev)){if(i.name==='retro_gbp'&&prev!==''&&isZero(v)&&!isZero(prev)){if(confirm('Remove this retro? The net price rises to the full list price at every site.')){changed=true;}else{i.value=prev;updNet(i);proceed=false;}}else{changed=true;}}});refresh();if(!proceed)return Promise.resolve(false);if(!changed)return Promise.resolve(true);var dl=ins.filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){ins.forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});dl.forEach(flash);refresh();return true;}dl.forEach(function(i){i.classList.add('err');});alert('Could not save that price: '+errmsg(res));return false;});}
-function saveAll(){if(busy)return Promise.resolve({ok:false,wrote:0});var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){if(formDirty(f))forms.push(f);});if(!forms.length)return Promise.resolve({ok:true,wrote:0});forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name==='fb_price'&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!==''){i.value=i.getAttribute('data-prev');updNet(i);}});});forms=forms.filter(formDirty);function empties(name){var n=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name===name&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!=='')n++;});});return n;}var rem=empties('tenant_price');if(rem&&!confirm('Remove '+rem+' price'+(rem>1?'s':'')+'? Those products stop billing at those sites from today.')){refresh();return Promise.resolve({ok:false,wrote:0});}var remR=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){var p=(i.getAttribute('data-prev')||'').trim();if(i.name==='retro_gbp'&&p!==''&&!isZero(p)&&(i.value.trim()===''||isZero(i.value)))remR++;});});if(remR&&!confirm('Remove '+remR+' retro'+(remR>1?'s':'')+'? The net price rises to the full list price for those products.')){refresh();return Promise.resolve({ok:false,wrote:0});}refresh();if(!forms.length)return Promise.resolve({ok:true,wrote:0});busy=true;if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…';}var idx=0,ok=true,wrote=0;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var dl=cellInputs(f).filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){if(res.j.saved)wrote++;cellInputs(f).forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});return step();}ok=false;dl.forEach(function(i){i.classList.add('err');});if(dl[0])dl[0].focus();alert('Could not save that price: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return {ok:all,wrote:wrote};});}
-if(saveBtn){saveBtn.addEventListener('click',function(){saveAll().then(function(r){if(r.ok&&r.wrote){location=saveBtn.getAttribute('data-reload')||location.href;}});});}
-if(doneLink){doneLink.addEventListener('click',function(e){if(refresh()>0){e.preventDefault();var href=doneLink.getAttribute('href');saveAll().then(function(r){if(r.ok)location=href;});}});}
+function saveAll(){if(busy)return Promise.resolve({ok:false,wrote:0});var forms=[];Array.prototype.forEach.call(t.querySelectorAll('form.cellf'),function(f){if(formDirty(f))forms.push(f);});if(!forms.length)return Promise.resolve({ok:true,wrote:0});forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name==='fb_price'&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!==''){i.value=i.getAttribute('data-prev');updNet(i);}});});forms=forms.filter(formDirty);function empties(name){var n=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){if(i.name===name&&i.value.trim()===''&&(i.getAttribute('data-prev')||'')!=='')n++;});});return n;}var rem=empties('tenant_price');if(rem&&!confirm('Remove '+rem+' price'+(rem>1?'s':'')+'? Those products stop billing at those sites from today.')){refresh();return Promise.resolve({ok:false,wrote:0});}var remR=0;forms.forEach(function(f){cellInputs(f).forEach(function(i){var p=(i.getAttribute('data-prev')||'').trim();if(i.name==='retro_gbp'&&p!==''&&!isZero(p)&&(i.value.trim()===''||isZero(i.value)))remR++;});});if(remR&&!confirm('Remove '+remR+' retro'+(remR>1?'s':'')+'? The net price rises to the full list price for those products.')){refresh();return Promise.resolve({ok:false,wrote:0});}refresh();if(!forms.length)return Promise.resolve({ok:true,wrote:0});busy=true;if(doneLink){doneLink.textContent='Saving…';}var idx=0,ok=true,wrote=0;function step(){if(idx>=forms.length)return Promise.resolve(ok);var f=forms[idx++];var dl=cellInputs(f).filter(dirty);return enq(function(){return post(f);}).then(function(res){if(res.j&&res.j.ok){if(res.j.saved)wrote++;cellInputs(f).forEach(function(i){i.setAttribute('data-prev',i.value.trim());i.classList.remove('dirty','err');});return step();}ok=false;dl.forEach(function(i){i.classList.add('err');});if(dl[0])dl[0].focus();alert('Could not save that price: '+errmsg(res)+'\nStopped — earlier cells were saved; the rest are still unsaved.');return ok;});}return step().then(function(all){busy=false;refresh();return {ok:all,wrote:wrote};});}
+if(doneLink){doneLink.addEventListener('click',function(e){if(busy){e.preventDefault();return;}if(refresh()>0){e.preventDefault();saveAll().then(function(r){if(r.ok)location=r.wrote?(doneLink.getAttribute('data-saved')||doneLink.getAttribute('href')):doneLink.getAttribute('href');});}});}
 t.addEventListener('submit',function(e){var f=e.target;if(!f.classList||!f.classList.contains('cellf'))return;e.preventDefault();saveOne(f);});
 window.addEventListener('beforeunload',function(e){if(refresh()>0){e.preventDefault();e.returnValue='';return '';}});
 refresh();
