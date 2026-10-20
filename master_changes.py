@@ -674,9 +674,7 @@ def apply_master_change(change: MasterChange, actor_email: str) -> ChangeResult:
         # Fresh read (not the cached snapshot) so the prepend uses the value
         # actually stored right now — and Airtable PATCH would otherwise
         # OVERWRITE the reason cell, losing history (design §2.2).
-        recs = airtable_io._list_all(
-            airtable_io.T["PricingRules"], fields=["rule_key", "tenant_price", "reason"]
-        )
+        recs = airtable_io.read_rules_by_key(key, ["rule_key", "tenant_price", "reason"])
         old = next((r for r in recs if r["fields"].get("rule_key") == key), None)
         if old is None:
             raise ValueError(f"fix_in_place: no pricing rule with rule_key {key!r}")
