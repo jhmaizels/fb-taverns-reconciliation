@@ -12,7 +12,7 @@ import sys
 
 import airtable_io as aio  # noqa: E402
 import tennents_grid  # noqa: E402
-from tennents_master import SitePrice, plan_add_sku, plan_sku_rate_change  # noqa: E402
+from tennents_master import SitePrice, plan_add_sku, plan_bar_plan_change, plan_sku_rate_change  # noqa: E402
 from test_tennents_bar_plan import make_master  # noqa: E402
 from test_tennents_cache import FakeIO, _install  # noqa: E402
 
@@ -166,6 +166,38 @@ def test_sku_writes_and_replace():
            and [k["sku_code"] for k in report.get("sku_rates") or []] == ["401211"])
 
 
+def test_history_undo():
+    print("\n-- price history: a grid change is listed and undone through the same writers")
+    import price_history as ph
+    import webapp
+    fake = FakeIO()
+    _seed(fake)
+    _install(fake)
+    m = aio.load_tennents_master()
+    aio.set_tennents_site_price(m, plan_bar_plan_change(m, "11110001", "090425", "130"), "james@x")
+    m = aio.load_tennents_master()
+    aio.set_tennents_sku_rate(m, plan_sku_rate_change(m, "401211", "360"), "james@x")
+    m = aio.load_tennents_master()
+    ev = ph.tennents_events(m)
+    off = [e for e in ev if e.kind == ph.TN_OFF and e.latest]
+    tot = [e for e in ev if e.kind == ph.TN_TOTAL and e.latest]
+    _check("off-invoice change listed and undoable", len(off) == 1 and off[0].before == 100.0
+           and off[0].after == 130.0 and off[0].undoable, str(off))
+    _check("total change listed and undoable", len(tot) == 1 and tot[0].before == 350.0 and tot[0].undoable, str(tot))
+    err = webapp._apply_tennents_cell(ph.TN_OFF, "11110001", "090425", 100.0, "james@x")
+    _check("off-invoice put back", err == "" and fake.tables[aio.T["TennentsSitePrices"]][0]["fields"]["off_invoice_per_brl"] == 100.0, err)
+    err = webapp._apply_tennents_cell(ph.TN_TOTAL, "", "401211", 350.0, "james@x")
+    row = [r for r in fake.tables[aio.T["TennentsSkuMaster"]] if r["id"] == "recS2"][0]["fields"]
+    _check("total put back, base nets the hold", err == "" and row["correct_total_per_brl"] == 350.0
+           and row["contract_base_per_brl"] == 300.0, err)
+    ev = ph.tennents_events(aio.load_tennents_master())
+    off = sorted([e for e in ev if e.kind == ph.TN_OFF], key=lambda e: e.order)
+    _check("the undo is itself a recorded change", [(e.before, e.after) for e in off] == [(100.0, 130.0), (130.0, 100.0)],
+           str([(e.before, e.after) for e in off]))
+    _check("a product figure can't go back to blank",
+           webapp._apply_tennents_cell(ph.TN_TOTAL, "", "401211", None, "james@x") != "")
+
+
 def test_render():
     print("\n-- render_tennents_grid")
     m = make_master(site_prices=[
@@ -208,6 +240,7 @@ if __name__ == "__main__":
     test_plan_sku_rate_change()
     test_plan_add_sku()
     test_sku_writes_and_replace()
+    test_history_undo()
     test_render()
     print("\nALL PASS" if PASS else "\nFAILURES")
     sys.exit(0 if PASS else 1)

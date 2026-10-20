@@ -398,6 +398,65 @@ def test_single_rule_saves_read_only_their_row():
         assert not unfiltered, f"{op}: full PricingRules sweep on a single-cell save"
 
 
+def test_route_price_history_undo_puts_back_the_overwritten_price():
+    """The Bellamy's case: a price set today, then typed over by mistake. The
+    history lists the overwrite with "Undo: put back £87.00"; pressing it
+    corrects the same row back to £87 (in place, same day), and a stale undo
+    (the cell has moved since the page loaded) is refused with nothing written."""
+    today_iso = date.today().isoformat()
+    rec = _pr_record("rec_today", _key(today_iso), valid_from=today_iso)
+    rec["fields"].update({
+        "tenant_price": 150.0, "status": "tenanted", "source": "grid:j@x.com",
+        "reason": f"corrected by j@x.com {today_iso}: was £87.00 — grid: price corrected (was £87.00); "
+                  "findings: added at charged",
+    })
+    with FakeAirtable([rec]) as fa:
+        with FakeAuthClient("viewer") as client:
+            r = client.get("/master/history", params={"days": "1"})
+            assert r.status_code == 200 and "£150.00" in r.text
+            assert "Undo:" not in r.text, "viewers see the history, not the buttons"
+        with FakeAuthClient("admin") as client:
+            r = client.get("/master/history", params={"days": "1"})
+            assert "Undo: put back £87.00" in r.text, r.text[-2000:]
+            stale = client.post("/master/history/undo", data={
+                "kind": "price", "site_id": SITE_ID, "product_code": PROD_CODE,
+                "to": "87.00", "expect": "140.00",
+            }, follow_redirects=False)
+            assert stale.status_code == 409 and not _updates(fa) and not _creates(fa)
+            ok = client.post("/master/history/undo", data={
+                "kind": "price", "site_id": SITE_ID, "product_code": PROD_CODE,
+                "to": "87.00", "expect": "150.00", "days": "1",
+            }, follow_redirects=False)
+            assert ok.status_code == 303, ok.text[:500]
+            assert "done=undone" in ok.headers["location"]
+            ups = [u for u in _updates(fa) if u["fields"].get("tenant_price") is not None]
+            assert len(ups) == 1 and ups[0]["id"] == "rec_today" and ups[0]["fields"]["tenant_price"] == 87.0
+            assert not _creates(fa)
+            assert "corrected by tester@example.com" in ups[0]["fields"]["reason"]
+
+
+def test_route_price_history_rollback_preview_then_apply():
+    """Roll back to the start of today: the preview lists the cell and what it
+    goes back to, writes nothing; confirming puts the old price back."""
+    today_iso = date.today().isoformat()
+    old = _grid_rule("rec_old")
+    old["fields"]["valid_to"] = today_iso
+    new = _pr_record("rec_new", _key(today_iso), valid_from=today_iso)
+    new["fields"].update({"tenant_price": 199.5, "status": "tenanted", "fb_price": 200.0,
+                          "source": "grid:j@x.com"})
+    old["fields"]["fb_price"] = 200.0
+    with FakeAirtable([old, new]) as fa:
+        with FakeAuthClient("admin") as client:
+            prev = client.post("/master/history/rollback", data={"since": today_iso, "site": ""})
+            assert prev.status_code == 200 and "Put back 1 price" in prev.text and "£180.00" in prev.text
+            assert not fa.calls
+            done = client.post("/master/history/rollback/apply", data={"since": today_iso, "site": ""},
+                               follow_redirects=False)
+            assert done.status_code == 303 and "done=rolled" in done.headers["location"], done.text[:500]
+            ups = [u for u in _updates(fa) if u["fields"].get("tenant_price") is not None]
+            assert [(u["id"], u["fields"]["tenant_price"]) for u in ups] == [("rec_new", 180.0)]
+
+
 # --------------------------------------------------------------------------
 # validate_master_change — table-driven over the §2.3 invariants
 # --------------------------------------------------------------------------
@@ -3215,6 +3274,8 @@ TESTS = [
     test_add_rule_new_key_creates_and_autocreates_site_product,
     test_apply_end_rule_dispatches_to_end_pricing_rule,
     test_single_rule_saves_read_only_their_row,
+    test_route_price_history_undo_puts_back_the_overwritten_price,
+    test_route_price_history_rollback_preview_then_apply,
     test_validate_table,
     test_validate_never_forbids_overlap,
     test_preview_price_change_close_create_winner,
