@@ -1307,6 +1307,23 @@ def upsert_pricing_rules(
     return created, updated, closed
 
 
+def read_rules_by_key(rule_key: str, fields: list[str]) -> list[dict]:
+    """PricingRules rows whose rule_key equals ``rule_key``, read with a
+    server-side filter. A full sweep is ~6,900 rows and ~30s, long enough for
+    the browser to give up on a single grid cell save (shown as HTTP 500 while
+    the write lands). Falls back to the full sweep if the key cannot be
+    embedded in a formula or the filtered read fails; callers still match the
+    key in Python, so a wider read is only slower, never wrong."""
+    table_id = T["PricingRules"]
+    if rule_key and '"' not in rule_key and "\\" not in rule_key:
+        try:
+            return _list_all(table_id, fields=fields,
+                             filter_by_formula=f'{{rule_key}}="{rule_key}"')
+        except AirtableError:
+            logger.warning("filtered rule read failed; falling back to full sweep", exc_info=True)
+    return _list_all(table_id, fields=fields)
+
+
 def end_pricing_rule(rule_key: str, valid_to: date, reason: str, source: str) -> str:
     """Targeted close of ONE rule (the editor's "end rule" / delist action);
     returns the Airtable record id. Creates nothing — unlike the upsert close
@@ -1318,7 +1335,7 @@ def end_pricing_rule(rule_key: str, valid_to: date, reason: str, source: str) ->
     ids, so re-resolution is mandatory anyway).
     """
     table_id = T["PricingRules"]
-    existing = _list_all(table_id, fields=["rule_key", "valid_from", "valid_to", "reason"])
+    existing = read_rules_by_key(rule_key, ["rule_key", "valid_from", "valid_to", "reason"])
     match = next((rec for rec in existing if rec["fields"].get("rule_key") == rule_key), None)
     if match is None:
         raise ValueError(f"no pricing rule with rule_key {rule_key!r}")

@@ -83,12 +83,14 @@ class FakeAirtable:
             airtable_io.T["PricingRules"]: [dict(r) for r in pricing],
         }
         self.calls: list[tuple] = []
+        self.reads: list[tuple] = []  # (table_id, filter_by_formula)
         self.invalidations = 0
 
     def _list_all(self, table_id, fields=None, filter_by_formula=None):
         # filter_by_formula is a server-side perf scope (verified against live
         # Airtable separately); the fake returns the full set and lets the
         # in-Python close pass do the filtering the tests actually assert on.
+        self.reads.append((table_id, filter_by_formula))
         out = []
         for rec in self.tables.get(table_id, []):
             f = rec["fields"]
@@ -378,6 +380,22 @@ def test_apply_end_rule_dispatches_to_end_pricing_rule():
     f = _updates(fa)[0]["fields"]
     assert f["valid_to"] == "2026-07-01" and f["source"] == "editor:me@x"
     assert res.rule_keys_touched == [_key("2026-01-01")]
+
+
+def test_single_rule_saves_read_only_their_row():
+    """A grid cell save (fix_in_place, end_rule) must not sweep the whole
+    PricingRules table: at ~6,900 rows that took ~30s and the browser showed
+    HTTP 500 while the write landed (Bellamy's, 20 Oct 2026)."""
+    pr = airtable_io.T["PricingRules"]
+    rec = _pr_record("rec_open", _key("2026-01-01"), valid_from="2026-01-01")
+    for op, extra in (("end_rule", {"valid_to": date(2026, 7, 1)}),
+                      ("fix_in_place", {"tenant_price": 190.0})):
+        change = MasterChange(op=op, site_id=SITE_ID, product_code=PROD_CODE,
+                              valid_from=date(2026, 1, 1), reason="r", **extra)
+        with FakeAirtable([rec]) as fa:
+            apply_master_change(change, "me@x")
+        unfiltered = [t for t, f in fa.reads if t == pr and not f]
+        assert not unfiltered, f"{op}: full PricingRules sweep on a single-cell save"
 
 
 # --------------------------------------------------------------------------
@@ -3196,6 +3214,7 @@ TESTS = [
     test_fix_in_place_updates_not_creates_and_prepends_reason,
     test_add_rule_new_key_creates_and_autocreates_site_product,
     test_apply_end_rule_dispatches_to_end_pricing_rule,
+    test_single_rule_saves_read_only_their_row,
     test_validate_table,
     test_validate_never_forbids_overlap,
     test_preview_price_change_close_create_winner,
