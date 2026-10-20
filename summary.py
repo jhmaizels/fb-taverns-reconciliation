@@ -78,6 +78,8 @@ class OtherFindingRow:
     cost: float = 0.0      # qty-weighted FB cost basis (LWC MASTER)
     mixed: bool = False    # True when the source lines had differing unit prices
     invoice_no: str = ""   # set only where the LINE, not the site/product, is the unit
+    account_no: str = ""   # LWC ACCOUNT NO, carried on siteless lines so LWC can find them
+    invoice_date: str = "" # ISO date, siteless lines only
 
 
 @dataclass
@@ -282,6 +284,8 @@ def build_summary(
                 product_code=line.product_code, product_desc=line.product_desc,
                 qty=line.qty, notes=m.notes, charged=line.unit_price,
                 cost=line.master_price, invoice_no=line.invoice_no,
+                account_no=line.account_no or "",
+                invoice_date=line.invoice_date.isoformat() if line.invoice_date else "",
             ))
         elif t == "unknown_site":
             key = (line.site_id, line.site_name)
@@ -637,7 +641,8 @@ def _findings_script(cfg: dict) -> str:
             "defaultEffDate": cfg.get("defaultEffDate", ""),
             "email": {"file": cfg.get("sourceFile", ""),
                       "tenant_mismatches": [], "fb_mismatches": [],
-                      "missing_products": [], "missing_prices": []},
+                      "missing_products": [], "missing_prices": [],
+                      "siteless_lines": []},
         })
     cfg_json = cfg_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     return (
@@ -866,15 +871,19 @@ def render_summary_html(
             "<strong>nothing on them was price-checked</strong>. This is not a site missing "
             "from the master &mdash; there is no pub to add, and adding one would not fix "
             "them. Attribute them at source, then re-upload. One row per line, by invoice "
-            "and product, so they can be found in the file.</p>"
+            "and product, so they can be found in the file. The draft email below asks "
+            "LWC which pub each invoice was delivered to.</p>"
         )
         parts.append(
-            "<table><thead><tr><th>Invoice</th><th>Product</th><th>Description</th>"
+            "<table><thead><tr><th>Invoice</th><th>Date</th><th>Account</th><th>Outlet</th>"
+            "<th>Product</th><th>Description</th>"
             "<th class='r'>Qty</th><th class='r'>Charged</th></tr></thead><tbody>"
         )
         for r in s.lines_without_site:
             parts.append(
-                f"<tr><td>{escape(r.invoice_no)}</td><td>{escape(r.product_code)}</td>"
+                f"<tr><td>{escape(r.invoice_no)}</td><td>{escape(r.invoice_date)}</td>"
+                f"<td>{escape(r.account_no)}</td><td>{escape(r.site_name)}</td>"
+                f"<td>{escape(r.product_code)}</td>"
                 f"<td>{escape(r.product_desc)}</td>"
                 f"<td class='r'>{r.qty:g}</td>"
                 f"<td class='r'>{_money_neutral(r.charged)}</td></tr>"
@@ -891,7 +900,8 @@ def render_summary_html(
     # items; accepting a missing item into the master (buttons above) drops it
     # from the draft live. The accept buttons' JS also lives in this block, so it
     # is emitted whenever there is anything actionable on the page.
-    if s.tenant_blocks or s.fb_blocks or s.products_not_on_master or s.tenant_price_missing:
+    if (s.tenant_blocks or s.fb_blocks or s.products_not_on_master
+            or s.tenant_price_missing or s.lines_without_site):
         default_subject = f"FB Taverns pricing — {s.file_name}"
         email_data = {
             "file": s.file_name,
@@ -918,6 +928,15 @@ def render_summary_html(
             ],
             "missing_products": [_email_missing_row(r, policy) for r in s.products_not_on_master],
             "missing_prices": [_email_missing_row(r, policy) for r in s.tenant_price_missing],
+            # Lines LWC booked with no SITE ID: nothing on them was price-checked,
+            # so the draft asks LWC which pub each invoice went to and to put the
+            # site ID right on their system. One row per line, as on the page.
+            "siteless_lines": [
+                {"invoice": r.invoice_no, "date": r.invoice_date, "account": r.account_no,
+                 "outlet": r.site_name, "product": r.product_code, "desc": r.product_desc,
+                 "qty": r.qty, "charged": round(r.charged, 2)}
+                for r in s.lines_without_site
+            ],
         }
         parts.append("<h2>5. Draft email to LWC</h2>")
         parts.append(
@@ -1047,6 +1066,29 @@ _FINDINGS_JS = """<script>
           line += 'please confirm the agreed tenant price (currently charged ' + money(x.charged) + ')';
         }
         L.push(line);
+      });
+      L.push('');
+    }
+    // Lines with no SITE ID, grouped by invoice so LWC can look each one up.
+    var siteless = e.siteless_lines || [];
+    if (siteless.length) {
+      L.push(n() + ') These invoice lines carry no site ID, so we cannot tell which of our pubs they were delivered to or check their pricing. Please tell us the pub for each invoice, correct the site ID on your system, and send a corrected file:');
+      var byInv = {}, order = [];
+      siteless.forEach(function (x) {
+        var k = x.invoice || '(no invoice number)';
+        if (!byInv[k]) { byInv[k] = []; order.push(k); }
+        byInv[k].push(x);
+      });
+      order.forEach(function (k) {
+        var first = byInv[k][0];
+        var head = '   - Invoice ' + k;
+        if (first.date) head += ' dated ' + first.date;
+        if (first.account) head += ', account ' + first.account;
+        if (first.outlet) head += ' (' + first.outlet + ')';
+        L.push(head + ':');
+        byInv[k].forEach(function (x) {
+          L.push('       ' + x.product + ' ' + x.desc + ', ' + fmtQty(x.qty) + ' at ' + money(x.charged));
+        });
       });
       L.push('');
     }

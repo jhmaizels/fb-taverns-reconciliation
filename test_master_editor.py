@@ -2463,6 +2463,18 @@ def test_summary_lists_every_siteless_line_by_invoice():
     assert "Lines with no site ID" in html
     assert "INV1" in html and "INV2" in html
 
+    # Siteless lines alone still produce the draft LWC email, and it carries
+    # each line so LWC can be asked which pub the invoice went to (James,
+    # 2026-10-20: "it needs a fix so it's picked up in the reply email").
+    import json, re
+    assert "Draft email to LWC" in html
+    cfg = json.loads(re.search(
+        r'<script id="findings-config" type="application/json">(.*?)</script>', html, re.S
+    ).group(1))
+    rows = cfg["email"]["siteless_lines"]
+    assert [r["invoice"] for r in rows] == ["INV1", "INV2"], rows
+    assert "carry no site ID" in html  # the JS section text ships with the page
+
 
 def test_reupload_after_master_correction_supersedes_and_keeps_survivors():
     """The Airtable side of the loop above: upload → see stale-master findings
