@@ -123,6 +123,7 @@ def render_tennents_grid(master: TennentsMaster, params: dict, is_admin: bool,
     <button type="submit">Search</button>{clear}
   </form>
   {edit_btns}
+  <a class="button" style="margin-top:0; background:#455a64" href="{ext_url('/tennents/history')}{_qs(site=site_f)}">History &amp; undo</a>
   <span class="grow"></span>
   <span class="help" style="margin:0">{n_prods} products × {n_sites} pub{"s" if n_sites != 1 else ""} · {managed_link} · as of {today.isoformat()}</span>
   <a href="{base}?view=tables">Workbook tables / exceptions →</a>

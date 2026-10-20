@@ -477,6 +477,7 @@ def render_master_pivot(
     <button type="submit">Search</button>{clear}
   </form>
   {edit_btns}
+  <a class="button" style="margin-top:0; background:#455a64" href="{ext_url('/master/history')}{_qs(site=site_f)}">History &amp; undo</a>
   <span class="grow"></span>
   <span class="help" style="margin:0">{n_prods} products × {n_sites} site{"s" if n_sites != 1 else ""} · prices current as of {today.isoformat()}</span>
   <a href="{ext_url('/master')}?view=list">Detailed list / history →</a>

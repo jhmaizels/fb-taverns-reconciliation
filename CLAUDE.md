@@ -333,6 +333,26 @@ Key facts:
   judges each against today's master; one press writes the rows still at £0
   through `set_tennents_site_price` (bar-plan stamped). A figure set since July
   is left alone. Once pressed the page shows "Nothing left to restore".
+- **Price history, undo and roll-back — `GET /master/history` and
+  `GET /tennents/history` (2026-10-20, `price_history.py`):** "History & undo" on
+  both grids. NO history table: the trail is read off the rows. LWC: a rule
+  created at a different tenant price from the rule closed where it starts
+  (cost-only successors skipped), each `corrected by <email> <date>: was £X`
+  stamp `apply_master_change` writes on a same-day fix, and a rule ended with
+  no rule starting at its `valid_to` (removed); supports are left out.
+  Tennent's: the `Bar plan change …: off-invoice £a → £b/brl` lines in
+  `TennentsSitePrices.notes` and `Price grid …: total £a → £b/brl, WSP …` in
+  `TennentsSkuMaster.notes` (figures loaded by a workbook upload are not
+  history). Undo (admin) is offered on a cell's NEWEST change only while the
+  cell still shows that figure; the POST re-derives the events and refuses
+  (409, nothing written) when the cell has moved. Roll-back takes a date (and
+  optionally one pub), previews every cell changed on or after it with the
+  figure it had at the start of that day, and applies on confirm (more than
+  8 cells run in a background thread). Both write through the grid's own
+  paths — `_lwc_cell_change` (the cell editor's op choice, shared) and
+  `plan_bar_plan_change`/`plan_sku_rate_change` → `set_tennents_*` — so an
+  undo is itself a recorded change. A product figure that was RATE TBC/blank
+  cannot be put back to blank, and a cell showing a support is not touched.
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -514,6 +534,8 @@ medium `>=5` / low; over and paid-not-on-master medium.
 | `POST /upload` | yes | LWC weekly reconcile | findings only |
 | `POST /upload-retro` | yes | LWC monthly retro reconcile | findings only |
 | `GET /export-master` | yes | Download master as .xlsx (read-only) | — |
+| `GET /master/history`, `GET /tennents/history` | yes | Price history (read off the rows) | — |
+| `POST /master/history/undo`, `/rollback`, `/rollback/apply` (+ `/tennents/history/…`) | yes (admin) | Undo a change / roll back to a date (preview, then apply) | **YES** |
 | `POST /upload-master` | yes | **LWC master replace** | **YES** |
 | `POST /add-support` | yes | **NL tenant-support rule** (LLM) | **YES** |
 | `GET /tennents` | yes | Tennents landing (+ barrelage vs 2,700 + annual-retro claim alarm) | — |

@@ -131,6 +131,7 @@ from tennents_master import (  # noqa: E402
     plan_sku_rate_change,
 )
 import tennents_grid  # noqa: E402
+import price_history  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -2797,81 +2798,18 @@ async def master_cell_apply(
         do = "delete"
 
     if do == "delete":
-        if winner is None:
-            return _rerender(["there is no current price to remove"])
-        # Delist from today. A rule that STARTED today ends tomorrow instead
-        # (valid_to must be after valid_from) — it bills today only.
-        vt = today
-        if winner.valid_from is not None and winner.valid_from >= today:
-            vt = winner.valid_from + timedelta(days=1)
-        change = MasterChange(
-            op="end_rule", site_id=site_id, product_code=product_code,
-            valid_from=winner.valid_from, valid_to=vt,
-            reason=f"grid: price removed (was {_fmt_price(winner.tenant_price)})",
-            source_note="grid",
-        )
+        tp = None
     else:
         try:
             tp = float(tp_raw)
         except (TypeError, ValueError):
             return _rerender(["enter the price in £, e.g. 182.50"])
-        # Excel-like: re-entering the same price is a no-op, not an error.
-        if (
-            winner is not None and winner.tenant_price is not None
-            and abs(tp - winner.tenant_price) < 0.005
-        ):
-            return _back_to_grid(saved=False)
-        if winner is None:
-            # New price at this site: inherit the product-level FB list price
-            # (when consistent across sites) and retro so margins stay honest.
-            fbs = {
-                round(r.fb_price, 4) for r in snap.rules
-                if r.product_code == product_code and r.valid_to is None
-                and r.fb_price is not None
-            }
-            fb = fbs.pop() if len(fbs) == 1 else None
-            retro_per_keg = (
-                (getattr(snap, "products", {}) or {}).get(product_code) or {}
-            ).get("retro_per_keg") or 0.0
-            retro_pct = (retro_per_keg / fb) if (fb and retro_per_keg) else None
-            change = MasterChange(
-                op="add_rule", site_id=site_id, product_code=product_code,
-                tenant_price=tp, fb_price=fb, retro_pct=retro_pct,
-                status="tenanted", valid_from=today,
-                reason="grid: price added", source_note="grid",
-            )
-        elif winner.valid_from == today:
-            # Second edit the same day: same rule_key -> in-place fix. fb/retro
-            # None keep the stored values (the write path skips them).
-            change = MasterChange(
-                op="fix_in_place", site_id=site_id, product_code=product_code,
-                tenant_price=tp, fb_price=None, retro_pct=None,
-                status=winner.status or "tenanted", valid_from=today,
-                reason=f"grid: price corrected (was {_fmt_price(winner.tenant_price)})",
-                source_note="grid",
-            )
-        elif is_support_rule(winner):
-            # The cell shows the SUPPORT price (an in-window support wins at
-            # its site — reconcile.rule_precedence), so typing a new price
-            # changes the support itself, in place under its own key: its
-            # window and the standing rule are untouched, and the standard
-            # price still resumes when the support ends.
-            change = MasterChange(
-                op="fix_in_place", site_id=site_id, product_code=product_code,
-                tenant_price=tp, fb_price=None, retro_pct=None,
-                status="supported", valid_from=winner.valid_from,
-                reason=f"grid: support price corrected (was {_fmt_price(winner.tenant_price)})",
-                source_note="grid",
-            )
-        else:
-            change = MasterChange(
-                op="price_change", site_id=site_id, product_code=product_code,
-                tenant_price=tp, fb_price=winner.fb_price,
-                retro_pct=winner.retro_pct or None,
-                status=winner.status or "tenanted", valid_from=today,
-                reason=f"grid: price change (was {_fmt_price(winner.tenant_price)})",
-                source_note="grid",
-            )
+    try:
+        change = _lwc_cell_change(snap, site_id, product_code, tp, today)
+    except ValueError as exc:
+        return _rerender([str(exc)])
+    if change is None:
+        return _back_to_grid(saved=False)
 
     errors, _warnings = validate_master_change(change, snap)
     if errors:
@@ -2897,6 +2835,97 @@ async def master_cell_apply(
         logger.exception("snapshot patch failed — grid catches up on refresh")
     refresh_master_cache_async()
     return _back_to_grid(saved=True)
+
+
+def _lwc_cell_change(snap, site_id: str, product_code: str, tp: float | None,
+                     today: date, note: str = "grid") -> MasterChange | None:
+    """The change that makes the LWC grid cell (site, product) show ``tp``
+    (None = remove the price), derived from the rule it shows now — the grid
+    cell editor's rule, shared by the price history's undo and roll-back.
+    None when the cell already shows that. Raises ValueError with the reason
+    when it can't be done."""
+    winner = master_pages.pivot_winner_for(snap, site_id, product_code)
+    if tp is None:
+        if winner is None:
+            raise ValueError("there is no current price to remove")
+        # Delist from today. A rule that STARTED today ends tomorrow instead
+        # (valid_to must be after valid_from) — it bills today only.
+        vt = today
+        if winner.valid_from is not None and winner.valid_from >= today:
+            vt = winner.valid_from + timedelta(days=1)
+        return MasterChange(
+            op="end_rule", site_id=site_id, product_code=product_code,
+            valid_from=winner.valid_from, valid_to=vt,
+            reason=f"{note}: price removed (was {_fmt_price(winner.tenant_price)})",
+            source_note=note,
+        )
+    # Excel-like: re-entering the same price is a no-op, not an error.
+    if (
+        winner is not None and winner.tenant_price is not None
+        and abs(tp - winner.tenant_price) < 0.005
+    ):
+        return None
+    if winner is None:
+        # New price at this site: inherit the product-level FB list price
+        # (when consistent across sites) and retro so margins stay honest.
+        # With no consistent product-level FB price, a price put back after a
+        # removal takes the FB price and retro of the rule that was removed.
+        fbs = {
+            round(r.fb_price, 4) for r in snap.rules
+            if r.product_code == product_code and r.valid_to is None
+            and r.fb_price is not None
+        }
+        fb = fbs.pop() if len(fbs) == 1 else None
+        retro_per_keg = (
+            (getattr(snap, "products", {}) or {}).get(product_code) or {}
+        ).get("retro_per_keg") or 0.0
+        retro_pct = (retro_per_keg / fb) if (fb and retro_per_keg) else None
+        ended = [
+            r for r in snap.rules
+            if r.site_id == site_id and r.product_code == product_code
+            and r.valid_to is not None and r.valid_to <= today
+            and not is_support_rule(r) and r.fb_price is not None
+        ]
+        if fb is None and ended:
+            last = max(ended, key=lambda r: r.valid_to)
+            fb, retro_pct = last.fb_price, (last.retro_pct or None)
+        return MasterChange(
+            op="add_rule", site_id=site_id, product_code=product_code,
+            tenant_price=tp, fb_price=fb, retro_pct=retro_pct,
+            status="tenanted", valid_from=today,
+            reason=f"{note}: price added", source_note=note,
+        )
+    if winner.valid_from == today:
+        # Second edit the same day: same rule_key -> in-place fix. fb/retro
+        # None keep the stored values (the write path skips them).
+        return MasterChange(
+            op="fix_in_place", site_id=site_id, product_code=product_code,
+            tenant_price=tp, fb_price=None, retro_pct=None,
+            status=winner.status or "tenanted", valid_from=today,
+            reason=f"{note}: price corrected (was {_fmt_price(winner.tenant_price)})",
+            source_note=note,
+        )
+    if is_support_rule(winner):
+        # The cell shows the SUPPORT price (an in-window support wins at
+        # its site — reconcile.rule_precedence), so typing a new price
+        # changes the support itself, in place under its own key: its
+        # window and the standing rule are untouched, and the standard
+        # price still resumes when the support ends.
+        return MasterChange(
+            op="fix_in_place", site_id=site_id, product_code=product_code,
+            tenant_price=tp, fb_price=None, retro_pct=None,
+            status="supported", valid_from=winner.valid_from,
+            reason=f"{note}: support price corrected (was {_fmt_price(winner.tenant_price)})",
+            source_note=note,
+        )
+    return MasterChange(
+        op="price_change", site_id=site_id, product_code=product_code,
+        tenant_price=tp, fb_price=winner.fb_price,
+        retro_pct=winner.retro_pct or None,
+        status=winner.status or "tenanted", valid_from=today,
+        reason=f"{note}: price change (was {_fmt_price(winner.tenant_price)})",
+        source_note=note,
+    )
 
 
 def _fmt_price(v: float | None) -> str:
@@ -4299,6 +4328,281 @@ def upload_tennents(
 </p>
 {summary_html}
 {PAGE_FOOT}"""
+
+
+# ---------------------------------------------------------------------------
+# Price history — undo and roll back (both masters; price_history.py)
+# ---------------------------------------------------------------------------
+
+_HISTORY_FLASH = {
+    "undone": "Done: the price is back to what it was. The undo shows in this list as a new change within a minute.",
+    "rolled": "Done: {n} price{s} put back. Each shows in this list as a new change within a minute.",
+    "rolling": "Putting back {n} prices in the background. Reload this page in a minute or two to see them.",
+}
+
+# Roll-backs larger than this run in a background thread: each LWC write is a
+# second or two, and a long POST times out in the browser while it lands.
+_ROLLBACK_INLINE_MAX = 8
+
+
+def _history_flash(params) -> str:
+    key = (params.get("done") or "").strip()
+    msg = _HISTORY_FLASH.get(key, "")
+    try:
+        n = int(params.get("n") or 0)
+    except ValueError:
+        n = 0
+    return msg.format(n=n, s="" if n == 1 else "s") if msg else ""
+
+
+def _history_back(base: str, form, **extra) -> str:
+    qs = [(k, (form.get(k) or "").strip()) for k in ("site", "q", "days")]
+    qs = [(k, v) for k, v in qs if v] + [(k, str(v)) for k, v in extra.items()]
+    return ext_url(base) + ("?" + urlencode(qs) if qs else "")
+
+
+def _parse_to(raw: str) -> float | None:
+    raw = (raw or "").strip()
+    return None if raw == "" else round(float(raw), 2)
+
+
+def _lwc_sites(snap) -> list[tuple[str, str]]:
+    priced = {r.site_id for r in snap.rules}
+    return [(sid, f"{sid} — {(snap.sites.get(sid) or {}).get('name', '')}")
+            for sid in sorted(snap.sites) if sid in priced]
+
+
+def _apply_lwc_cell(site_id: str, product_code: str, tp: float | None, actor: str,
+                    note: str = "history") -> str:
+    """Put ONE LWC cell to ``tp`` (None = remove) from a fresh read of the
+    cached snapshot; returns "" on success or the reason it wasn't done."""
+    snap = load_master_snapshot()
+    try:
+        change = _lwc_cell_change(snap, site_id, product_code, tp, date.today(), note=note)
+    except ValueError as exc:
+        return str(exc)
+    if change is None:
+        return ""
+    errors, _w = validate_master_change(change, snap)
+    if errors:
+        return "; ".join(errors)
+    try:
+        apply_master_change(change, actor)
+    except ValueError as exc:
+        return f"refused at apply time: {exc}"
+    try:
+        publish_patched_snapshot(patch_snapshot_for_change(snap, change, actor))
+    except Exception:
+        logger.exception("snapshot patch failed — the grid catches up on refresh")
+    refresh_master_cache_async()
+    return ""
+
+
+def _apply_tennents_cell(kind: str, site_id: str, product_code: str, tp: float | None,
+                         actor: str) -> str:
+    """Put ONE Tennent's figure back through the grid's planners and writers;
+    returns "" on success or the reason it wasn't done."""
+    master = load_tennents_master()
+    try:
+        if kind == price_history.TN_OFF:
+            change = plan_bar_plan_change(master, site_id, product_code, "0" if tp is None else f"{tp:.2f}")
+            set_tennents_site_price(master, change, actor, "Put back from the price history.")
+        elif kind in (price_history.TN_TOTAL, price_history.TN_WSP):
+            if tp is None:
+                return "a product figure can't be set back to blank"
+            total, wsp = (f"{tp:.2f}", "") if kind == price_history.TN_TOTAL else ("", f"{tp:.2f}")
+            change = plan_sku_rate_change(master, product_code, total, wsp)
+            set_tennents_sku_rate(master, change, actor, "Put back from the price history.")
+        else:
+            return f"unknown figure {kind!r}"
+    except ValueError as exc:
+        return str(exc)
+    return ""
+
+
+def _run_rollback(master_name: str, items, actor: str) -> tuple[int, list[str]]:
+    done, failed = 0, []
+    for it in items:
+        if master_name == "lwc":
+            err = _apply_lwc_cell(it.site_id, it.product_code, it.target, actor)
+        else:
+            err = _apply_tennents_cell(it.kind, it.site_id, it.product_code, it.target, actor)
+        if err:
+            failed.append(f"{it.site_name or it.site_id or 'all pubs'} {it.product_code}: {err}")
+        else:
+            done += 1
+    logger.info("price history roll-back (%s) by %s: %d put back, %d refused%s", master_name, actor,
+                done, len(failed), (" — " + " | ".join(failed)) if failed else "")
+    return done, failed
+
+
+def _history_events(master_name: str):
+    if master_name == "lwc":
+        snap = load_master_snapshot()
+        return snap, price_history.lwc_events(snap), _lwc_sites(snap)
+    master = load_tennents_master()
+    sites = [(s.account, s.site_name or s.account)
+             for s in tennents_grid.grid_sites(master, include_managed=True)]
+    return master, price_history.tennents_events(master), sites
+
+
+async def _history_page(request: Request, principal: DrinksPrincipal, master_name: str,
+                        error: str = "", status_code: int = 200):
+    params = dict(request.query_params)
+    try:
+        _m, events, sites = await run_in_threadpool(_history_events, master_name)
+        body = price_history.render_history_page(
+            master=master_name, events=events, sites=sites, params=params,
+            is_admin=principal.is_admin, flash=_history_flash(params), error=error,
+        )
+    except Exception:
+        logger.exception("price history page failed")
+        return _error_page(_GENERIC_ERR)
+    return HTMLResponse(f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+                        status_code=status_code)
+
+
+async def _history_undo(request: Request, principal: DrinksPrincipal, master_name: str):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    base = "/master/history" if master_name == "lwc" else "/tennents/history"
+    kind = (form.get("kind") or "").strip()
+    site_id = (form.get("site_id") or "").strip()
+    code = (form.get("product_code") or "").strip()
+    try:
+        target = _parse_to(form.get("to") or "")
+        expect = _parse_to(form.get("expect") or "")
+    except ValueError:
+        return _error_page("That undo link is malformed — reload the history page and try again.")
+    try:
+        _m, events, _sites = await run_in_threadpool(_history_events, master_name)
+    except Exception:
+        logger.exception("price history undo: load failed")
+        return _error_page(_GENERIC_ERR)
+    cell = (kind, site_id, code)
+    latest = next((e for e in events if e.cell == cell and e.latest), None)
+    if (latest is None or not latest.undoable
+            or not price_history._same(latest.after, expect)
+            or not price_history._same(latest.before, target)):
+        return await _history_page(
+            request, principal, master_name, status_code=409,
+            error="Not undone: that price has changed since the page was loaded. The list below is up to date.")
+    if master_name == "lwc":
+        err = await run_in_threadpool(_apply_lwc_cell, site_id, code, target, principal.email)
+    else:
+        err = await run_in_threadpool(_apply_tennents_cell, kind, site_id, code, target, principal.email)
+    if err:
+        return await _history_page(request, principal, master_name, status_code=400,
+                                   error=f"Not undone: {err}")
+    logger.info("price history undo (%s) by %s: %s %s %s -> %s", master_name, principal.email,
+                kind, site_id, code, target)
+    return RedirectResponse(_history_back(base, form, done="undone"), status_code=303)
+
+
+def _rollback_inputs(form):
+    since_raw = (form.get("since") or "").strip()
+    try:
+        since = date.fromisoformat(since_raw)
+    except ValueError:
+        return None, ""
+    return since, (form.get("site") or "").strip()
+
+
+async def _history_rollback_preview(request: Request, principal: DrinksPrincipal, master_name: str):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    since, site = _rollback_inputs(form)
+    if since is None:
+        return _error_page("Choose the date to roll back to.")
+    try:
+        _m, events, sites = await run_in_threadpool(_history_events, master_name)
+    except Exception:
+        logger.exception("price history roll-back preview failed")
+        return _error_page(_GENERIC_ERR)
+    items = price_history.plan_rollback(events, since, site)
+    label = dict(sites).get(site, site)
+    body = price_history.render_rollback_page(master=master_name, items=items, since=since,
+                                              site=site, site_label=label)
+    return HTMLResponse(f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}")
+
+
+async def _history_rollback_apply(request: Request, principal: DrinksPrincipal, master_name: str):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    base = "/master/history" if master_name == "lwc" else "/tennents/history"
+    since, site = _rollback_inputs(form)
+    if since is None:
+        return _error_page("Choose the date to roll back to.")
+    try:
+        _m, events, _sites = await run_in_threadpool(_history_events, master_name)
+    except Exception:
+        logger.exception("price history roll-back failed")
+        return _error_page(_GENERIC_ERR)
+    items = [i for i in price_history.plan_rollback(events, since, site) if not i.blocked]
+    back = {"site": site} if site else {}
+    if len(items) > _ROLLBACK_INLINE_MAX:
+        threading.Thread(target=_run_rollback, args=(master_name, items, principal.email),
+                         daemon=True, name=f"rollback-{master_name}").start()
+        qs = urlencode({**back, "done": "rolling", "n": len(items)})
+        return RedirectResponse(ext_url(base) + "?" + qs, status_code=303)
+    done, failed = await run_in_threadpool(_run_rollback, master_name, items, principal.email)
+    if failed:
+        return await _history_page(
+            request, principal, master_name, status_code=400,
+            error=f"{done} put back; not done: " + "; ".join(failed))
+    qs = urlencode({**back, "done": "rolled", "n": done})
+    return RedirectResponse(ext_url(base) + "?" + qs, status_code=303)
+
+
+@app.get("/master/history", response_class=HTMLResponse)
+async def master_history(request: Request,
+                         principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    return await _history_page(request, principal, "lwc")
+
+
+@app.post("/master/history/undo")
+async def master_history_undo(request: Request,
+                              principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_undo(request, principal, "lwc")
+
+
+@app.post("/master/history/rollback", response_class=HTMLResponse)
+async def master_history_rollback(request: Request,
+                                  principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_rollback_preview(request, principal, "lwc")
+
+
+@app.post("/master/history/rollback/apply")
+async def master_history_rollback_apply(request: Request,
+                                        principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_rollback_apply(request, principal, "lwc")
+
+
+@app.get("/tennents/history", response_class=HTMLResponse)
+async def tennents_history(request: Request,
+                           principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))):
+    return await _history_page(request, principal, "tennents")
+
+
+@app.post("/tennents/history/undo")
+async def tennents_history_undo(request: Request,
+                                principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_undo(request, principal, "tennents")
+
+
+@app.post("/tennents/history/rollback", response_class=HTMLResponse)
+async def tennents_history_rollback(request: Request,
+                                    principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_rollback_preview(request, principal, "tennents")
+
+
+@app.post("/tennents/history/rollback/apply")
+async def tennents_history_rollback_apply(request: Request,
+                                          principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return await _history_rollback_apply(request, principal, "tennents")
 
 
 def _error_page(message: str) -> HTMLResponse:
