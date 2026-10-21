@@ -457,6 +457,46 @@ def test_route_price_history_rollback_preview_then_apply():
             assert [(u["id"], u["fields"]["tenant_price"]) for u in ups] == [("rec_new", 180.0)]
 
 
+
+def test_route_price_sheet_preview_then_sign_off():
+    """A pub's price sheet: the preview lists an add, a change and a removal
+    and writes nothing; signing off makes exactly those three changes."""
+    sites = [{"id": SITE_REC, "fields": {"site_id": SITE_ID, "name": "Test Tavern", "status": "tenanted"}}]
+    products = [
+        {"id": "rec_p_bel", "fields": {"product_code": "12240204", "description": "Belhaven Best 11G"}},
+        {"id": "rec_p_car", "fields": {"product_code": "15530004", "description": "Carling 11G"}},
+        {"id": "rec_p_old", "fields": {"product_code": "11111111", "description": "Old Ale 11G"}},
+    ]
+
+    def rule(rec_id, prod_rec, code, price):
+        return {"id": rec_id, "fields": {
+            "rule_key": f"{SITE_ID}|{code}|2026-01-01", "site": [SITE_REC], "product": [prod_rec],
+            "valid_from": "2026-01-01", "tenant_price": price, "fb_price": 100.0, "status": "tenanted"}}
+
+    pricing = [rule("rec_car", "rec_p_car", "15530004", 190.0), rule("rec_old", "rec_p_old", "11111111", 50.0)]
+    sheet = b"Test Tavern price sheet\nCode,Product,Buying price\n12240204,Belhaven Best 11G,125.13\n15530004,Carling 11G,194.57\n"
+    with FakeAirtable(pricing, sites=sites, products=products) as fa:
+        with FakeAuthClient("admin") as client:
+            prev = client.post("/master/sheet/preview", data={"site_id": ""},
+                               files={"file": ("tavern.csv", sheet, "text/csv")})
+            assert prev.status_code == 200, prev.text[:800]
+            text = unescape(prev.text)
+            assert "Sign off and make 3 changes" in text and "Test Tavern" in text, text[-3000:]
+            assert "£194.57" in text and "Remove" in text
+            assert not fa.calls
+            import re as _re
+            carried = unescape(_re.search(r'name="lines" value="([^"]*)"', prev.text).group(1))
+            done = client.post("/master/sheet/apply",
+                               data={"site_id": SITE_ID, "lines": carried, "filename": "tavern.csv"},
+                               follow_redirects=False)
+            assert done.status_code == 303 and "done=sheet" in done.headers["location"], done.text[:800]
+            created = {c["fields"]["rule_key"].split("|")[1]: c["fields"].get("tenant_price")
+                       for c in _creates(fa)}
+            assert created.get("12240204") == 125.13 and created.get("15530004") == 194.57, created
+            ended = [u["id"] for u in _updates(fa) if u["fields"].get("valid_to")]
+            assert "rec_old" in ended and "rec_car" in ended, _updates(fa)
+
+
 # --------------------------------------------------------------------------
 # validate_master_change — table-driven over the §2.3 invariants
 # --------------------------------------------------------------------------
@@ -3276,6 +3316,7 @@ TESTS = [
     test_single_rule_saves_read_only_their_row,
     test_route_price_history_undo_puts_back_the_overwritten_price,
     test_route_price_history_rollback_preview_then_apply,
+    test_route_price_sheet_preview_then_sign_off,
     test_validate_table,
     test_validate_never_forbids_overlap,
     test_preview_price_change_close_create_winner,

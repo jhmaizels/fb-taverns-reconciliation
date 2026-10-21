@@ -7,3 +7,4 @@ requests==2.32.3
 python-dotenv==1.0.1
 anthropic==0.92.0
 msoffcrypto-tool==6.0.0
+pypdf==5.1.0

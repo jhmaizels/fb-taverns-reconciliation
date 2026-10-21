@@ -132,6 +132,7 @@ from tennents_master import (  # noqa: E402
 )
 import tennents_grid  # noqa: E402
 import price_history  # noqa: E402
+import price_sheet  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
@@ -736,6 +737,10 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
         f' <a class="button" href="{ext_url("/master/policy")}" style="margin-top:0;background:#666">Suggested-price policy</a>'
         if role_at_least(principal.role, "admin") else ""
     )
+    sheet_link = (
+        f' <a class="button" href="{ext_url("/master/sheet")}" style="margin-top:0">Upload a price sheet for a pub</a>'
+        if role_at_least(principal.role, "admin") else ""
+    )
     return f"""{render_head(principal.email, principal.role)}
 <p class="sub" style="margin-top:0"><a href="{ext_url('/')}">← Back to estate picker</a></p>
 <h1>LWC Reconciliation <span class="estate-tag">England</span></h1>
@@ -746,7 +751,7 @@ def lwc_home(principal: DrinksPrincipal = Depends(require_drinks_role("viewer"))
   margins, and (admins) edit directly in the grid — prices, products, sites, the annual increase. Every change
   takes effect from the day it's made, with history kept underneath, and reconciliations check supplier files
   against it.</p>
-  <p style="margin-bottom:0"><a class="button" href="{ext_url('/master')}" style="margin-top:0">Open price file</a>{policy_link}</p>
+  <p style="margin-bottom:0"><a class="button" href="{ext_url('/master')}" style="margin-top:0">Open price file</a>{sheet_link}{policy_link}</p>
 </div>
 
 <div class="grid2" style="margin-top:1em">
@@ -4338,6 +4343,8 @@ _HISTORY_FLASH = {
     "undone": "Done: the price is back to what it was. The undo shows in this list as a new change within a minute.",
     "rolled": "Done: {n} price{s} put back. Each shows in this list as a new change within a minute.",
     "rolling": "Putting back {n} prices in the background. Reload this page in a minute or two to see them.",
+    "sheet": "Signed off: {n} price change{s} from the price sheet made. Each is listed below and can be undone.",
+    "sheeting": "Signed off: making {n} price changes from the price sheet in the background. Reload this page in a minute or two to see them.",
 }
 
 # Roll-backs larger than this run in a background thread: each LWC write is a
@@ -4603,6 +4610,143 @@ async def tennents_history_rollback(request: Request,
 async def tennents_history_rollback_apply(request: Request,
                                           principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
     return await _history_rollback_apply(request, principal, "tennents")
+
+
+# ---------------------------------------------------------------------------
+# Price sheet for one pub — upload, check, sign off (price_sheet.py)
+# ---------------------------------------------------------------------------
+
+def _sheet_page(principal: DrinksPrincipal, body: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(f"{render_head(principal.email, principal.role)}{body}{PAGE_FOOT}",
+                        status_code=status_code)
+
+
+def _sheet_plan(snap, site_id: str, lines, text: str = "", compare_site: str = ""):
+    """The plan for ``site_id`` from a fresh read of the cached snapshot, plus
+    the pub the sheet points at for comparison (when it names one by number)."""
+    winners = {code: w for (sid, code), w in master_pages._pivot_winners(snap, date.today()).items()
+               if sid == site_id}
+    if not compare_site and text:
+        refs = price_sheet.referenced_sites(text, snap.sites, exclude=site_id)
+        compare_site = refs[0] if refs else ""
+    compare = {}
+    if compare_site:
+        compare = {code: w.tenant_price
+                   for (sid, code), w in master_pages._pivot_winners(snap, date.today()).items()
+                   if sid == compare_site}
+    descs = master_pages._product_descs(snap)
+    products = {code: descs.get(code, "") for code in snap.product_ids}
+    plan = price_sheet.plan_sheet(site_id=site_id, site=snap.sites.get(site_id) or {}, lines=lines,
+                                  winners=winners, products=products, compare=compare)
+    return plan, compare_site
+
+
+@app.get("/master/sheet", response_class=HTMLResponse)
+async def master_sheet(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("price sheet page failed")
+        return _error_page(_GENERIC_ERR)
+    return _sheet_page(principal, price_sheet.render_upload_page(snap.sites))
+
+
+@app.post("/master/sheet/preview", response_class=HTMLResponse)
+async def master_sheet_preview(request: Request,
+                               principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    """Read the sheet (or the lines carried from the previous preview when the
+    pub is changed) and show the plan. Writes nothing."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("price sheet preview: load failed")
+        return _error_page(_GENERIC_ERR)
+    site_id = (form.get("site_id") or "").strip()
+    upload = form.get("file")
+    text, problems, how = "", [], ""
+    if upload is not None and getattr(upload, "filename", ""):
+        filename = upload.filename
+        try:
+            data = _read_upload_capped(upload)
+            read = await run_in_threadpool(price_sheet.read_sheet, filename, data, set(snap.product_ids))
+        except (_UploadTooLarge, ValueError) as exc:
+            return _sheet_page(principal, price_sheet.render_upload_page(snap.sites, error=f"Not read: {exc}."),
+                               status_code=400)
+        except Exception:
+            logger.exception("price sheet read failed")
+            return _sheet_page(principal, price_sheet.render_upload_page(
+                snap.sites, error="Not read: something went wrong reading that file."), status_code=400)
+        lines, text, problems = read.lines, read.text, read.problems
+        if not site_id:
+            site_id, how = price_sheet.guess_site(text, snap.sites)
+        elif site_id in snap.sites:
+            how = "you chose it"
+    else:
+        filename = (form.get("filename") or "").strip() or "price sheet"
+        lines = price_sheet.decode_lines(form.get("lines") or "")
+        how = "you chose it" if site_id else ""
+    if site_id and site_id not in snap.sites:
+        site_id = ""
+    plan, compare_site = (None, "")
+    if site_id and lines:
+        plan, compare_site = _sheet_plan(snap, site_id, lines, text)
+    logger.info("price sheet preview by %s: %s, %d lines, pub %s", principal.email, filename, len(lines),
+                site_id or "?")
+    return _sheet_page(principal, price_sheet.render_preview_page(
+        plan=plan, lines=lines, sites=snap.sites, filename=filename, how=how,
+        compare_site=compare_site, problems=problems))
+
+
+def _run_sheet(site_id: str, rows, actor: str, filename: str) -> tuple[int, list[str]]:
+    done, failed = 0, []
+    for r in rows:
+        err = _apply_lwc_cell(site_id, r.code, r.new, actor, note=f"price sheet {filename}"[:60])
+        if err:
+            failed.append(f"{r.code}: {err}")
+        else:
+            done += 1
+    logger.info("price sheet %s for %s signed off by %s: %d made, %d refused%s", filename, site_id, actor,
+                done, len(failed), (" — " + " | ".join(failed)) if failed else "")
+    return done, failed
+
+
+@app.post("/master/sheet/apply")
+async def master_sheet_apply(request: Request,
+                             principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    """Sign-off: re-plan from the master as it stands now (so a change made
+    since the preview is not overwritten blindly) and make the changes through
+    the grid's own cell path."""
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    site_id = (form.get("site_id") or "").strip()
+    filename = (form.get("filename") or "").strip() or "price sheet"
+    lines = price_sheet.decode_lines(form.get("lines") or "")
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("price sheet apply: load failed")
+        return _error_page(_GENERIC_ERR)
+    if site_id not in snap.sites or not lines:
+        return _error_page("That sign-off is missing its pub or its prices — upload the sheet again.")
+    plan, _c = _sheet_plan(snap, site_id, lines)
+    if plan.blocked:
+        return _error_page(plan.blocked)
+    rows = plan.to_write
+    back = ext_url("/master/history") + "?"
+    if len(rows) > _ROLLBACK_INLINE_MAX:
+        threading.Thread(target=_run_sheet, args=(site_id, rows, principal.email, filename),
+                         daemon=True, name="price-sheet").start()
+        return RedirectResponse(back + urlencode({"site": site_id, "done": "sheeting", "n": len(rows)}),
+                                status_code=303)
+    done, failed = await run_in_threadpool(_run_sheet, site_id, rows, principal.email, filename)
+    if failed:
+        return await _history_page(request, principal, "lwc", status_code=400,
+                                   error=f"{done} made; not done: " + "; ".join(failed))
+    return RedirectResponse(back + urlencode({"site": site_id, "done": "sheet", "n": done}), status_code=303)
 
 
 def _error_page(message: str) -> HTMLResponse:
