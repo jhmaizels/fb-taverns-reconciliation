@@ -363,6 +363,8 @@ HEAD_STYLE = """<!doctype html>
   .site-user form { background: none; border: 0; padding: 0; margin: 0; max-width: none; }
   .site-user button.signout { background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 0.3em 0.8em; border-radius: 4px; font-size: 0.78em; cursor: pointer; }
   .site-user button.signout:hover { background: rgba(255,255,255,0.25); }
+  .site-user a.admin { background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 0.3em 0.8em; border-radius: 4px; font-size: 0.78em; text-decoration: none; }
+  .site-user a.admin:hover { background: rgba(255,255,255,0.25); }
   h1 { margin-bottom: 0.2em; }
   h2 { margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid #2c5aa0; color: #2c5aa0; }
   .sub { color: #666; margin-bottom: 2em; }
@@ -470,17 +472,25 @@ def render_head(user_email: str = "", drinks_role: str = "") -> str:
     the FB logo (always returns to the HUB portal — "/" when proxied under
     EXTERNAL_BASE_PATH, the app root when standalone) plus, on the right,
     the signed-in email (escaped) and a relative sign-out form
-    (POST /auth/signout). No duplicate nav links, no cross-app links —
-    the hub portal is the crossroads (admin is reached from its Admin tile).
+    (POST /auth/signout), with an Admin button between them for drinks
+    admins, as on the hub's own headers.
     Called with empty strings for error / pre-auth pages — the header still
     renders, just without identity.
     """
+    # Admin button (James, 2026-10-21): the same slot as the hub's own headers,
+    # between the user and Sign out, for drinks admins. Proxied, the hub's
+    # /admin is on the same origin; standalone, TENANCY_ADMIN_URL.
+    admin_link = ""
+    if role_at_least(drinks_role, "admin"):
+        admin_href = "/admin" if EXTERNAL_BASE_PATH else TENANCY_ADMIN_URL
+        admin_link = f'<a class="admin" href="{escape(admin_href)}">Admin</a>'
     user_block = ""
     if user_email or drinks_role:
         who = f'<span class="who">{escape(user_email)}</span>' if user_email else ""
         user_block = (
             '<div class="site-user">'
             f'{who}'
+            f'{admin_link}'
             f'<form method="post" action="{ext_url("/auth/signout")}">'
             '<button type="submit" class="signout">Sign out</button>'
             '</form>'
