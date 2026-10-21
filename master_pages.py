@@ -459,6 +459,7 @@ def render_master_pivot(
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/site/new")}">+ Add site</a>'
+            f'<a class="button" style="margin-top:0" href="{ext_url("/master/sheet")}">Upload a price sheet</a>'
             f'<a class="button" style="margin-top:0; background:#7a5c00" href="{ext_url("/master/increase")}">Annual increase</a>'
             f'<a class="button" id="grid-done" style="margin-top:0; background:#666" '
             f'data-saved="{escape(saved_href, quote=True)}" '

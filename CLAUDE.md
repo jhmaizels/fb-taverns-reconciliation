@@ -79,6 +79,9 @@ Module map:
 - `tennents_master.py` — parser + rate-resolution for the Tennents master
   workbook (`FB_Taverns_Tennents_Master.xlsx`), the primary Tennents price file.
 - `support_parser.py` — NL → structured support rule via Claude tool-use.
+- `price_history.py` — price history, undo and roll-back for both masters.
+- `price_sheet.py` — read a pub's price sheet (PDF/Word/Excel/CSV) and plan
+  the changes that make its LWC prices the sheet's (preview + sign-off).
 - `summary.py` — builder/renderer for the main LWC weekly summary.
 - `master_export.py` — read-only Airtable → wide-form FB cost Excel export.
 - `setup_airtable.py` / `migrate_csv_to_airtable.py` — one-off bootstrap scripts.
@@ -353,6 +356,30 @@ Key facts:
   `plan_bar_plan_change`/`plan_sku_rate_change` → `set_tennents_*` — so an
   undo is itself a recorded change. A product figure that was RATE TBC/blank
   cannot be put back to blank, and a cell showing a support is not touched.
+- **Price sheet for one pub — `GET /master/sheet` → `POST /master/sheet/preview`
+  → `POST /master/sheet/apply` (admin, cross-origin checked, 2026-10-21,
+  `price_sheet.py`):** upload a pub's price sheet (a side letter's schedule —
+  the Earl Grey letter of 20 Oct 2026 was the sample — or a price list) as PDF
+  (`pypdf`), Word .docx, Excel .xlsx or CSV. Layouts vary, so the reader does
+  not rely on columns: in text it pairs each product CODE (any code on the
+  master's product list, or any 8-digit number) with the first £ amount after
+  it before the next code; in a spreadsheet it takes the "price" column, else
+  the row's last number. Matching is by code only; the preview shows the
+  sheet's wording beside the master's and flags a code whose names share no
+  word. The pub is chosen on the form or found as the pub NAME appearing first
+  in the sheet (never a "site NNN" reference — a side letter cites the pub it
+  matches; that pub's current prices are shown alongside instead). **The sheet
+  REPLACES the pub's prices** (James: "any new pricing should erase the old
+  pricing"): products on it are added/changed, products the pub has a price for
+  that are NOT on it are removed. Not done (listed): a code not on the
+  master's product list, two prices for one code, a price outside £0–5,000, a
+  running support (change it in the grid), a managed pub (whole sheet
+  refused). Sign-off re-plans from the master as it stands, then writes each
+  change through `_apply_lwc_cell` (the grid cell path, background thread when
+  more than 8), so every change is on the price history under the signer's
+  name and can be undone. The sheet's lines ride the preview form, so
+  changing the pub or signing off never needs the file again. Nothing is
+  written by the preview.
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -536,6 +563,8 @@ medium `>=5` / low; over and paid-not-on-master medium.
 | `GET /export-master` | yes | Download master as .xlsx (read-only) | — |
 | `GET /master/history`, `GET /tennents/history` | yes | Price history (read off the rows) | — |
 | `POST /master/history/undo`, `/rollback`, `/rollback/apply` (+ `/tennents/history/…`) | yes (admin) | Undo a change / roll back to a date (preview, then apply) | **YES** |
+| `GET /master/sheet`, `POST /master/sheet/preview` | yes (admin) | A pub's price sheet: read it and show the changes | — |
+| `POST /master/sheet/apply` | yes (admin) | Sign off a price sheet: the pub's prices become the sheet's | **YES** |
 | `POST /upload-master` | yes | **LWC master replace** | **YES** |
 | `POST /add-support` | yes | **NL tenant-support rule** (LLM) | **YES** |
 | `GET /tennents` | yes | Tennents landing (+ barrelage vs 2,700 + annual-retro claim alarm) | — |
