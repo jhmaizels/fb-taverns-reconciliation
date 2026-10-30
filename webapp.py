@@ -79,6 +79,7 @@ from reconcile import (  # noqa: E402
 # so it stays off the cold-start / health-check readiness path.
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from deal_products import build_deal_products_payload, token_ok  # noqa: E402
+from site_prices import build_lwc_site_payload, build_site_index, build_tennents_site_payload  # noqa: E402
 from airtable_io import (  # noqa: E402
     clear_rule_retro_pcts,
     set_product_retro_fields,
@@ -1405,6 +1406,33 @@ def api_deal_products(request: Request):
     except Exception:
         logger.exception("deal-products feed failed")
         return JSONResponse({"detail": "snapshot unavailable"}, status_code=503)
+
+
+@app.get("/api/site-prices")
+def api_site_prices(request: Request, lwc_site: str = "", tennents_account: str = ""):
+    """Per-pub price feed for the hub's bar plans (server-to-server, the same
+    shared bearer token as /api/deal-products — read-only). No query: every pub
+    on both price files, for the hub to link its sites. ?lwc_site=<LWC site
+    number> or ?tennents_account=<account>: that pub's prices, margin per barrel
+    included. 404 when the pub is not on the file."""
+    expected = os.environ.get("DEAL_PRODUCTS_TOKEN", "")
+    if not expected:
+        return JSONResponse({"detail": "feed not configured"}, status_code=503)
+    if not token_ok(request.headers.get("authorization"), expected):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    try:
+        if lwc_site.strip():
+            payload = build_lwc_site_payload(load_master_snapshot(), lwc_site)
+        elif tennents_account.strip():
+            payload = build_tennents_site_payload(load_tennents_master(), tennents_account)
+        else:
+            payload = build_site_index(load_master_snapshot(), load_tennents_master())
+    except Exception:
+        logger.exception("site-prices feed failed")
+        return JSONResponse({"detail": "price files unavailable"}, status_code=503)
+    if payload is None:
+        return JSONResponse({"detail": "pub not on the price file"}, status_code=404)
+    return JSONResponse(payload)
 
 
 @app.post("/upload-master", response_class=HTMLResponse)
