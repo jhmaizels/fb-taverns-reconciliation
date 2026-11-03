@@ -3428,7 +3428,9 @@ def tennents_prices_index(principal: DrinksPrincipal = Depends(require_drinks_ro
     rows = "".join(
         f"<tr><td>{escape(name)}</td><td>{escape(acct)}</td>"
         f'<td><a class="button" style="margin:0" '
-        f'href="{ext_url("/tennents/export-prices?site=" + quote(acct))}">Download</a></td></tr>'
+        f'href="{ext_url("/tennents/export-prices?site=" + quote(acct))}">Download</a></td>'
+        f'<td><a class="button" style="margin:0" '
+        f'href="{ext_url("/tennents/export-prices?copy=tenant&site=" + quote(acct))}">Tenant copy</a></td></tr>'
         for acct, name in choices
     )
     return f"""{render_head(principal.email, principal.role)}
@@ -3438,9 +3440,13 @@ def tennents_prices_index(principal: DrinksPrincipal = Depends(require_drinks_ro
 &ldquo;Price Lists and Bar Plans&rdquo; folder — or grab them all at once as a
 <a href="{ext_url('/tennents/export-prices?format=zip')}">.zip</a>, or the
 <a href="{ext_url('/tennents/export-prices')}">single master workbook</a> (a tab per site).</p>
+<p class="sub"><strong>Sending to a tenant?</strong> Use <strong>Tenant copy</strong>. The price file
+shows FB's total discount, retro and cost, so it is for the team only. The tenant copy lists just the
+products the pub has a deal on, with the list price, the tenant's discount and their price per keg and
+per pint. All tenant copies as a <a href="{ext_url('/tennents/export-prices?copy=tenant&format=zip')}">.zip</a>.</p>
 {_tennents_master_banner_html()}
 {layer_warning}
-<table><thead><tr><th>Site</th><th>Tennents account</th><th>Price file</th></tr></thead>
+<table><thead><tr><th>Site</th><th>Tennents account</th><th>Price file (team only)</th><th>For the tenant</th></tr></thead>
 <tbody>{rows}</tbody></table>
 {PAGE_FOOT}"""
 
@@ -3566,6 +3572,7 @@ def tennents_pricer_download(
 def tennents_export_prices(
     site: str | None = None,
     format: str | None = None,
+    copy: str | None = None,
     principal: DrinksPrincipal = Depends(require_drinks_role("viewer")),
 ):
     """Team-facing Tennents price file, built live from the master so it's
@@ -3599,6 +3606,23 @@ def tennents_export_prices(
 
     try:  # wrap the build like /export-master, so an openpyxl failure renders
           # the friendly page rather than a bare 500.
+        if copy == "tenant":
+            # ?copy=tenant -> the tenant-safe price list: no total discount,
+            # retro, FB cost or substitution band (tennents_price_export).
+            from tennents_price_export import build_tenant_site_bytes, build_tenant_zip_bytes, tenant_filename
+            if format == "zip":
+                return Response(
+                    content=build_tenant_zip_bytes(master),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="FB_Taverns_Tennents_Tenant_Price_Lists_{today}.zip"'},
+                )
+            if target is None:
+                return _error_page("Choose a site for the tenant copy.")
+            return Response(
+                content=build_tenant_site_bytes(master, target),
+                media_type=xlsx,
+                headers={"Content-Disposition": _attachment_disposition(tenant_filename(target, date.today()))},
+            )
         if format == "zip":
             return Response(
                 content=build_all_sites_zip_bytes(master),
@@ -4188,6 +4212,7 @@ From now on the monthly Tennents reconciliation checks this pub's deliveries of 
 {_bar_plan_change_table(change) if result["action"] != "already" else ""}
 <p>
   <a class="button" href="{ext_url('/tennents/export-prices?site=' + quote(change.account))}">Download {escape(change.site_name)} price file</a>
+  <a class="button" href="{ext_url('/tennents/export-prices?copy=tenant&site=' + quote(change.account))}">Tenant copy to send</a>
   <a class="button" href="{ext_url('/tennents/pricer?site=' + quote(change.account))}">Tennents pricer for {escape(change.site_name)}</a>
   <a class="button" href="{ext_url('/tennents/bar-plan')}" style="background:#666">Another change</a>
 </p>

@@ -258,6 +258,28 @@ def run():
     _check("find_site by account", tpe.find_site(m, "11110002").site_name == "MANAGED HOUSE")
     _check("find_site by name", tpe.find_site(m, "bespoke bar").account == "11110003")
 
+    # ---- tenant copy: nothing of FB's margin or cost ----
+    tl = tpe.tenant_lines(m, tpe.find_site(m, "STANDARD ARMS"))
+    _check("tenant copy: only products with a deal (T.Lager, Guinness)",
+           sorted(x["code"] for x in tl) == ["090425", "GUI002"], str([x["code"] for x in tl]))
+    _check("tenant copy: no total or retro keys", all("total" not in x and "retro" not in x for x in tl))
+    tb = tpe.build_tenant_site_bytes(m, tpe.find_site(m, "STANDARD ARMS"))
+    twb = load_workbook(io.BytesIO(tb))
+    tws = twb.active
+    cells = [c.value for row in tws.iter_rows() for c in row if c.value is not None]
+    text = " ".join(str(v) for v in cells).lower()
+    _check("tenant copy: no formulas", not any(isinstance(v, str) and v.startswith("=") for v in cells))
+    for word in ("retro", "total discount", "net cost", "rpb", "substitution", "margin", "fb taverns total"):
+        _check(f"tenant copy: no '{word}'", word not in text)
+    _check("tenant copy: no total discount figure", not any(isinstance(v, (int, float)) and _near(v, 314.33, 0.001) for v in cells))
+    _check("tenant copy: no Tennents account number", "11110001" not in text)
+    _check("tenant copy: keg price present",
+           any(isinstance(v, float) and _near(v, tl[0]["net_keg"], 0.001) for v in cells)
+           and _near(tl[0]["net_keg"], tpe._price_line(m, tpe.find_site(m, "STANDARD ARMS"), m.find_sku("090425"))["net_keg"]))
+    tz = zipfile.ZipFile(io.BytesIO(tpe.build_tenant_zip_bytes(m)))
+    _check("tenant zip: managed site left out", len(tz.namelist()) == 2 and not any("MANAGED" in n for n in tz.namelist()),
+           str(tz.namelist()))
+
     # ---- Site_Prices parser round-trip ----
     _roundtrip_parse()
 
