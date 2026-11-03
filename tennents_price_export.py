@@ -419,6 +419,136 @@ def build_all_sites_zip_bytes(master: TennentsMaster, as_of: date | None = None)
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Tenant copy — safe to send to the tenant (Nick Madigan, Nov-2026).
+#
+# The team file above shows FB's agreed total discount, FB's retro (margin), FB's
+# net cost and the substitution band — none of which a tenant may see. The
+# tenant copy carries ONLY what the tenant's own Tennents invoice shows: the
+# list price (WSP), their off-invoice discount, and the net price per keg and
+# per pint, for the products they have a deal on. Values are written as plain
+# numbers, never formulas, so nothing in the workbook can be worked back to the
+# total discount or the retro. No Notes column: an exception note names the
+# loaded total discount.
+# ---------------------------------------------------------------------------
+
+TENANT_HEADERS = {
+    1: "SKU Code", 2: "Product", 3: "ABV %", 4: "List price (WSP) £/Brl",
+    5: "Your discount £/Brl", 6: "Your price £/Keg", 7: "Your price £/Pint",
+}
+_TENANT_MONEY = {4, 5, 6, 7}
+_TENANT_WIDTHS = {1: 12, 2: 32, 3: 7, 4: 16, 5: 16, 6: 15, 7: 15}
+
+
+def tenant_lines(master: TennentsMaster, site: SiteInfo) -> list[dict]:
+    """The tenant-safe rows for a site: products with an off-invoice deal in
+    place and a priced WSP, each reduced to the fields a tenant may see."""
+    out: list[dict] = []
+    for sku in master.skus:
+        ln = _price_line(master, site, sku)
+        if not ln["has_deal"] or ln["total"] is None or ln["wsp"] is None:
+            continue
+        out.append({
+            "category": ln["category"], "code": ln["code"], "brand": ln["brand"],
+            "abv": ln["abv"], "wsp": round(float(ln["wsp"]), 2),
+            "off": round(float(ln["off"]), 2),
+            "net_keg": round(float(ln["net_keg"]), 2),
+            "net_pint": round(float(ln["net_pint"]), 2),
+        })
+    return out
+
+
+def _write_tenant_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -> None:
+    bold = Font(bold=True)
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill("solid", fgColor="DDE6F2")
+    cat_fill = PatternFill("solid", fgColor="4A6A8A")
+    cat_font = Font(bold=True, size=10, color="FFFFFF")
+    last = max(TENANT_HEADERS)
+
+    ws["A1"] = "FB Taverns — Draught Price List (Tennents)"
+    ws["A1"].font = Font(bold=True, size=13, color="1F3B57")
+    ws["A2"] = f"Site: {site.site_name}    |    Prices effective: {as_of.isoformat()}"
+    ws["A2"].font = Font(size=9, color="555555")
+
+    r = 4
+    for c, h in TENANT_HEADERS.items():
+        hc = ws.cell(row=r, column=c, value=h)
+        hc.font = bold
+        hc.fill = header_fill
+        hc.border = border
+        hc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    r += 1
+    lines = tenant_lines(master, site)
+    if not lines:
+        ws.cell(row=r, column=1, value="— no products priced for this site —").font = Font(italic=True, color="888888")
+        r += 1
+    for cat, rows in _by_category(lines):
+        ws.cell(row=r, column=1, value=cat).font = cat_font
+        for c in range(1, last + 1):
+            ws.cell(row=r, column=c).fill = cat_fill
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=last)
+        r += 1
+        for ln in rows:
+            vals = {1: ln["code"], 2: ln["brand"], 3: ln["abv"], 4: ln["wsp"],
+                    5: ln["off"], 6: ln["net_keg"], 7: ln["net_pint"]}
+            for c, v in vals.items():
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.border = border
+                if c in _TENANT_MONEY and isinstance(v, (int, float)):
+                    cell.number_format = '"£"#,##0.00'
+                if c == _ABV_COL and isinstance(v, (int, float)):
+                    cell.number_format = '0.0"%"'
+            r += 1
+
+    foot = ws.cell(row=r + 1, column=1, value=(
+        "Prices are per Tennents' list price less your agreed discount, before VAT. "
+        "Your price per keg and per pint follow from the keg size. Products not listed have no "
+        "agreed discount — ask your area manager before ordering a new line."))
+    foot.font = Font(size=9, color="555555")
+    foot.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=last)
+    ws.row_dimensions[r + 1].height = 30
+
+    for c, w in _TENANT_WIDTHS.items():
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = "A5"
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+
+def tenant_filename(site: SiteInfo, as_of: date) -> str:
+    safe = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', " ", site.site_name).strip() or "Site"
+    return f"{safe} - Tennents Price List {as_of.isoformat()}.xlsx"
+
+
+def build_tenant_site_bytes(master: TennentsMaster, site: SiteInfo, as_of: date | None = None) -> bytes:
+    """One workbook, one site, safe to send to the tenant."""
+    as_of = as_of or date.today()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = _sanitize_tab(site.site_name, set())
+    _write_tenant_sheet(ws, master, site, as_of)
+    buf = io.BytesIO()
+    wb.save(buf)                      # plain values only: no recalculation needed
+    return buf.getvalue()
+
+
+def build_tenant_zip_bytes(master: TennentsMaster, as_of: date | None = None) -> bytes:
+    """A .zip of every tenanted site's tenant copy (managed sites have no tenant)."""
+    as_of = as_of or date.today()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for site in _sites_in_scope(master):
+            if site.is_managed:
+                continue
+            zf.writestr(tenant_filename(site, as_of), build_tenant_site_bytes(master, site, as_of))
+    return buf.getvalue()
+
+
 def _to_bytes(wb: Workbook) -> bytes:
     # openpyxl writes formulas without a cached result, so tell Excel to
     # recalculate on open — otherwise the live Net/Retro cells read blank/0 until
