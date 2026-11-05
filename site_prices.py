@@ -191,3 +191,69 @@ def build_site_index(snap, master) -> dict:
         if s.account and s.account.upper() != "TBC"
     ] if master is not None else []
     return {"lwc": lwc, "tennents": tennents}
+
+
+# ---------- prices agreed on a hub bar plan (POST /api/bar-plan-prices) ----------
+#
+# James, 5 Nov 2026: the area managers (Nick in Scotland, Adrian or Lewis in
+# England) put the tenant's price on the bar plan in the hub; Jason approves
+# it; the approved price then lands on the price file here, so nobody keys it
+# twice. The hub sends the tenant's price PER KEG for both files. LWC stores
+# exactly that. Tennent's stores the pub's off-invoice discount per barrel,
+# so the keg price is turned back into it: the tenant pays (WSP − off) × barrels
+# per keg, hence off = WSP − tenant keg ÷ barrels per keg.
+
+
+def parse_bar_plan_prices(body) -> tuple[dict | None, str]:
+    """Validate the hub's request. Returns (request, "") or (None, reason).
+
+    {"supplier": "lwc"|"tennents", "site": "<LWC site number or Tennent's
+    account>", "actor": "<approver's email>", "note": "BP-0007 …",
+    "lines": [{"code": "...", "tenant_keg": 177.11}, ...]}"""
+    if not isinstance(body, dict):
+        return None, "body must be a JSON object"
+    supplier = str(body.get("supplier") or "").strip().lower()
+    if supplier not in ("lwc", "tennents"):
+        return None, "supplier must be lwc or tennents"
+    site = str(body.get("site") or "").strip()
+    if not site:
+        return None, "site is required"
+    actor = str(body.get("actor") or "").strip()[:200]
+    if not actor:
+        return None, "actor is required"
+    raw = body.get("lines")
+    if not isinstance(raw, list) or not raw:
+        return None, "lines must be a non-empty list"
+    if len(raw) > 60:
+        return None, "at most 60 lines at a time"
+    lines = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, "each line must be an object"
+        code = str(item.get("code") or "").strip()
+        try:
+            tk = float(item.get("tenant_keg"))
+        except (TypeError, ValueError):
+            return None, f"line {code or '?'}: tenant_keg must be a number"
+        if not code:
+            return None, "each line needs a product code"
+        if not (0 < tk < 10000) or tk != tk:
+            return None, f"line {code}: tenant_keg must be between £0 and £10,000"
+        lines.append({"code": code, "tenant_keg": round(tk, 2)})
+    return {"supplier": supplier, "site": site, "actor": actor,
+            "note": str(body.get("note") or "").strip()[:300], "lines": lines}, ""
+
+
+def tennents_off_for_tenant_keg(wsp_per_brl, keg_brl, tenant_keg: float) -> float:
+    """The pub's off-invoice £/brl that makes the tenant pay ``tenant_keg`` a
+    keg. Raises ValueError with the reason when it can't be worked out or the
+    price is above the list price (the off-invoice would be negative)."""
+    if wsp_per_brl is None:
+        raise ValueError("no WSP on the master for this product, so a keg price can't be turned into an off-invoice")
+    if not keg_brl or keg_brl <= 0:
+        raise ValueError("barrels per keg not known for this product")
+    off = round(float(wsp_per_brl) - float(tenant_keg) / float(keg_brl), 2)
+    if off < -0.005:
+        list_keg = float(wsp_per_brl) * float(keg_brl)
+        raise ValueError(f"£{tenant_keg:,.2f} a keg is above the list price (£{list_keg:,.2f} a keg)")
+    return max(off, 0.0)

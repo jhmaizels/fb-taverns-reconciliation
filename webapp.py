@@ -79,7 +79,10 @@ from reconcile import (  # noqa: E402
 # so it stays off the cold-start / health-check readiness path.
 from support_parser import parse_support_request, validate_support_fields  # noqa: E402
 from deal_products import build_deal_products_payload, token_ok  # noqa: E402
-from site_prices import build_lwc_site_payload, build_site_index, build_tennents_site_payload  # noqa: E402
+from site_prices import (  # noqa: E402
+    build_lwc_site_payload, build_site_index, build_tennents_site_payload, parse_bar_plan_prices,
+    tennents_off_for_tenant_keg,
+)
 from airtable_io import (  # noqa: E402
     clear_rule_retro_pcts,
     set_product_retro_fields,
@@ -128,8 +131,8 @@ from tennents import (  # noqa: E402
 )
 from tennents_july_restore import RESTORE_NOTE, plan_july_restore  # noqa: E402
 from tennents_master import (  # noqa: E402
-    BAR_PLAN_SOURCE_PREFIX, parse_master_workbook, plan_add_site, plan_add_sku, plan_bar_plan_change,
-    plan_sku_rate_change,
+    BAR_PLAN_SOURCE_PREFIX, keg_brl_factor, parse_master_workbook, plan_add_site, plan_add_sku,
+    plan_bar_plan_change, plan_sku_rate_change,
 )
 import tennents_grid  # noqa: E402
 import price_history  # noqa: E402
@@ -1433,6 +1436,65 @@ def api_site_prices(request: Request, lwc_site: str = "", tennents_account: str 
     if payload is None:
         return JSONResponse({"detail": "pub not on the price file"}, status_code=404)
     return JSONResponse(payload)
+
+
+def _apply_bar_plan_line(req: dict, line: dict, master) -> dict:
+    """Put ONE approved bar plan price on the price file; never raises."""
+    code, tk = line["code"], line["tenant_keg"]
+    note = f"bar plan {req['note']}".strip() if req["note"] else "bar plan (hub)"
+    out = {"code": code, "tenant_keg": tk}
+    try:
+        if req["supplier"] == "lwc":
+            err = _apply_lwc_cell(req["site"], code, tk, req["actor"], note=note[:120])
+            return {**out, "ok": not err, "message": err or "set"}
+        sku = master.find_sku(code)
+        if sku is None:
+            return {**out, "ok": False, "message": "not on SKU_Master: add the product to the Tennent's master first"}
+        off = tennents_off_for_tenant_keg(sku.wsp_per_brl, keg_brl_factor(sku), tk)
+        change = plan_bar_plan_change(master, req["site"], code, f"{off:.2f}")
+        r = set_tennents_site_price(master, change, req["actor"], note)
+        return {**out, "ok": True, "off_invoice_per_brl": off,
+                "tenant_keg_applied": change.net_keg(off),
+                "message": "already" if r.get("action") == "already" else "set"}
+    except ValueError as exc:
+        return {**out, "ok": False, "message": str(exc)}
+    except Exception:
+        logger.exception("bar plan price %s %s %s failed", req["supplier"], req["site"], code)
+        return {**out, "ok": False, "message": "failed writing to the price file"}
+
+
+@app.post("/api/bar-plan-prices")
+async def api_bar_plan_prices(request: Request):
+    """Write the tenant prices on a bar plan Jason approved in the hub
+    (server-to-server, the same shared bearer token as /api/site-prices). The
+    approval is the hub's; this only puts the approved figures on the price
+    file, one line at a time, each through the same planner and writer as the
+    grid and the bar plan form, and says per line what happened."""
+    expected = os.environ.get("DEAL_PRODUCTS_TOKEN", "")
+    if not expected:
+        return JSONResponse({"detail": "feed not configured"}, status_code=503)
+    if not token_ok(request.headers.get("authorization"), expected):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "body must be JSON"}, status_code=400)
+    req, why = parse_bar_plan_prices(body)
+    if req is None:
+        return JSONResponse({"detail": why}, status_code=400)
+
+    def run():
+        master = load_tennents_master() if req["supplier"] == "tennents" else None
+        return [_apply_bar_plan_line(req, line, master) for line in req["lines"]]
+
+    try:
+        results = await run_in_threadpool(run)
+    except Exception:
+        logger.exception("bar-plan-prices failed")
+        return JSONResponse({"detail": "price files unavailable"}, status_code=503)
+    logger.info("bar plan prices (%s %s) by %s: %d set, %d refused", req["supplier"], req["site"], req["actor"],
+                sum(1 for r in results if r["ok"]), sum(1 for r in results if not r["ok"]))
+    return JSONResponse({"supplier": req["supplier"], "site": req["site"], "lines": results})
 
 
 @app.post("/upload-master", response_class=HTMLResponse)
