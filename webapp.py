@@ -3503,9 +3503,10 @@ def tennents_prices_index(principal: DrinksPrincipal = Depends(require_drinks_ro
 <a href="{ext_url('/tennents/export-prices?format=zip')}">.zip</a>, or the
 <a href="{ext_url('/tennents/export-prices')}">single master workbook</a> (a tab per site).</p>
 <p class="sub"><strong>Sending to a tenant?</strong> Use <strong>Tenant copy</strong>. The price file
-shows FB's total discount, retro and cost, so it is for the team only. The tenant copy lists just the
-products the pub has a deal on, with the list price, the tenant's discount and their price per keg and
-per pint. All tenant copies as a <a href="{ext_url('/tennents/export-prices?copy=tenant&format=zip')}">.zip</a>.</p>
+shows FB's total discount, retro and cost, so it is for the team only. The tenant copy shows the
+pub's own prices (list price, the tenant's discount, price per keg and per pint) and then the rest of
+the range at Tennents' list price with the discount marked "by agreement", so it also works for a
+prospective tenant. All tenant copies as a <a href="{ext_url('/tennents/export-prices?copy=tenant&format=zip')}">.zip</a>.</p>
 {_tennents_master_banner_html()}
 {layer_warning}
 <table><thead><tr><th>Site</th><th>Tennents account</th><th>Price file (team only)</th><th>For the tenant</th></tr></thead>

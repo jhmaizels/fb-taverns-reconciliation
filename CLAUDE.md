@@ -266,6 +266,13 @@ Key facts:
   Rates/WSP from `SKU_Master`; per-site off-invoice from `TennentsSitePrices`
   (`tennents_price_export.py`). Managed sites = all off-invoice; bespoke split
   is not modelled (total only). NOT a master write.
+  **`?copy=tenant`** (one pub, or `&format=zip` for all tenanted pubs) is the
+  TENANT copy, safe to send to a tenant or a prospective one (Nick Madigan,
+  Nov 2026): "Your prices" (deal products: WSP, the tenant's off-invoice, net
+  £/keg and £/pint) then "Other products available" (every other product with a
+  WSP, at list price, discount "By agreement"). Plain values, no formulas, no
+  total discount, retro, FB cost, substitution band, notes or account number —
+  `test_tennents_price_export.py` checks each. Never add one of those to it.
 - **`POST /tennents/accept-sku`** (admin, JSON): the Tennents findings page's
   Add-to-master buttons (LWC parity). `airtable_io.accept_tennents_sku` modes:
   `link` — a new report code for an EXISTING SKU (the usual "unknown product":

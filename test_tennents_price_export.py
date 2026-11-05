@@ -276,6 +276,14 @@ def run():
     _check("tenant copy: keg price present",
            any(isinstance(v, float) and _near(v, tl[0]["net_keg"], 0.001) for v in cells)
            and _near(tl[0]["net_keg"], tpe._price_line(m, tpe.find_site(m, "STANDARD ARMS"), m.find_sku("090425"))["net_keg"]))
+    tr = tpe.tenant_range_lines(m, tpe.find_site(m, "STANDARD ARMS"))
+    _check("tenant copy: other range lists the no-deal products with a WSP (Jeffrey's)",
+           [x["code"] for x in tr] == ["400889"], str([x["code"] for x in tr]))
+    _check("tenant copy: other range shows no discount", all(x["off"] is None for x in tr))
+    _check("tenant copy: other range at list price per keg",
+           _near(tr[0]["net_keg"], round(m.find_sku("400889").wsp_per_brl * keg_brl_factor(m.find_sku("400889")), 2), 0.001))
+    _check("tenant copy: 'By agreement' shown for the other range", "by agreement" in text)
+    _check("tenant copy: Jeffrey's in the workbook", any(v == "400889" for v in cells))
     tz = zipfile.ZipFile(io.BytesIO(tpe.build_tenant_zip_bytes(m)))
     _check("tenant zip: managed site left out", len(tz.namelist()) == 2 and not any("MANAGED" in n for n in tz.namelist()),
            str(tz.namelist()))
