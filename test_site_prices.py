@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from reconcile import Rule
 from site_prices import (
     build_lwc_site_payload, build_site_index, build_tennents_site_payload, litres_from_description,
+    parse_bar_plan_prices, tennents_off_for_tenant_keg,
 )
 from tennents_master import LITRES_PER_BRL, SiteInfo, SitePrice, SkuRate, TennentsMaster
 
@@ -100,6 +101,29 @@ def main() -> int:
     idx = build_site_index(snap, master)
     check("index: lwc sites", [s["site_id"] for s in idx["lwc"]] == ["817", "824"])
     check("index: tennents sites by name", [s["name"] for s in idx["tennents"]][0] == "Gartocher")
+
+    # --- bar plan prices (POST /api/bar-plan-prices) -------------------------
+    req, why = parse_bar_plan_prices({"supplier": "tennents", "site": "17597274", "actor": "jason@x",
+                                      "note": "BP-0002", "lines": [{"code": "401211", "tenant_keg": "177.111"}]})
+    check("bp: parsed", req is not None and req["lines"] == [{"code": "401211", "tenant_keg": 177.11}])
+    check("bp: bad supplier", parse_bar_plan_prices({"supplier": "x"})[0] is None)
+    check("bp: no lines", parse_bar_plan_prices({"supplier": "lwc", "site": "1", "actor": "a", "lines": []})[0] is None)
+    check("bp: no actor", parse_bar_plan_prices({"supplier": "lwc", "site": "1", "lines": [{"code": "A", "tenant_keg": 1}]})[0] is None)
+    check("bp: zero price refused",
+          parse_bar_plan_prices({"supplier": "lwc", "site": "1", "actor": "a", "lines": [{"code": "A", "tenant_keg": 0}]})[0] is None)
+    check("bp: text price refused",
+          parse_bar_plan_prices({"supplier": "lwc", "site": "1", "actor": "a", "lines": [{"code": "A", "tenant_keg": "x"}]})[0] is None)
+    # Real McCoy T.Lager, Aug 2026: WSP £641.62/brl, 11G keg 0.3055 brl, tenant
+    # pays £153.16 -> off-invoice £140.43/brl.
+    off = tennents_off_for_tenant_keg(641.62, 0.3055, 153.16)
+    check("bp: keg price -> off-invoice", abs(off - 140.29) < 0.2)
+    check("bp: list price -> off 0", tennents_off_for_tenant_keg(600.0, 0.5, 300.0) == 0.0)
+    for args in ((600.0, 0.5, 300.01), (None, 0.5, 100.0), (600.0, 0.0, 100.0)):
+        try:
+            tennents_off_for_tenant_keg(*args)
+            check(f"bp: refused {args}", False)
+        except ValueError:
+            check(f"bp: refused {args}", True)
 
     print("OK" if ok else "FAILED")
     return 0 if ok else 1

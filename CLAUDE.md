@@ -100,6 +100,14 @@ Module map:
   unlocked in `pricer_template/`; the download is locked again with the
   password Tennents use (`TENNENTS_PRICER_PASSWORD` overrides, empty = unlocked).
   When Tennents send a new pricer (new WSP, new rows), replace the template file.
+- `site_prices.py` — the hub's bar plan feed (`GET /api/site-prices`, one
+  pub's prices and margins, read-only) and the write-back of prices Jason
+  approved on a hub bar plan (`POST /api/bar-plan-prices`, same bearer token
+  `DEAL_PRODUCTS_TOKEN`). The hub sends the tenant's price per keg; LWC takes it
+  as the cell price through `_apply_lwc_cell`, Tennent's turns it into the pub's
+  off-invoice (WSP − keg price ÷ barrels per keg) through
+  `plan_bar_plan_change` + `set_tennents_site_price`. Each line succeeds or is
+  refused with its reason; nothing is retried. The approval itself is the hub's.
 - `seed_tennents_site_prices.py` — one-off: seed the per-site off-invoice
   `Site_Prices` layer into the master workbook from the team's price files.
 
