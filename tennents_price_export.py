@@ -458,13 +458,47 @@ def tenant_lines(master: TennentsMaster, site: SiteInfo) -> list[dict]:
     return out
 
 
+def tenant_range_lines(master: TennentsMaster, site: SiteInfo) -> list[dict]:
+    """The rest of the range for the tenant copy (Nick Madigan, 5 Nov 2026:
+    tenants and prospective tenants want to see the full range before deciding
+    on a change). Every product with a WSP that the site has NO deal on, at
+    Tennents' list price: no discount is shown, because any discount on a new
+    line is agreed with the area manager and the figure on the master is FB's
+    total, not the tenant's. Prices per keg and per pint are WSP-based."""
+    out: list[dict] = []
+    for sku in master.skus:
+        ln = _price_line(master, site, sku)
+        if ln["has_deal"] and ln["total"] is not None:
+            continue                       # already in the "your prices" section
+        if sku.wsp_per_brl is None:
+            continue
+        wsp = float(sku.wsp_per_brl)
+        bpu = keg_brl_factor(sku)
+        out.append({
+            "category": ln["category"], "code": ln["code"], "brand": ln["brand"],
+            "abv": ln["abv"], "wsp": round(wsp, 2), "off": None,
+            "net_keg": round(wsp * bpu, 2) if bpu else None,
+            "net_pint": round(wsp / PINTS_PER_BRL, 2),
+        })
+    return out
+
+
+TENANT_RANGE_HEADERS = {
+    1: "SKU Code", 2: "Product", 3: "ABV %", 4: "List price (WSP) £/Brl",
+    5: "Discount", 6: "List price £/Keg", 7: "List price £/Pint",
+}
+
+
 def _write_tenant_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date) -> None:
     bold = Font(bold=True)
     thin = Side(style="thin", color="CCCCCC")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     header_fill = PatternFill("solid", fgColor="DDE6F2")
+    section_fill = PatternFill("solid", fgColor="1F3B57")
+    section_font = Font(bold=True, size=11, color="FFFFFF")
     cat_fill = PatternFill("solid", fgColor="4A6A8A")
     cat_font = Font(bold=True, size=10, color="FFFFFF")
+    centre = Alignment(horizontal="center", vertical="center", wrap_text=True)
     last = max(TENANT_HEADERS)
 
     ws["A1"] = "FB Taverns — Draught Price List (Tennents)"
@@ -472,48 +506,64 @@ def _write_tenant_sheet(ws, master: TennentsMaster, site: SiteInfo, as_of: date)
     ws["A2"] = f"Site: {site.site_name}    |    Prices effective: {as_of.isoformat()}"
     ws["A2"].font = Font(size=9, color="555555")
 
-    r = 4
-    for c, h in TENANT_HEADERS.items():
-        hc = ws.cell(row=r, column=c, value=h)
-        hc.font = bold
-        hc.fill = header_fill
-        hc.border = border
-        hc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    r += 1
-    lines = tenant_lines(master, site)
-    if not lines:
-        ws.cell(row=r, column=1, value="— no products priced for this site —").font = Font(italic=True, color="888888")
-        r += 1
-    for cat, rows in _by_category(lines):
-        ws.cell(row=r, column=1, value=cat).font = cat_font
+    def _band(row, text, fill, font):
+        ws.cell(row=row, column=1, value=text).font = font
         for c in range(1, last + 1):
-            ws.cell(row=r, column=c).fill = cat_fill
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=last)
-        r += 1
-        for ln in rows:
-            vals = {1: ln["code"], 2: ln["brand"], 3: ln["abv"], 4: ln["wsp"],
-                    5: ln["off"], 6: ln["net_keg"], 7: ln["net_pint"]}
-            for c, v in vals.items():
-                cell = ws.cell(row=r, column=c, value=v)
-                cell.border = border
-                if c in _TENANT_MONEY and isinstance(v, (int, float)):
-                    cell.number_format = '"£"#,##0.00'
-                if c == _ABV_COL and isinstance(v, (int, float)):
-                    cell.number_format = '0.0"%"'
-            r += 1
+            ws.cell(row=row, column=c).fill = fill
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=last)
+
+    def _section(row, title, headers, lines, empty_text):
+        _band(row, title, section_fill, section_font)
+        row += 1
+        for c, h in headers.items():
+            hc = ws.cell(row=row, column=c, value=h)
+            hc.font = bold
+            hc.fill = header_fill
+            hc.border = border
+            hc.alignment = centre
+        row += 1
+        if not lines:
+            ws.cell(row=row, column=1, value=empty_text).font = Font(italic=True, color="888888")
+            return row + 1
+        for cat, rows in _by_category(lines):
+            _band(row, cat, cat_fill, cat_font)
+            row += 1
+            for ln in rows:
+                off = ln["off"] if ln["off"] is not None else "By agreement"
+                vals = {1: ln["code"], 2: ln["brand"], 3: ln["abv"], 4: ln["wsp"],
+                        5: off, 6: ln["net_keg"], 7: ln["net_pint"]}
+                for c, v in vals.items():
+                    cell = ws.cell(row=row, column=c, value=v)
+                    cell.border = border
+                    if c in _TENANT_MONEY and isinstance(v, (int, float)):
+                        cell.number_format = '"£"#,##0.00'
+                    if c == _ABV_COL and isinstance(v, (int, float)):
+                        cell.number_format = '0.0"%"'
+                    if c == 5 and isinstance(v, str):
+                        cell.alignment = Alignment(horizontal="center")
+                        cell.font = Font(italic=True, color="555555")
+                row += 1
+        return row
+
+    r = _section(4, "Your prices — products with an agreed discount", TENANT_HEADERS,
+                 tenant_lines(master, site), "— no agreed discounts on file for this site —")
+    r += 1
+    r = _section(r, "Other products available — Tennents list price before any discount",
+                 TENANT_RANGE_HEADERS, tenant_range_lines(master, site), "— none —")
 
     foot = ws.cell(row=r + 1, column=1, value=(
-        "Prices are per Tennents' list price less your agreed discount, before VAT. "
-        "Your price per keg and per pint follow from the keg size. Products not listed have no "
-        "agreed discount — ask your area manager before ordering a new line."))
+        "Prices are before VAT. 'Your prices' are Tennents' list price less your agreed discount. "
+        "'Other products available' are shown at Tennents' list price: a discount on a new line is "
+        "agreed with your area manager before you order it. Per keg and per pint prices follow from "
+        "the keg size."))
     foot.font = Font(size=9, color="555555")
     foot.alignment = Alignment(wrap_text=True, vertical="top")
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=last)
-    ws.row_dimensions[r + 1].height = 30
+    ws.row_dimensions[r + 1].height = 42
 
     for c, w in _TENANT_WIDTHS.items():
         ws.column_dimensions[get_column_letter(c)].width = w
-    ws.freeze_panes = "A5"
+    ws.freeze_panes = "A4"
     ws.page_setup.orientation = "portrait"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
