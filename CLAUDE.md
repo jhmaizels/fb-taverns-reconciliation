@@ -100,6 +100,12 @@ Module map:
   unlocked in `pricer_template/`; the download is locked again with the
   password Tennents use (`TENNENTS_PRICER_PASSWORD` overrides, empty = unlocked).
   When Tennents send a new pricer (new WSP, new rows), replace the template file.
+  The download stores each formula's RESULT beside the formula
+  (`_with_cached_values`): openpyxl saves formulas with an empty result, so a
+  pricer opened in Protected View, Outlook or on a phone showed net price per
+  brl/keg/pint and retro blank (Nick Madigan, Corner House, 13 Nov 2026). Only
+  plain cell arithmetic is worked out; a new template formula with a function
+  in it is left for Excel to calculate.
 - `site_prices.py` — the hub's bar plan feed (`GET /api/site-prices`, one
   pub's prices and margins, read-only) and the write-back of prices Jason
   approved on a hub bar plan (`POST /api/bar-plan-prices`, same bearer token
