@@ -106,6 +106,22 @@ def run():
     _check("Tennents' total untouched", ws.cell(r, 6).value == 314.33)
     _check("retro formula kept", ws.cell(r, 11).value == f"=F{r}-J{r}")
 
+    # the results are stored too, so Protected View, Outlook and phones show them
+    vals = load_workbook(io.BytesIO(data), data_only=True)
+    vb, vc = vals["BDM Copy"], vals["Customer Copy"]
+    r = row_of(ws, "Jeffreys Lager")
+    _check("net per brl stored", vb.cell(r, 7).value == round(538.39 - 302.97, 10), repr(vb.cell(r, 7).value))
+    _check("net per keg stored", abs(vb.cell(r, 8).value - (538.39 - 118.0) / 36 * 11) < 1e-6,
+           repr(vb.cell(r, 8).value))
+    _check("net per pint stored", abs(vb.cell(r, 9).value - (538.39 - 118.0) / 36 * 11 / 88) < 1e-6)
+    _check("retro stored", abs(vb.cell(r, 11).value - (302.97 - 118.0)) < 1e-6)
+    _check("formula kept beside its result", ws.cell(r, 8).value == f"=((E{r}-J{r})/36)*11")
+    r_un = row_of(ws, "Heverlee")
+    _check("unsold row: net per keg at full WSP", abs(vb.cell(r_un, 8).value - 788.01 / 36 * 11) < 1e-6)
+    _check("Customer Copy net per keg follows BDM Copy",
+           abs(vc["F8"].value - vb.cell(r, 8).value) < 1e-9, repr(vc["F8"].value))
+    _check("Customer Copy GP% with no retail price left to Excel", vc["I7"].value is None, repr(vc["I7"].value))
+
     names = [s.product for s, _ in check.not_on_pricer]
     _check("Kingfisher listed as not on the pricer", names == ["Kingfisher"], repr(names))
     differs = [ln.brand for ln in check.total_differs]

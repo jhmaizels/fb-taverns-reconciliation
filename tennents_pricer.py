@@ -35,6 +35,7 @@ import io
 import os
 import re
 import zipfile
+from xml.sax.saxutils import escape as _xml_escape
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -205,7 +206,129 @@ def build_pricer_bytes(master: TennentsMaster, site: SiteInfo, as_of: date | Non
     wb.calculation.fullCalcOnLoad = True
     buf = io.BytesIO()
     wb.save(buf)
-    return _encrypt(buf.getvalue(), _password() if password is None else password), check
+    data = _with_cached_values(buf.getvalue(), _formula_values(wb))
+    return _encrypt(data, _password() if password is None else password), check
+
+
+# --- Cached formula results ------------------------------------------------
+# openpyxl saves a formula with an EMPTY result, and only Excel with editing
+# enabled recalculates it. A pricer downloaded from the app or opened from an
+# email opens in Protected View, and Outlook, phones and loaders that read the
+# stored values see the same thing: the net price per brl, per keg and per
+# pint and the retro all blank (Nick Madigan, Corner House, 13 Nov 2026). So
+# the file carries each result as well as the formula. The template's
+# formulas are plain arithmetic on cells (E7-F7, ((E7-J7)/36)*11, (H7/88),
+# 'BDM Copy'!H7); anything else (#REF!, a function) is left for Excel.
+
+_REF = re.compile(r"(?:'([^']+)'!)?\$?([A-Z]{1,3})\$?(\d+)")
+_SAFE = re.compile(r"^[0-9.eE+\-*/() ]+$")
+
+
+def _formula_values(wb) -> dict[tuple[str, str], float]:
+    """{(sheet, cell): result} for every formula the template's arithmetic
+    can work out. A blank cell counts as 0, as in Excel; a division by zero
+    or a reference to text gives no result."""
+    memo: dict[tuple[str, str], float | None] = {}
+
+    def value(sheet: str, coord: str, depth: int = 0) -> float | None:
+        key = (sheet, coord)
+        if key in memo:
+            return memo[key]
+        memo[key] = None  # cycle guard
+        if sheet not in wb.sheetnames or depth > 20:
+            return None
+        v = wb[sheet][coord].value
+        if v is None or v == "":
+            out = 0.0
+        elif isinstance(v, bool):
+            out = None
+        elif isinstance(v, (int, float)):
+            out = float(v)
+        elif isinstance(v, str) and v.startswith("="):
+            out = evaluate(sheet, v[1:], depth)
+        else:
+            out = None
+        memo[key] = out
+        return out
+
+    def evaluate(sheet: str, expr: str, depth: int) -> float | None:
+        if "#" in expr:  # #REF! and the like: Excel's to show
+            return None
+        failed = False
+
+        def sub(m):
+            nonlocal failed
+            ref_sheet = m.group(1) or sheet
+            v = value(ref_sheet, f"{m.group(2)}{m.group(3)}", depth + 1)
+            if v is None:
+                failed = True
+                return "0"
+            return f"({v!r})"
+
+        py = _REF.sub(sub, expr)
+        if failed or not _SAFE.match(py):
+            return None
+        try:
+            return float(eval(py, {"__builtins__": {}}, {}))  # digits and + - * / ( ) only
+        except (ZeroDivisionError, ArithmeticError, SyntaxError):
+            return None
+
+    out: dict[tuple[str, str], float] = {}
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if isinstance(c.value, str) and c.value.startswith("="):
+                    v = value(ws.title, c.coordinate)
+                    if v is not None:
+                        out[(ws.title, c.coordinate)] = round(v, 10)
+    return out
+
+
+def _sheet_paths(z: zipfile.ZipFile) -> dict[str, str]:
+    """Sheet name -> its part in the package, through workbook.xml's rels."""
+    wbx = z.read("xl/workbook.xml").decode("utf-8")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    targets = {m.group(1): m.group(2) for m in
+               re.finditer(r'<Relationship[^>]*?Id="([^"]+)"[^>]*?Target="([^"]+)"', rels)}
+    targets.update({m.group(2): m.group(1) for m in
+                    re.finditer(r'<Relationship[^>]*?Target="([^"]+)"[^>]*?Id="([^"]+)"', rels)})
+    out = {}
+    for m in re.finditer(r'<sheet\b[^>]*?name="([^"]+)"[^>]*?r:id="([^"]+)"', wbx):
+        t = targets.get(m.group(2), "")
+        out[m.group(1).replace("&amp;", "&").replace("&apos;", "'")] = (
+            t.lstrip("/") if t.startswith("/") else "xl/" + t)
+    return out
+
+
+def _with_cached_values(data: bytes, values: dict[tuple[str, str], float]) -> bytes:
+    """Write each formula's result into its cell's empty <v> in the saved
+    package. Only cells openpyxl wrote as <f>..</f><v></v> are touched."""
+    if not values:
+        return data
+    src = zipfile.ZipFile(io.BytesIO(data))
+    paths = _sheet_paths(src)
+    by_part: dict[str, dict[str, float]] = {}
+    for (sheet, coord), v in values.items():
+        if sheet in paths:
+            by_part.setdefault(paths[sheet], {})[coord] = v
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            raw = src.read(item.filename)
+            cells = by_part.get(item.filename)
+            if cells:
+                xml = raw.decode("utf-8")
+
+                def put(m):
+                    v = cells.get(m.group(2))
+                    if v is None:
+                        return m.group(0)
+                    return f"{m.group(1)}<f>{m.group(3)}</f><v>{_xml_escape(repr(v))}</v></c>"
+
+                xml = re.sub(r'(<c r="([A-Z]+\d+)"[^>]*>)<f>(.*?)</f><v\s*/?>(?:</v>)?</c>', put, xml)
+                raw = xml.encode("utf-8")
+            dst.writestr(item, raw)
+    return buf.getvalue()
 
 
 def pricer_filename(site: SiteInfo, as_of: date | None = None) -> str:
