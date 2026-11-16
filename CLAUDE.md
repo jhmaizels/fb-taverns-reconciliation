@@ -147,7 +147,7 @@ Key facts:
   retro or Tennents findings table. Types: LWC (`wrong_tenant_price`,
   `wrong_fb_price`, `site_should_be_managed`, `unknown_site`,
   `line_without_site`, `product_not_on_master`, `tenant_price_missing`,
-  `lwc_arithmetic_error`);
+  `lwc_arithmetic_error`, `fb_account_not_at_cost`);
   Tennents (`tennents_wrong_discount`, `_exception_pending`,
   `_exception_resolved`, `_retro_arithmetic`, `_line_arithmetic`,
   `_managed_retro_split`, `_no_agreed_rate`, `_not_on_master`,
@@ -476,8 +476,16 @@ that close, never compounding it.
    (medium) for a real site number that is simply not on the master. The
    split matters because the remedies differ: a siteless line is attributed
    at source, and filing it as a missing site invites someone to create
-   site 0. Else product not in active master →
-   `product_not_on_master` (medium); else → `tenant_price_missing` (medium).
+   site 0. **Exception (16 Nov 2026): stock on FB's OWN account**
+   (`reconcile.FB_OWN_ACCOUNTS`, today FF1031 = FB TAVERNS FH LIMITED) also
+   has SITE ID 0, but LWC names the pub in the DEL NAME column (Robin Price,
+   LWC). `is_fb_account_stock` catches these lines before `line_without_site`:
+   they are not findings and are not asked of LWC; the summary lists them as
+   "Stock FB paid for" by pub (`summary.FbStockRow`, matched to our site by
+   name with `match_del_name`, unique match only). FB is billed LWC's MASTER
+   (cost) for them, so the one check is unit = master within `fb_tolerance`,
+   else `fb_account_not_at_cost`. A new FB account goes in `FB_OWN_ACCOUNTS`.
+   Else product not in active master → `product_not_on_master` (medium); else → `tenant_price_missing` (medium).
    If rule found and `status=='managed'` → `site_should_be_managed` (skips price
    checks).
 3. If a rule is found but its **tenant_price is blank** → `tenant_price_missing`

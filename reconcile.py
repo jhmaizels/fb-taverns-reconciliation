@@ -440,6 +440,8 @@ LWC_COLUMN_MAP = {
     "SITE ID": "site_id",
     "ACCOUNT": "account_name",
     "OUTLET": "account_name",  # newer LWC files (Apr 2026+) renamed ACCOUNT → OUTLET
+    "DEL POINT": "del_point",
+    "DEL NAME": "del_name",
     "PRODUCT CODE": "product_code",
     "PRODUCT DESC": "product_desc",
     "INVOICE NO": "invoice_no",
@@ -461,6 +463,14 @@ LWC_COLUMN_MAP = {
 # bridge is mainly future-proofing / used only in diagnostics.
 ACCOUNT_BRIDGE: dict[str, str] = {}
 
+# LWC accounts that are FB Taverns' OWN, not a tenant's. Stock booked on one
+# of these is bought by FB (opening stock after a refurb, a support keg) and
+# billed at LWC's MASTER (cost) price. LWC gives such a line no SITE ID (0);
+# the pub it went to is in the DEL NAME column (LWC, Robin Price, 16 Nov
+# 2026: "All products ordered under this account FF1031 are shown in Column I
+# (Del Name)"). FF1031 = FB TAVERNS FH LIMITED.
+FB_OWN_ACCOUNTS: frozenset[str] = frozenset({"FF1031"})
+
 
 @dataclass
 class InvoiceLine:
@@ -475,6 +485,10 @@ class InvoiceLine:
     master_price: float
     diff_master: float
     account_no: str = ""  # LWC customer account number (ACCOUNT NO column), if present
+    # LWC DEL POINT / DEL NAME: the delivery address on the account. On FB's
+    # own account (FB_OWN_ACCOUNTS) DEL NAME is the only thing naming the pub.
+    del_point: str = ""
+    del_name: str = ""
     # 1-based row of this line in the source sheet (the Excel row number).
     # parse_lwc_sales always sets it; it is the stable per-file disambiguator
     # in Mismatches.mismatch_key (airtable_io.write_mismatches). None when a
@@ -565,6 +579,8 @@ def parse_lwc_sales(path: str) -> list[InvoiceLine]:
                 master_price=master,
                 diff_master=diff,
                 account_no=_to_str_code(row.get("account_no")) if not pd.isna(row.get("account_no")) else "",
+                del_point=_to_str_code(row.get("del_point")) if not pd.isna(row.get("del_point")) else "",
+                del_name=str(row.get("del_name")).strip() if not pd.isna(row.get("del_name")) else "",
                 # Default RangeIndex: idx is the 0-based data row; the header
                 # sits on Excel row 1, so the line is on row idx + 2.
                 row_no=int(idx) + 2,
@@ -669,6 +685,20 @@ def names_no_site(site_id: str) -> bool:
         return float(s) == 0.0
     except ValueError:
         return False
+
+
+def is_fb_account_stock(line: "InvoiceLine") -> bool:
+    """True when a line is stock FB Taverns bought on its OWN LWC account for
+    a pub: no SITE ID, an account in FB_OWN_ACCOUNTS, and a DEL NAME naming
+    where it went. Such a line is not "siteless" in the sense of
+    `line_without_site` — LWC's file already says which pub it was for, so
+    asking LWC is pointless (it was, every week, until 16 Nov 2026). It
+    carries no tenant price; FB pays LWC's MASTER (cost) price for it."""
+    return (
+        names_no_site(line.site_id)
+        and (line.account_no or "").strip().upper() in FB_OWN_ACCOUNTS
+        and bool((line.del_name or "").strip())
+    )
 
 
 def is_support_rule(r: Rule) -> bool:
@@ -912,6 +942,29 @@ def reconcile_lines(
                 # A line naming no pub is a different problem from a pub that
                 # is missing from the master, and has a different remedy: the
                 # line needs attributing at source, not a new site record.
+                if is_fb_account_stock(line):
+                    # Stock FB bought for a pub on its own account: listed on
+                    # the summary as "Stock FB paid for", by pub. The only
+                    # thing to check is that FB was billed at cost.
+                    if abs(line.unit_price - line.master_price) > fb_tolerance:
+                        d = line.unit_price - line.master_price
+                        mismatches.append(
+                            Mismatch(
+                                type="fb_account_not_at_cost",
+                                severity=_severity(d * line.qty),
+                                line=line,
+                                expected_fb_price=line.master_price,
+                                actual_fb_price=line.unit_price,
+                                delta_per_unit=d,
+                                delta_total=d * line.qty,
+                                notes=(
+                                    f"Stock on FB's own account {line.account_no} for "
+                                    f"{line.del_name} billed at £{line.unit_price:.2f}, "
+                                    f"not LWC's cost (MASTER) £{line.master_price:.2f}"
+                                ),
+                            )
+                        )
+                    continue
                 if names_no_site(line.site_id):
                     mismatches.append(
                         Mismatch(

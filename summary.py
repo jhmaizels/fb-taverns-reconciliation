@@ -17,7 +17,7 @@ from datetime import date, timedelta
 from html import escape
 from typing import Iterable
 
-from reconcile import InvoiceLine, Mismatch  # type: ignore
+from reconcile import InvoiceLine, Mismatch, is_fb_account_stock  # type: ignore
 
 
 # ---------- data shapes ----------
@@ -83,6 +83,27 @@ class OtherFindingRow:
 
 
 @dataclass
+class FbStockRow:
+    """One line of stock FB bought for a pub on its own LWC account."""
+    del_name: str          # LWC DEL NAME: the pub as LWC's delivery address names it
+    del_point: str
+    site_id: str           # our site, when DEL NAME names exactly one; else ""
+    site_name: str
+    invoice_no: str
+    invoice_date: str      # ISO
+    account_no: str
+    product_code: str
+    product_desc: str
+    qty: float
+    charged: float         # LWC UNIT
+    cost: float            # LWC MASTER
+
+    @property
+    def total(self) -> float:
+        return self.charged * self.qty
+
+
+@dataclass
 class Summary:
     file_name: str
     line_count: int
@@ -100,6 +121,39 @@ class Summary:
     # without it (tests, any older caller) is simply empty rather than a
     # TypeError.
     lines_without_site: list[OtherFindingRow] = field(default_factory=list)
+    # Stock FB bought for pubs on its own LWC account (reconcile.FB_OWN_ACCOUNTS):
+    # no SITE ID, the pub named in DEL NAME. Listed by pub, never asked of LWC.
+    fb_paid_stock: list[FbStockRow] = field(default_factory=list)
+
+
+# ---------- FB-account stock: which pub DEL NAME names ----------
+
+# Words that say nothing about WHICH pub a name means.
+_NAME_NOISE = {"THE", "T", "A", "TA", "LTD", "LIMITED", "NEW", "PUB", "PUBS", "CO", "AND", "OF"}
+
+
+def _name_tokens(name: str) -> frozenset[str]:
+    words = re.findall(r"[A-Z0-9]+", (name or "").upper().replace("'", ""))
+    return frozenset(w for w in words if w not in _NAME_NOISE and not w.isdigit())
+
+
+def match_del_name(del_name: str, names: dict[str, str]) -> str:
+    """The site id whose name DEL NAME names, or "" when none or several do.
+
+    LWC's delivery names are short ("CROOK HOTEL", "THE SWISS BELL") where our
+    site names may be longer ("STEPHEN WILSON PUBS LTD T/A CROOK HOTEL") or
+    shorter ("THE BELL"). A site matches when, ignoring words like THE / LTD /
+    T/A, all of one name's words are in the other. Only a UNIQUE match counts;
+    otherwise the row shows LWC's name alone rather than a guess."""
+    want = _name_tokens(del_name)
+    if not want:
+        return ""
+    hits = set()
+    for sid, nm in names.items():
+        have = _name_tokens(nm)
+        if have and (want <= have or have <= want):
+            hits.add(sid)
+    return next(iter(hits)) if len(hits) == 1 else ""
 
 
 # ---------- builder ----------
@@ -280,7 +334,11 @@ def build_summary(
             # product to find it in the source file. It also keeps this block's
             # row count equal to its share of the headline mismatch count.
             lines_without_site.append(OtherFindingRow(
-                site_id=line.site_id, site_name=line.site_name,
+                site_id=line.site_id,
+                # The OUTLET column is "0" on these; LWC's DEL NAME, when it
+                # has one, is the best clue to the pub for whoever chases it.
+                site_name=(line.del_name if (line.site_name or "").strip("0 ") == ""
+                           and line.del_name else line.site_name),
                 product_code=line.product_code, product_desc=line.product_desc,
                 qty=line.qty, notes=m.notes, charged=line.unit_price,
                 cost=line.master_price, invoice_no=line.invoice_no,
@@ -299,6 +357,33 @@ def build_summary(
         else:
             other_counts[t] = other_counts.get(t, 0) + 1
 
+    # 4d. Stock FB paid for. Built from the LINES, not the mismatches: these
+    # lines are not findings (FB bought them on its own account, at cost); a
+    # line billed above cost ALSO appears under "Other" as
+    # fb_account_not_at_cost.
+    site_names: dict[str, str] = {}
+    for sid, info in (sites_master or {}).items():
+        if (info or {}).get("name"):
+            site_names[sid] = info["name"]
+    for l in lines:
+        if l.site_id and l.site_name and l.site_id not in site_names and l.site_id.strip("0"):
+            site_names[l.site_id] = l.site_name
+    fb_paid_stock: list[FbStockRow] = []
+    for l in lines:
+        if not is_fb_account_stock(l):
+            continue
+        sid = match_del_name(l.del_name, site_names)
+        fb_paid_stock.append(FbStockRow(
+            del_name=l.del_name, del_point=l.del_point or "",
+            site_id=sid, site_name=site_names.get(sid, "") if sid else "",
+            invoice_no=l.invoice_no,
+            invoice_date=l.invoice_date.isoformat() if l.invoice_date else "",
+            account_no=l.account_no or "", product_code=l.product_code,
+            product_desc=l.product_desc, qty=_fin(l.qty),
+            charged=_fin(l.unit_price), cost=_fin(l.master_price),
+        ))
+    fb_paid_stock.sort(key=lambda r: (r.del_name, r.invoice_date, r.invoice_no, r.product_code))
+
     products_not_on_master = _finalize(_pnm)
     tenant_price_missing = _finalize(_tpm)
     products_not_on_master.sort(key=lambda r: (r.product_code, r.site_id))
@@ -316,6 +401,7 @@ def build_summary(
         tenant_price_missing=tenant_price_missing,
         sites_in_sales_not_on_master=sites_in_sales_not_on_master,
         lines_without_site=lines_without_site,
+        fb_paid_stock=fb_paid_stock,
         other_counts=other_counts,
         total_tenant_delta=sum(b.total_delta for b in tenant_blocks),
         total_fb_delta=sum(b.total_delta for b in fb_blocks),
@@ -887,6 +973,47 @@ def render_summary_html(
                 f"<td>{escape(r.product_desc)}</td>"
                 f"<td class='r'>{r.qty:g}</td>"
                 f"<td class='r'>{_money_neutral(r.charged)}</td></tr>"
+            )
+        parts.append("</tbody></table>")
+
+    if s.fb_paid_stock:
+        total = sum(r.total for r in s.fb_paid_stock)
+        parts.append(
+            f"<h3>Stock FB paid for <span class='pill'>{len(s.fb_paid_stock)}</span></h3>"
+        )
+        parts.append(
+            "<p class='sub'>Bought on FB Taverns' own LWC account, so FB pays for it, at "
+            "LWC's cost price. LWC gives these lines no site ID; the pub is in the file's "
+            "<strong>Del Name</strong> column, shown here. They are not asked of LWC. "
+            f"Total this file: <strong>{_money_neutral(total)}</strong> ex VAT.</p>"
+        )
+        parts.append(
+            "<table><thead><tr><th>Pub (Del Name)</th><th>Our site</th><th>Invoice</th>"
+            "<th>Date</th><th>Product</th><th>Description</th><th class='r'>Qty</th>"
+            "<th class='r'>Charged</th><th class='r'>Cost</th><th class='r'>Total</th>"
+            "</tr></thead><tbody>"
+        )
+        by_pub: dict[str, list[FbStockRow]] = {}
+        for r in s.fb_paid_stock:
+            by_pub.setdefault(r.del_name, []).append(r)
+        for pub, rows in by_pub.items():
+            for r in rows:
+                ours = f"{r.site_id} {r.site_name}".strip() if r.site_id else "not matched"
+                parts.append(
+                    f"<tr><td>{escape(r.del_name)}</td><td>{escape(ours)}</td>"
+                    f"<td>{escape(r.invoice_no)}</td><td>{escape(r.invoice_date)}</td>"
+                    f"<td>{escape(r.product_code)}</td><td>{escape(r.product_desc)}</td>"
+                    f"<td class='r'>{r.qty:g}</td>"
+                    f"<td class='r'>{_money_neutral(r.charged)}</td>"
+                    f"<td class='r'>{_money_neutral(r.cost)}</td>"
+                    f"<td class='r'>{_money_neutral(r.total)}</td></tr>"
+                )
+            sub = sum(r.total for r in rows)
+            kegs = sum(r.qty for r in rows)
+            parts.append(
+                f"<tr><td colspan='6'><strong>{escape(pub)} total</strong></td>"
+                f"<td class='r'><strong>{kegs:g}</strong></td><td></td><td></td>"
+                f"<td class='r'><strong>{_money_neutral(sub)}</strong></td></tr>"
             )
         parts.append("</tbody></table>")
 
