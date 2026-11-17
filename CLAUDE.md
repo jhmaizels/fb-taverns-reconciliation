@@ -114,6 +114,16 @@ Module map:
   off-invoice (WSP − keg price ÷ barrels per keg) through
   `plan_bar_plan_change` + `set_tennents_site_price`. Each line succeeds or is
   refused with its reason; nothing is retried. The approval itself is the hub's.
+- `hub_notify.py` — at the end of `POST /upload` (LWC weekly) and
+  `POST /upload-tennents` (monthly), POSTs the ids that took a delivery
+  (qty/kegs > 0), the period, the file's sha256 and the price file's pubs to
+  the hub's `POST /api/drinks/no-orders` (bearer `DEAL_PRODUCTS_TOKEN`, the
+  token the hub already uses here; `HUB_ORIGIN` overrides
+  https://portal.fbtaverns.com). The HUB decides which pubs should have
+  ordered and emails the area managers, Jason and Lewis (James, 17 Nov 2026);
+  it sends once per file hash, so a re-upload never re-sends. Best effort: the
+  results page shows the hub's one-line answer and a failure never touches the
+  findings.
 - `seed_tennents_site_prices.py` — one-off: seed the per-site off-invoice
   `Site_Prices` layer into the master workbook from the team's price files.
 

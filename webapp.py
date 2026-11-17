@@ -138,6 +138,7 @@ import tennents_grid  # noqa: E402
 import price_history  # noqa: E402
 import price_sheet  # noqa: E402
 from summary import build_summary, render_summary_html  # noqa: E402
+import hub_notify  # noqa: E402
 from retro import parse_lwc_retro, build_retro_summary, render_retro_summary_html  # noqa: E402
 # Master editor (design docs/master-editor-design.md): master_changes is the
 # single seam every edit flows through; master_pages holds the HTML bodies +
@@ -850,6 +851,7 @@ def upload(
             mismatches, file_rec_id,
             site_ids=snap.site_ids, product_ids=snap.product_ids, rule_ids=snap.rule_ids,
         )
+        lwc_hash = hub_notify.file_sha256(tmp_path)
 
         # Best-effort: capture each pub's LWC account number (the ACCOUNT NO
         # column) onto its Sites record so the master grid + export can show it.
@@ -882,6 +884,12 @@ def upload(
                 pass
 
     summary = build_summary(original_name, lines, mismatches, sites, active_site_ids=active_site_ids)
+    # The pubs with no delivery go to the hub, which emails the area managers
+    # (hub_notify.py). After the findings are written; never fails the page.
+    hub_notice = hub_notify.send_to_hub(hub_notify.lwc_payload(
+        original_name, lwc_hash, lines,
+        {sid: (sites.get(sid) or {}).get("name", "") for sid in active_site_ids},
+    ))
     try:
         policy = load_pricing_policy()
     except Exception:
@@ -898,6 +906,7 @@ def upload(
 <h1>Reconciliation complete</h1>
 <p class="sub">{original_name} &middot; <code>{file_rec_id}</code> in Airtable &middot; {mismatch_count} new mismatch rows (a re-upload refreshes or supersedes the earlier rows)</p>
 {_master_banner_html(snap.banner_info)}
+{hub_notify.notice_html(hub_notice)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="{ext_url('/lwc')}" style="background:#666">Upload another</a>
@@ -4429,6 +4438,7 @@ def upload_tennents(
             extra_fields=extra,
         )
         n_findings = write_tennents_findings(summary, file_rec_id)
+        tennents_hash = hub_notify.file_sha256(tmp_path)
     except Exception:
         logger.exception("request failed")
         return _error_page("Something went wrong processing this request — the details have been logged. Try again, and if it recurs contact the administrator.")
@@ -4439,6 +4449,7 @@ def upload_tennents(
             except OSError:
                 pass
 
+    hub_notice = hub_notify.send_to_hub(hub_notify.tennents_payload(original_name, tennents_hash, report, master))
     summary_html = render_tennents_summary_html(
         summary,
         accept_url=ext_url("/tennents/accept-sku"),
@@ -4452,6 +4463,7 @@ def upload_tennents(
 <h1>Tennents reconciliation complete</h1>
 <p class="sub">{escape(original_name)} &middot; <code>{file_rec_id}</code> in Airtable &middot; {n_findings} new findings rows (a re-upload refreshes or supersedes the earlier rows)</p>
 {_tennents_master_banner_html()}
+{hub_notify.notice_html(hub_notice)}
 <p>
   <a class="button" href="{AIRTABLE_BASE_URL}" target="_blank">Open Airtable</a>
   <a class="button" href="{ext_url('/tennents')}" style="background:#666">Upload another</a>
