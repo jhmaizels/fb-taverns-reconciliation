@@ -31,6 +31,7 @@ how the template marks "not sold here".
 """
 from __future__ import annotations
 
+import base64
 import io
 import os
 import re
@@ -348,3 +349,30 @@ def build_pricer_zip_bytes(master: TennentsMaster, sites: list[SiteInfo], as_of:
             data, _ = build_pricer_bytes(master, site, as_of, template, password)
             zf.writestr(pricer_filename(site, as_of), data)
     return buf.getvalue()
+
+
+def pricer_for_hub(master: TennentsMaster, site: SiteInfo, as_of: date | None = None,
+                   template: bytes | None = None, password: str | None = None) -> dict:
+    """The pub's pricer for the hub to attach to its email to Tennents (James,
+    18 Nov 2026: an approved Scottish bar plan goes to David Simpson as his own
+    pricer, with the changed lines named). The file, locked as the download is,
+    plus what it carries per code and what it cannot carry, so the hub can
+    check the approved prices landed and name a product with no pricer row in
+    the email instead (blank J reads as no discount). Nothing is written."""
+    as_of = as_of or date.today()
+    data, check = build_pricer_bytes(master, site, as_of=as_of, template=template, password=password)
+    return {
+        "account": site.account,
+        "site_name": site.site_name,
+        "filename": pricer_filename(site, as_of),
+        "file_b64": base64.b64encode(data).decode("ascii"),
+        # code = the master's SKU code (what the hub's bar plan carries);
+        # pricer_code = the code on Tennents' row, which can differ.
+        "lines": [{"code": ln.sku.sku_code if ln.sku else ln.code, "pricer_code": ln.code,
+                   "brand": ln.brand, "off_invoice_per_brl": ln.off}
+                  for ln in check.filled],
+        "not_on_pricer": [{"code": s.sku_code, "brand": s.product or s.brand, "off_invoice_per_brl": off}
+                          for s, off in check.not_on_pricer],
+        "total_differs": [ln.code for ln in check.total_differs],
+        "off_above_total": [ln.code for ln in check.off_above_total],
+    }

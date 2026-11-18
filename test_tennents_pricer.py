@@ -153,6 +153,17 @@ def run():
         "FB TAVERNS - PRICER - MANAGED HOUSE 2026-10-12.xlsx"], repr(z.namelist()))
 
 
+    # what the hub attaches to its email to Tennents (pricer_for_hub)
+    import base64
+    hub = tp.pricer_for_hub(m, mall, as_of=date(2026, 11, 18), password="")
+    _check("hub: names the file as the download does", hub["filename"] == "FB TAVERNS - PRICER - MALLROAD HOUSE 2026-11-18.xlsx", hub["filename"])
+    _check("hub: the file is the pricer", bdm(base64.b64decode(hub["file_b64"]))["J2"].value == "MALLROAD HOUSE")
+    _check("hub: lists each filled code with its off-invoice", {d["pricer_code"]: d["off_invoice_per_brl"] for d in hub["lines"]} == {ln.code: ln.off for ln in check.filled}, repr(hub["lines"]))
+    _check("hub: names the master's code where the pricer's differs", any(d["code"] == "090425" and d["pricer_code"] != "090425" for d in hub["lines"]), repr(hub["lines"]))
+    _check("hub: lists a product with no pricer row", [d["code"] for d in hub["not_on_pricer"]] == [s.sku_code for s, _ in check.not_on_pricer], repr(hub["not_on_pricer"]))
+    _check("hub: carries no retro figure", "retro" not in repr({k: v for k, v in hub.items() if k != "file_b64"}).lower())
+
+
 if __name__ == "__main__":
     run()
     print("\nALL PASS" if PASS else "\nSOME FAILED")

@@ -1506,6 +1506,33 @@ async def api_bar_plan_prices(request: Request):
     return JSONResponse({"supplier": req["supplier"], "site": req["site"], "lines": results})
 
 
+@app.get("/api/tennents-pricer")
+def api_tennents_pricer(request: Request, account: str = ""):
+    """One pub's Tennents pricer for the hub to email David Simpson after a
+    Scottish bar plan is approved (server-to-server, the same shared bearer
+    token as /api/site-prices; read-only). JSON: the locked file as base64 plus
+    the off-invoice each code carries and what the file cannot carry
+    (tennents_pricer.pricer_for_hub). 404 when the pub is not on the master."""
+    from tennents_price_export import find_site
+    from tennents_pricer import pricer_for_hub
+    expected = os.environ.get("DEAL_PRODUCTS_TOKEN", "")
+    if not expected:
+        return JSONResponse({"detail": "feed not configured"}, status_code=503)
+    if not token_ok(request.headers.get("authorization"), expected):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    if not account.strip():
+        return JSONResponse({"detail": "account is required"}, status_code=400)
+    try:
+        master = load_tennents_master()
+        target = find_site(master, account)
+        if target is None:
+            return JSONResponse({"detail": "pub not on the Tennents master"}, status_code=404)
+        return JSONResponse(pricer_for_hub(master, target))
+    except Exception:
+        logger.exception("tennents pricer for hub failed")
+        return JSONResponse({"detail": "pricer unavailable"}, status_code=503)
+
+
 @app.post("/upload-master", response_class=HTMLResponse)
 def upload_master(
     file: UploadFile = File(...),
