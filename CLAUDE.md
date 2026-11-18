@@ -114,6 +114,12 @@ Module map:
   off-invoice (WSP − keg price ÷ barrels per keg) through
   `plan_bar_plan_change` + `set_tennents_site_price`. Each line succeeds or is
   refused with its reason; nothing is retried. The approval itself is the hub's.
+  `GET /api/tennents-pricer?account=` (same token, read-only, 18 Nov 2026)
+  hands the hub one pub's pricer (`tennents_pricer.pricer_for_hub`: the locked
+  file as base64, the off-invoice per code with the master's code beside the
+  pricer's, and the products the file cannot carry) so that an approved
+  Scottish bar plan is emailed to David Simpson with his pricer attached. The
+  hub checks each approved line is on the file before it sends.
 - `hub_notify.py` — at the end of `POST /upload` (LWC weekly) and
   `POST /upload-tennents` (monthly), POSTs the ids that took a delivery
   (qty/kegs > 0), the period, the file's sha256 and the price file's pubs to
