@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from types import SimpleNamespace
 
 from tennents_master import LITRES_PER_BRL, _LITRES_PER_GALLON, keg_brl_factor
 
@@ -107,6 +108,16 @@ def build_lwc_site_payload(snap, site_id: str) -> dict | None:
         cur = newest.get(code)
         if cur is None or (r.valid_from or date.min) > (cur.valid_from or date.min):
             newest[code] = r
+    # A product added at FB's cost (airtable_io.add_lwc_product) that no pub
+    # prices yet has no rule: offer it from its product row.
+    for code, meta in product_meta.items():
+        lp = meta.get("list_price")
+        if code in stocked or code in newest or lp is None or lp <= 0:
+            continue
+        newest[code] = SimpleNamespace(
+            product_code=code, product_desc=meta.get("desc") or code, tenant_price=None,
+            fb_price=float(lp), retro_pct=None, valid_from=None,
+        )
     others = []
     for code, r in newest.items():
         line = lwc_line(r, product_meta)

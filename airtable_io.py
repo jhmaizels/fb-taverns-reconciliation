@@ -972,6 +972,114 @@ def publish_patched_snapshot(snap: MasterSnapshot) -> None:
         _MASTER_CACHE["gen"] += 1
 
 
+# ---------- LWC products added at FB's cost (no pub priced yet) ----------
+#
+# An English product the estate has never stocked has no PricingRule, so the
+# hub's bar plan could not offer it (James, 24 Nov 2026: Jason's Heineken 11G,
+# Heineken 0.0 and Old Mout Berries from LWC). "Add a product" (/master/product/new)
+# creates the Products row (description, retro) and keeps FB's LIST price here,
+# in its own table, created on first use like Config. A product's cost lives
+# on its rules once any pub prices it; this table only fills the gap before.
+
+_PRODUCT_COSTS_TABLE_NAME = "LwcProductCosts"
+_PRODUCT_COSTS_TABLE_ID: dict = {"id": None}
+_PRODUCT_COSTS_FIELDS = ["product_code", "list_price", "added_by", "added_at", "note"]
+
+
+def _resolve_product_costs_table_id(create: bool = False) -> str | None:
+    if _PRODUCT_COSTS_TABLE_ID["id"]:
+        return _PRODUCT_COSTS_TABLE_ID["id"]
+    _require_env()
+
+    def _find() -> str | None:
+        r = requests.get(_META_URL, headers=HEADERS)
+        if r.status_code < 300:
+            for t in r.json().get("tables", []):
+                if t.get("name") == _PRODUCT_COSTS_TABLE_NAME:
+                    _PRODUCT_COSTS_TABLE_ID["id"] = t["id"]
+                    return t["id"]
+        return None
+
+    try:
+        found = _find()
+        if found or not create:
+            return found
+    except Exception:
+        if not create:
+            return None
+    spec = {
+        "name": _PRODUCT_COSTS_TABLE_NAME,
+        "description": "FB's list price for an LWC product added before any pub prices it (Add a product).",
+        "fields": [
+            {"name": "product_code", "type": "singleLineText"},
+            {"name": "list_price", "type": "number", "options": {"precision": 2}},
+            {"name": "added_by", "type": "singleLineText"},
+            {"name": "added_at", "type": "singleLineText"},
+            {"name": "note", "type": "multilineText"},
+        ],
+    }
+    r = requests.post(_META_URL, headers=HEADERS, json=spec)
+    if r.status_code >= 300:
+        try:
+            again = _find()
+            if again:
+                return again
+        except Exception:
+            pass
+        raise AirtableError(f"Could not create {_PRODUCT_COSTS_TABLE_NAME} table: {r.status_code} {r.text[:200]}")
+    _PRODUCT_COSTS_TABLE_ID["id"] = r.json()["id"]
+    return _PRODUCT_COSTS_TABLE_ID["id"]
+
+
+def load_lwc_product_costs() -> dict[str, dict]:
+    """{product_code: {"list_price", "added_by", "added_at"}}. Empty when the
+    table does not exist yet or cannot be read: the master still loads."""
+    out: dict[str, dict] = {}
+    try:
+        tid = _resolve_product_costs_table_id(create=False)
+        if not tid:
+            return out
+        for rec in _list_all(tid, fields=_PRODUCT_COSTS_FIELDS):
+            f = rec["fields"]
+            code = str(f.get("product_code") or "").strip()
+            price = f.get("list_price")
+            if not code or price is None:
+                continue
+            out[code] = {
+                "list_price": float(price),
+                "added_by": f.get("added_by") or "",
+                "added_at": f.get("added_at") or "",
+            }
+    except Exception:
+        logging.getLogger("fbtaverns.airtable").warning("load_lwc_product_costs failed", exc_info=True)
+    return out
+
+
+def add_lwc_product(plan: dict, actor: str) -> None:
+    """Write a planned new LWC product (master_changes.plan_add_lwc_product):
+    the Products row, then its cost row. Re-reads Products first so a product
+    added since the page was drawn is refused, not duplicated."""
+    code = plan["product_code"]
+    if code in _product_lookup():
+        raise ValueError(f"product {code} is already on the master")
+    tid = _resolve_product_costs_table_id(create=True)
+    _batch([{"fields": {
+        "product_code": code,
+        "description": plan["description"],
+        "supplier": "LWC",
+        "retro_eligible": plan["retro_per_keg"] > 0,
+        "retro_per_keg": plan["retro_per_keg"],
+    }}], "create", T["Products"])
+    _batch([{"fields": {
+        "product_code": code,
+        "list_price": plan["list_price"],
+        "added_by": actor,
+        "added_at": date.today().isoformat(),
+        "note": plan.get("note") or "",
+    }}], "create", tid)
+    invalidate_master_cache()
+
+
 def _fetch_master_snapshot() -> MasterSnapshot:
     site_recs = _list_all(T["Sites"], fields=["site_id", "name", "account_no", "status", "country", "notes"])
     product_recs = _list_all(T["Products"], fields=["product_code", "description", "retro_per_keg"])
@@ -1010,6 +1118,12 @@ def _fetch_master_snapshot() -> MasterSnapshot:
             "desc": f.get("description") or "",
             "retro_per_keg": float(f.get("retro_per_keg") or 0.0),
         }
+
+    # FB's cost for a product added with "Add a product" (no pub prices it
+    # yet), so a hub bar plan can offer it at every pub. Never blocks a read.
+    for code, cost in load_lwc_product_costs().items():
+        if code in products:
+            products[code]["list_price"] = cost["list_price"]
 
     rules: list[Rule] = []
     rule_ids: dict[str, str] = {}

@@ -417,6 +417,25 @@ Key facts:
   name and can be undone. The sheet's lines ride the preview form, so
   changing the pub or signing off never needs the file again. Nothing is
   written by the preview.
+- **Add an LWC product at FB's cost — `GET/POST /master/product/new` (admin,
+  cross-origin checked, 24 Nov 2026):** a product LWC sells that NO pub prices
+  yet had no PricingRule, so the hub's bar plan could not offer it (Jason's
+  Heineken 11G 13550005 £137, Heineken 0.0 20L 13550056 £59, Old Mout Berries
+  30L 19030124 £90, from Robin Price). `master_changes.plan_add_lwc_product`
+  checks it (LWC's numeric code, not already on Products, description, FB's
+  LIST price £0–5,000, retro below it); `airtable_io.add_lwc_product` writes
+  the Products row (description, supplier LWC, retro_per_keg) and FB's list
+  price to its own table **`LwcProductCosts`** (product_code, list_price,
+  added_by, added_at, note), created on first use through the Metadata API
+  like Config, and read guarded (`load_lwc_product_costs`: missing/unreadable
+  = {}). The snapshot puts it on `products[code]["list_price"]`;
+  `site_prices.build_lwc_site_payload` offers such a product under
+  `other_products` at every pub with FB's cost and no tenant price, and
+  `_lwc_cell_change` takes it as the new rule's `fb_price` when no rule
+  carries one. No tenant price is set here: the area manager prices each pub
+  on a hub bar plan and Jason approves. Once any pub prices it, its rules are
+  the cost source. `test_lwc_new_product.py`. Grid edit mode: "+ New product
+  at FB's cost".
 - **`GET /export-master`**: `master_export.build_master_xlsx_bytes()` →
   download (read-only).
 
@@ -610,6 +629,7 @@ medium `>=5` / low; over and paid-not-on-master medium.
 | `POST /master/history/undo`, `/rollback`, `/rollback/apply` (+ `/tennents/history/…`) | yes (admin) | Undo a change / roll back to a date (preview, then apply) | **YES** |
 | `GET /master/sheet`, `POST /master/sheet/preview` | yes (admin) | A pub's price sheet: read it and show the changes | — |
 | `POST /master/sheet/apply` | yes (admin) | Sign off a price sheet: the pub's prices become the sheet's | **YES** |
+| `GET/POST /master/product/new` | yes (admin) | Add an LWC product at FB's cost (no pub price) | **YES** (Products + LwcProductCosts) |
 | `POST /upload-master` | yes | **LWC master replace** | **YES** |
 | `POST /add-support` | yes | **NL tenant-support rule** (LLM) | **YES** |
 | `GET /tennents` | yes | Tennents landing (+ barrelage vs 2,700 + annual-retro claim alarm) | — |
