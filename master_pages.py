@@ -458,6 +458,7 @@ def render_master_pivot(
         saved_href = base + _qs(saved="1", site=site_f, q=q)
         edit_btns = (
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/add")}">+ Add product</a>'
+            f'<a class="button" style="margin-top:0" href="{ext_url("/master/product/new")}">+ New product at FB\'s cost</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/site/new")}">+ Add site</a>'
             f'<a class="button" style="margin-top:0" href="{ext_url("/master/sheet")}">Upload a price sheet</a>'
             f'<a class="button" style="margin-top:0; background:#7a5c00" href="{ext_url("/master/increase")}">Annual increase</a>'

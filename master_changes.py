@@ -1040,3 +1040,55 @@ def patch_snapshot_for_bulk_upsert(
     for r in new_rules:
         rule_ids.setdefault(_key_of(r), "pending-refresh")
     return _dc_replace(snap, rules=rules, rule_ids=rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Add an LWC product at FB's cost, before any pub prices it (24 Nov 2026)
+# ---------------------------------------------------------------------------
+
+def _money_field(raw: str, label: str, *, allow_zero: bool) -> float:
+    txt = (raw or "").strip().replace("£", "").replace(",", "")
+    if not txt:
+        if allow_zero:
+            return 0.0
+        raise ValueError(f"{label} is required")
+    try:
+        v = float(txt)
+    except ValueError:
+        raise ValueError(f"{label} must be a number in pounds, e.g. 137.00") from None
+    if v < 0 or (v == 0 and not allow_zero):
+        raise ValueError(f"{label} must be more than £0")
+    if v > 5000:
+        raise ValueError(f"{label} of £{v:,.2f} is more than £5,000 a keg — check it")
+    return round(v, 2)
+
+
+def plan_add_lwc_product(snap: MasterSnapshot, code: str, description: str, list_price: str,
+                         retro: str = "", note: str = "") -> dict:
+    """Check a new LWC product before it is written (airtable_io.add_lwc_product).
+    FB's LIST price a keg (what LWC charges FB before retro) and the retro a keg;
+    no pub gets a tenant price here: that is a bar plan, priced by the area
+    manager and approved by Jason. Raises ValueError naming the problem."""
+    code = (code or "").strip()
+    if not code.isdigit() or not (6 <= len(code) <= 10):
+        raise ValueError("LWC product code must be the number LWC uses, e.g. 13550005")
+    if code in (snap.product_ids or {}):
+        desc = ((snap.products or {}).get(code) or {}).get("desc") or ""
+        raise ValueError(f"product {code}{f' ({desc})' if desc else ''} is already on the master")
+    description = " ".join((description or "").split())
+    if not description:
+        raise ValueError("description is required, as LWC names it, with the size (e.g. HEINEKEN 11G KEG)")
+    if len(description) > 80:
+        raise ValueError("description is too long (80 characters at most)")
+    price = _money_field(list_price, "FB's price a keg", allow_zero=False)
+    retro_v = _money_field(retro, "Retro a keg", allow_zero=True)
+    if retro_v >= price:
+        raise ValueError("the retro can't be as much as FB's price a keg")
+    return {
+        "product_code": code,
+        "description": description,
+        "list_price": price,
+        "retro_per_keg": retro_v,
+        "net_cost": round(price - retro_v, 2),
+        "note": (note or "").strip()[:300],
+    }

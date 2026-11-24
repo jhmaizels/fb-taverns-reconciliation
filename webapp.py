@@ -84,6 +84,7 @@ from site_prices import (  # noqa: E402
     tennents_off_for_tenant_keg,
 )
 from airtable_io import (  # noqa: E402
+    add_lwc_product,
     clear_rule_retro_pcts,
     set_product_retro_fields,
     create_site,
@@ -152,6 +153,7 @@ from master_changes import (  # noqa: E402
     build_universal_increase,
     patch_snapshot_for_change,
     patch_snapshot_for_bulk_upsert,
+    plan_add_lwc_product,
     preview_master_change,
     validate_master_change,
 )
@@ -3016,6 +3018,9 @@ def _lwc_cell_change(snap, site_id: str, product_code: str, tp: float | None,
             and r.fb_price is not None
         }
         fb = fbs.pop() if len(fbs) == 1 else None
+        if fb is None and not fbs:
+            # No pub prices it yet: FB's price from "Add a product".
+            fb = ((getattr(snap, "products", {}) or {}).get(product_code) or {}).get("list_price")
         retro_per_keg = (
             (getattr(snap, "products", {}) or {}).get(product_code) or {}
         ).get("retro_per_keg") or 0.0
@@ -4117,6 +4122,72 @@ def _product_form_html(code: str = "", product: str = "", container: str = "", t
   <input type="text" name="note" id="np-note" value="{escape(note)}" maxlength="300">
   <button type="submit">Add the product</button>
 </form>"""
+
+
+def _lwc_product_form_html(code: str = "", desc: str = "", price: str = "", retro: str = "", note: str = "") -> str:
+    return f"""<form action="{ext_url('/master/product/new')}" method="post" style="max-width: 640px">
+  <label for="lp-code">LWC product code</label>
+  <input type="text" name="product_code" id="lp-code" value="{escape(code)}" required maxlength="10" inputmode="numeric">
+  <label for="lp-desc">Description, as LWC names it, with the size (e.g. HEINEKEN 11G KEG)</label>
+  <input type="text" name="description" id="lp-desc" value="{escape(desc)}" required maxlength="80">
+  <label for="lp-price">FB's price a keg from LWC, £ before retro</label>
+  <input type="text" name="list_price" id="lp-price" value="{escape(price)}" required inputmode="decimal">
+  <label for="lp-retro">Retro a keg, £ (blank = none)</label>
+  <input type="text" name="retro" id="lp-retro" value="{escape(retro)}" inputmode="decimal">
+  <label for="lp-note">Note (where the price came from, e.g. "Robin Price email 24 Nov")</label>
+  <input type="text" name="note" id="lp-note" value="{escape(note)}" maxlength="300">
+  <button type="submit">Add the product</button>
+</form>"""
+
+
+def _lwc_product_page(principal, body: str) -> str:
+    return f"""{render_head(principal.email, principal.role)}
+<p class="sub" style="margin-top:0"><a href="{ext_url('/master')}?edit=1">← Price grid</a></p>
+<h1>Add a product at FB's cost</h1>
+<p class="sub">A product LWC sells that no pub has a price for yet. It is added with FB's price a keg only, so
+every pub's bar plan on the hub can offer it with FB's cost and margin. The tenant's price at each pub is set by
+the area manager on a bar plan and approved by Jason, as usual. To give one pub a price straight away, use
+<a href="{ext_url('/master/add')}">Add a rule</a> instead.</p>
+{body}
+{PAGE_FOOT}"""
+
+
+@app.get("/master/product/new", response_class=HTMLResponse)
+def lwc_product_new(principal: DrinksPrincipal = Depends(require_drinks_role("admin"))):
+    return _lwc_product_page(principal, _lwc_product_form_html())
+
+
+@app.post("/master/product/new", response_class=HTMLResponse)
+async def lwc_product_new_apply(
+    request: Request,
+    principal: DrinksPrincipal = Depends(require_drinks_role("admin")),
+):
+    if _is_cross_origin(request):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    form = await request.form()
+    f = {k: (form.get(k) or "").strip() for k in ("product_code", "description", "list_price", "retro", "note")}
+    again = _lwc_product_form_html(f["product_code"], f["description"], f["list_price"], f["retro"], f["note"])
+    try:
+        snap = await run_in_threadpool(load_master_snapshot)
+    except Exception:
+        logger.exception("request failed")
+        return _error_page("Could not load the LWC master from Airtable.")
+    try:
+        plan = plan_add_lwc_product(snap, f["product_code"], f["description"], f["list_price"], f["retro"], f["note"])
+        await run_in_threadpool(add_lwc_product, plan, principal.email)
+    except ValueError as e:
+        return HTMLResponse(_lwc_product_page(principal, f'<div class="result err">{escape(str(e))}</div>{again}'),
+                            status_code=400)
+    except Exception:
+        logger.exception("lwc add product failed")
+        return _error_page("Could not add the product — the details have been logged. Check whether it is now on "
+                           "the master before trying again.")
+    logger.info("lwc product added by %s: %s %s at £%.2f (retro £%.2f)", principal.email, plan["product_code"],
+                plan["description"], plan["list_price"], plan["retro_per_keg"])
+    done = (f'<div class="result ok">Added {escape(plan["product_code"])} {escape(plan["description"])}: FB\'s price '
+            f'£{plan["list_price"]:.2f} a keg, retro £{plan["retro_per_keg"]:.2f}, net £{plan["net_cost"]:.2f}. '
+            f'It shows on every pub\'s bar plan on the hub within a minute or so.</div>')
+    return HTMLResponse(_lwc_product_page(principal, done + _lwc_product_form_html()))
 
 
 @app.get("/tennents/product/new", response_class=HTMLResponse)
